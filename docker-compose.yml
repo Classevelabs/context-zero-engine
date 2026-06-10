@@ -1,0 +1,54 @@
+services:
+  # ──────────── PostgreSQL ────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: scg_v2
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env before starting}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d scg_v2"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ──────────── ContextZero Server ────────────
+  scg:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3100:3100"
+    volumes:
+      - ${SCG_REPOS_PATH:-./}:/repos
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: scg_v2
+      DB_USER: postgres
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env before starting}
+      DB_SSL_ALLOW_INSECURE_PRIVATE_NETWORK: "true"
+      DB_MAX_CONNECTIONS: 20
+      SCG_PORT: 3100
+      SCG_HOST: 0.0.0.0
+      SCG_API_KEYS: ${SCG_API_KEYS:?Set SCG_API_KEYS in .env before starting}
+      SCG_ALLOWED_BASE_PATHS: ${SCG_ALLOWED_BASE_PATHS:-/repos}
+      SCG_CORS_ORIGINS: ${SCG_CORS_ORIGINS:-}
+      SCG_TRUST_PROXY: ${SCG_TRUST_PROXY:-false}
+      SCG_MAX_FILES_PER_REPO: ${SCG_MAX_FILES_PER_REPO:-20000}
+      SCG_MAX_FILE_SIZE_BYTES: ${SCG_MAX_FILE_SIZE_BYTES:-1048576}
+      SCG_INGEST_WORKERS: ${SCG_INGEST_WORKERS:-4}
+      SCG_PYTHON_TIMEOUT_MS: ${SCG_PYTHON_TIMEOUT_MS:-30000}
+      LOG_LEVEL: info
+      NODE_ENV: production
+
+volumes:
+  pgdata:
