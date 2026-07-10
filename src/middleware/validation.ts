@@ -207,7 +207,8 @@ export const requirePatchArray = (value: unknown): string | null => {
     if (normalized.startsWith("..") || path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
       return `patches[${i}].file_path: path traversal or absolute path not allowed`
     }
-    ;(value[i] as Record<string, unknown>).file_path = slashNormalized
+    const patchRecord = value[i] as Record<string, unknown>
+    patchRecord.file_path = slashNormalized
   }
   return null
 }
@@ -245,7 +246,8 @@ export const requireSafePathArray =
       if (normalized.startsWith("..") || path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
         return `item at index ${i}: path traversal or absolute path not allowed`
       }
-      ;(value as string[])[i] = slashNormalized
+      const items = value as string[]
+      items[i] = slashNormalized
     }
     return null
   }

@@ -11,6 +11,7 @@
  */
 
 import * as dotenv from "dotenv"
+import * as fs from "fs"
 import * as path from "path"
 
 const dotenvPath = process.env["CONTEXTZERO_ENV_FILE"]
@@ -65,8 +66,8 @@ export const isTest = NODE_ENV === "test"
 function readPackageVersion(): string {
   try {
     // dist layout: dist/config.js → ../package.json; src layout (ts-node): src/config.ts → ../package.json
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const pkg = require(path.join(__dirname, "..", "package.json")) as { version?: string }
+    const raw = fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8")
+    const pkg = JSON.parse(raw) as { version?: string }
     if (typeof pkg.version === "string" && pkg.version.length > 0) return pkg.version
   } catch {
     // fall through
