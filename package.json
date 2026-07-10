@@ -1,6 +1,6 @@
 {
   "name": "contextzero-engine",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Local code intelligence engine for AI agents with MCP and HTTP interfaces",
   "main": "dist/mcp-interface/index.js",
   "engines": {
@@ -41,7 +41,7 @@
     "semantic-search",
     "impact-analysis"
   ],
-  "author": "ClassEve",
+  "author": "Ranjit Barnala",
   "license": "Apache-2.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",

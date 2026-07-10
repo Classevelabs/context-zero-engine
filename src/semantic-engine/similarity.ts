@@ -12,30 +12,30 @@
  * Sparse vector: maps token -> TF-IDF score.
  * After L2 normalization, the dot product of two sparse vectors equals cosine similarity.
  */
-export type SparseVector = Record<string, number>;
+export type SparseVector = Record<string, number>
 
 // --------------------------------------------------------------------------
 // Hash function: FNV-1a 32-bit — fast, deterministic, no dependencies
 // --------------------------------------------------------------------------
 
 function fnv1a(input: string): number {
-    let hash = 0x811c9dc5; // FNV offset basis
-    for (let i = 0; i < input.length; i++) {
-        hash ^= input.charCodeAt(i);
-        // FNV prime: multiply by 16777619, keep within 32-bit unsigned range
-        hash = Math.imul(hash, 0x01000193);
-    }
-    // Convert to unsigned 32-bit
-    return hash >>> 0;
+  let hash = 0x811c9dc5 // FNV offset basis
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i)
+    // FNV prime: multiply by 16777619, keep within 32-bit unsigned range
+    hash = Math.imul(hash, 0x01000193)
+  }
+  // Convert to unsigned 32-bit
+  return hash >>> 0
 }
 
 // --------------------------------------------------------------------------
 // MinHash permutation coefficients — deterministic from a fixed seed
 // --------------------------------------------------------------------------
 
-const LARGE_PRIME = 4294967291; // Largest prime < 2^32
-const LARGE_PRIME_BIG = BigInt(LARGE_PRIME);
-const MAX_PERMUTATIONS = 256;
+const LARGE_PRIME = 4294967291 // Largest prime < 2^32
+const LARGE_PRIME_BIG = BigInt(LARGE_PRIME)
+const MAX_PERMUTATIONS = 256
 
 /**
  * Pre-computed permutation coefficients for MinHash.
@@ -46,28 +46,28 @@ const MAX_PERMUTATIONS = 256;
  * a and h can each be up to ~2^32, so a*h can reach ~2^64, which exceeds
  * Number.MAX_SAFE_INTEGER (2^53). BigInt handles arbitrary precision.
  */
-const PERM_A: bigint[] = [];
-const PERM_B: bigint[] = [];
+const PERM_A: bigint[] = []
+const PERM_B: bigint[] = []
 
-(function initPermutations(): void {
-    // Simple LCG for deterministic coefficient generation
-    // seed = 42 (the answer to everything)
-    let state = 42;
-    function nextRand(): number {
-        // LCG: state = (state * 1664525 + 1013904223) mod 2^32
-        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-        return state;
-    }
+;(function initPermutations(): void {
+  // Simple LCG for deterministic coefficient generation
+  // seed = 42 (the answer to everything)
+  let state = 42
+  function nextRand(): number {
+    // LCG: state = (state * 1664525 + 1013904223) mod 2^32
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+    return state
+  }
 
-    for (let i = 0; i < MAX_PERMUTATIONS; i++) {
-        // a must be non-zero
-        let a = nextRand() % (LARGE_PRIME - 1);
-        if (a === 0) a = 1;
-        const b = nextRand() % LARGE_PRIME;
-        PERM_A.push(BigInt(a));
-        PERM_B.push(BigInt(b));
-    }
-})();
+  for (let i = 0; i < MAX_PERMUTATIONS; i++) {
+    // a must be non-zero
+    let a = nextRand() % (LARGE_PRIME - 1)
+    if (a === 0) a = 1
+    const b = nextRand() % LARGE_PRIME
+    PERM_A.push(BigInt(a))
+    PERM_B.push(BigInt(b))
+  }
+})()
 
 // --------------------------------------------------------------------------
 // TF-IDF functions
@@ -78,16 +78,16 @@ const PERM_B: bigint[] = [];
  * TF(t) = 1 + log(count(t)) for each token t in the document.
  */
 export function computeTF(tokens: string[]): Record<string, number> {
-    const counts: Record<string, number> = {};
-    for (const token of tokens) {
-        counts[token] = (counts[token] || 0) + 1;
-    }
+  const counts: Record<string, number> = {}
+  for (const token of tokens) {
+    counts[token] = (counts[token] || 0) + 1
+  }
 
-    const tf: Record<string, number> = {};
-    for (const [token, count] of Object.entries(counts)) {
-        tf[token] = 1 + Math.log(count);
-    }
-    return tf;
+  const tf: Record<string, number> = {}
+  for (const [token, count] of Object.entries(counts)) {
+    tf[token] = 1 + Math.log(count)
+  }
+  return tf
 }
 
 /**
@@ -97,60 +97,54 @@ export function computeTF(tokens: string[]): Record<string, number> {
  * @param documentTokenSets Array of token sets, one per document
  * @param totalDocs Total number of documents in the corpus
  */
-export function computeIDF(
-    documentTokenSets: Set<string>[],
-    totalDocs: number,
-): Record<string, number> {
-    // Guard: no documents → no IDF scores
-    if (totalDocs <= 0) return {};
+export function computeIDF(documentTokenSets: Set<string>[], totalDocs: number): Record<string, number> {
+  // Guard: no documents → no IDF scores
+  if (totalDocs <= 0) return {}
 
-    // Count how many documents contain each token
-    const docFreq: Record<string, number> = {};
-    for (const tokenSet of documentTokenSets) {
-        for (const token of tokenSet) {
-            docFreq[token] = (docFreq[token] || 0) + 1;
-        }
+  // Count how many documents contain each token
+  const docFreq: Record<string, number> = {}
+  for (const tokenSet of documentTokenSets) {
+    for (const token of tokenSet) {
+      docFreq[token] = (docFreq[token] || 0) + 1
     }
+  }
 
-    const idf: Record<string, number> = {};
-    for (const [token, freq] of Object.entries(docFreq)) {
-        idf[token] = Math.log(1 + totalDocs / (1 + freq));
-    }
-    return idf;
+  const idf: Record<string, number> = {}
+  for (const [token, freq] of Object.entries(docFreq)) {
+    idf[token] = Math.log(1 + totalDocs / (1 + freq))
+  }
+  return idf
 }
 
 /**
  * Compute TF-IDF sparse vector, then L2-normalize the result.
  * If a token has no IDF entry, it is assigned a default IDF of 1.0.
  */
-export function computeTFIDF(
-    tf: Record<string, number>,
-    idf: Record<string, number>,
-): SparseVector {
-    const raw: SparseVector = {};
+export function computeTFIDF(tf: Record<string, number>, idf: Record<string, number>): SparseVector {
+  const raw: SparseVector = {}
 
-    for (const [token, tfValue] of Object.entries(tf)) {
-        const idfValue = idf[token] ?? 1.0;
-        raw[token] = tfValue * idfValue;
-    }
+  for (const [token, tfValue] of Object.entries(tf)) {
+    const idfValue = idf[token] ?? 1.0
+    raw[token] = tfValue * idfValue
+  }
 
-    // L2 normalize
-    let magnitude = 0;
-    for (const value of Object.values(raw)) {
-        magnitude += value * value;
-    }
-    magnitude = Math.sqrt(magnitude);
+  // L2 normalize
+  let magnitude = 0
+  for (const value of Object.values(raw)) {
+    magnitude += value * value
+  }
+  magnitude = Math.sqrt(magnitude)
 
-    if (magnitude < 1e-10) {
-        return raw;
-    }
+  if (magnitude < 1e-10) {
+    return raw
+  }
 
-    const normalized: SparseVector = {};
-    for (const [token, value] of Object.entries(raw)) {
-        normalized[token] = value / magnitude;
-    }
+  const normalized: SparseVector = {}
+  for (const [token, value] of Object.entries(raw)) {
+    normalized[token] = value / magnitude
+  }
 
-    return normalized;
+  return normalized
 }
 
 // --------------------------------------------------------------------------
@@ -162,21 +156,19 @@ export function computeTFIDF(
  * Since vectors are L2-normalized, dot product = cosine similarity.
  */
 export function cosineSimilarity(a: SparseVector, b: SparseVector): number {
-    // Iterate over the smaller vector for efficiency
-    let dotProduct = 0;
-    const [smaller, larger] = Object.keys(a).length <= Object.keys(b).length
-        ? [a, b]
-        : [b, a];
+  // Iterate over the smaller vector for efficiency
+  let dotProduct = 0
+  const [smaller, larger] = Object.keys(a).length <= Object.keys(b).length ? [a, b] : [b, a]
 
-    for (const [token, valueA] of Object.entries(smaller)) {
-        const valueB = larger[token];
-        if (valueB !== undefined) {
-            dotProduct += valueA * valueB;
-        }
+  for (const [token, valueA] of Object.entries(smaller)) {
+    const valueB = larger[token]
+    if (valueB !== undefined) {
+      dotProduct += valueA * valueB
     }
+  }
 
-    // Clamp to [0, 1] to handle floating-point noise
-    return Math.max(0, Math.min(1, dotProduct));
+  // Clamp to [0, 1] to handle floating-point noise
+  return Math.max(0, Math.min(1, dotProduct))
 }
 
 // --------------------------------------------------------------------------
@@ -197,69 +189,63 @@ export function cosineSimilarity(a: SparseVector, b: SparseVector): number {
  * @param numPermutations Number of hash permutations (default 128, max 256)
  * @returns Array of minimum hash values, one per permutation
  */
-export function generateMinHash(
-    tokens: Set<string>,
-    numPermutations: number = 128,
-): number[] {
-    const nPerms = Math.min(numPermutations, MAX_PERMUTATIONS);
-    const signature: number[] = new Array(nPerms).fill(0xFFFFFFFF);
+export function generateMinHash(tokens: Set<string>, numPermutations: number = 128): number[] {
+  const nPerms = Math.min(numPermutations, MAX_PERMUTATIONS)
+  const signature: number[] = new Array(nPerms).fill(0xffffffff)
 
-    if (tokens.size === 0) {
-        return signature;
+  if (tokens.size === 0) {
+    return signature
+  }
+
+  // Pre-hash all tokens once, store as BigInt for safe arithmetic
+  const tokenHashes: bigint[] = []
+  for (const token of tokens) {
+    tokenHashes.push(BigInt(fnv1a(token)))
+  }
+
+  for (let i = 0; i < nPerms; i++) {
+    const a = PERM_A[i]!
+    const b = PERM_B[i]!
+    let minHash = 0xffffffff
+
+    for (const h of tokenHashes) {
+      // h_i(x) = (a * hash(x) + b) % LARGE_PRIME
+      // BigInt arithmetic prevents overflow when a*h exceeds 2^53
+      const permuted = Number((a * h + b) % LARGE_PRIME_BIG)
+      if (permuted < minHash) {
+        minHash = permuted
+      }
     }
 
-    // Pre-hash all tokens once, store as BigInt for safe arithmetic
-    const tokenHashes: bigint[] = [];
-    for (const token of tokens) {
-        tokenHashes.push(BigInt(fnv1a(token)));
-    }
+    signature[i] = minHash
+  }
 
-    for (let i = 0; i < nPerms; i++) {
-        const a = PERM_A[i]!;
-        const b = PERM_B[i]!;
-        let minHash = 0xFFFFFFFF;
-
-        for (const h of tokenHashes) {
-            // h_i(x) = (a * hash(x) + b) % LARGE_PRIME
-            // BigInt arithmetic prevents overflow when a*h exceeds 2^53
-            const permuted = Number((a * h + b) % LARGE_PRIME_BIG);
-            if (permuted < minHash) {
-                minHash = permuted;
-            }
-        }
-
-        signature[i] = minHash;
-    }
-
-    return signature;
+  return signature
 }
 
 /**
  * Estimate Jaccard similarity from two MinHash signatures.
  * Counts the fraction of matching positions.
  */
-export function estimateJaccardFromMinHash(
-    sigA: number[],
-    sigB: number[],
-): number {
-    const length = Math.min(sigA.length, sigB.length);
-    if (length === 0) return 0;
+export function estimateJaccardFromMinHash(sigA: number[], sigB: number[]): number {
+  const length = Math.min(sigA.length, sigB.length)
+  if (length === 0) return 0
 
-    // Empty token sets produce all-0xFFFFFFFF signatures (sentinel).
-    // Two empty sets matching is a sentinel collision, not real similarity.
-    const EMPTY_SENTINEL = 0xFFFFFFFF;
-    const aIsEmpty = sigA.every(v => v === EMPTY_SENTINEL);
-    const bIsEmpty = sigB.every(v => v === EMPTY_SENTINEL);
-    if (aIsEmpty || bIsEmpty) return 0;
+  // Empty token sets produce all-0xFFFFFFFF signatures (sentinel).
+  // Two empty sets matching is a sentinel collision, not real similarity.
+  const EMPTY_SENTINEL = 0xffffffff
+  const aIsEmpty = sigA.every((v) => v === EMPTY_SENTINEL)
+  const bIsEmpty = sigB.every((v) => v === EMPTY_SENTINEL)
+  if (aIsEmpty || bIsEmpty) return 0
 
-    let matches = 0;
-    for (let i = 0; i < length; i++) {
-        if (sigA[i] === sigB[i]) {
-            matches++;
-        }
+  let matches = 0
+  for (let i = 0; i < length; i++) {
+    if (sigA[i] === sigB[i]) {
+      matches++
     }
+  }
 
-    return matches / length;
+  return matches / length
 }
 
 // --------------------------------------------------------------------------
@@ -267,7 +253,7 @@ export function estimateJaccardFromMinHash(
 // --------------------------------------------------------------------------
 
 /** Number of consecutive MinHash rows per LSH band */
-export const LSH_ROWS_PER_BAND = 8;
+export const LSH_ROWS_PER_BAND = 8
 
 /**
  * Compute LSH band hashes from a MinHash signature.
@@ -283,41 +269,38 @@ export const LSH_ROWS_PER_BAND = 8;
  * @param rowsPerBand Number of consecutive MinHash values per band (default: LSH_ROWS_PER_BAND)
  * @returns Array of band hash integers (length = floor(signature.length / rowsPerBand))
  */
-export function computeBandHashes(
-    signature: number[],
-    rowsPerBand: number = LSH_ROWS_PER_BAND,
-): number[] {
-    const numBands = Math.floor(signature.length / rowsPerBand);
-    const bandHashes: number[] = new Array(numBands);
+export function computeBandHashes(signature: number[], rowsPerBand: number = LSH_ROWS_PER_BAND): number[] {
+  const numBands = Math.floor(signature.length / rowsPerBand)
+  const bandHashes: number[] = new Array(numBands)
 
-    for (let band = 0; band < numBands; band++) {
-        const offset = band * rowsPerBand;
+  for (let band = 0; band < numBands; band++) {
+    const offset = band * rowsPerBand
 
-        // FNV-1a over the raw bytes of R consecutive 32-bit integers
-        let hash = 0x811c9dc5; // FNV offset basis
+    // FNV-1a over the raw bytes of R consecutive 32-bit integers
+    let hash = 0x811c9dc5 // FNV offset basis
 
-        for (let r = 0; r < rowsPerBand; r++) {
-            const value = signature[offset + r]!;
+    for (let r = 0; r < rowsPerBand; r++) {
+      const value = signature[offset + r]!
 
-            // Process each of the 4 bytes of the 32-bit integer (little-endian)
-            hash ^= value & 0xFF;
-            hash = Math.imul(hash, 0x01000193);
+      // Process each of the 4 bytes of the 32-bit integer (little-endian)
+      hash ^= value & 0xff
+      hash = Math.imul(hash, 0x01000193)
 
-            hash ^= (value >>> 8) & 0xFF;
-            hash = Math.imul(hash, 0x01000193);
+      hash ^= (value >>> 8) & 0xff
+      hash = Math.imul(hash, 0x01000193)
 
-            hash ^= (value >>> 16) & 0xFF;
-            hash = Math.imul(hash, 0x01000193);
+      hash ^= (value >>> 16) & 0xff
+      hash = Math.imul(hash, 0x01000193)
 
-            hash ^= (value >>> 24) & 0xFF;
-            hash = Math.imul(hash, 0x01000193);
-        }
-
-        // Convert to signed 32-bit integer for PostgreSQL INTEGER column compatibility
-        bandHashes[band] = hash | 0;
+      hash ^= (value >>> 24) & 0xff
+      hash = Math.imul(hash, 0x01000193)
     }
 
-    return bandHashes;
+    // Convert to signed 32-bit integer for PostgreSQL INTEGER column compatibility
+    bandHashes[band] = hash | 0
+  }
+
+  return bandHashes
 }
 
 // --------------------------------------------------------------------------
@@ -338,25 +321,25 @@ export function computeBandHashes(
  * @returns Weighted similarity score in [0, 1]
  */
 export function multiViewSimilarity(
-    viewsA: Map<string, SparseVector>,
-    viewsB: Map<string, SparseVector>,
-    weights: Record<string, number>,
+  viewsA: Map<string, SparseVector>,
+  viewsB: Map<string, SparseVector>,
+  weights: Record<string, number>,
 ): number {
-    let totalSimilarity = 0;
-    let activeWeight = 0;
+  let totalSimilarity = 0
+  let activeWeight = 0
 
-    for (const [viewType, weight] of Object.entries(weights)) {
-        const vecA = viewsA.get(viewType);
-        const vecB = viewsB.get(viewType);
+  for (const [viewType, weight] of Object.entries(weights)) {
+    const vecA = viewsA.get(viewType)
+    const vecB = viewsB.get(viewType)
 
-        // Only count views present in BOTH symbols
-        if (vecA && vecB) {
-            activeWeight += weight;
-            totalSimilarity += weight * cosineSimilarity(vecA, vecB);
-        }
+    // Only count views present in BOTH symbols
+    if (vecA && vecB) {
+      activeWeight += weight
+      totalSimilarity += weight * cosineSimilarity(vecA, vecB)
     }
+  }
 
-    // Normalize by weight of views that were actually compared
-    if (activeWeight === 0 || !isFinite(activeWeight)) return 0;
-    return totalSimilarity / activeWeight;
+  // Normalize by weight of views that were actually compared
+  if (activeWeight === 0 || !isFinite(activeWeight)) return 0
+  return totalSimilarity / activeWeight
 }
