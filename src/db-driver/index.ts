@@ -166,6 +166,7 @@ class DatabaseDriver {
   private readonly slowQueryMs: number
   private readonly circuit: CircuitBreaker
   private readonly maxWaitingQueries: number
+  private readonly bulkStatementTimeoutMs: number
   private closed = false
 
   private constructor() {
@@ -184,6 +185,9 @@ class DatabaseDriver {
     // rejection here cascades into whole-batch failures upstream. Override via
     // DB_MAX_WAITING_QUERIES.
     this.maxWaitingQueries = safeInt(process.env["DB_MAX_WAITING_QUERIES"], maxConnections * 8)
+    // Bulk ingest writes get their own (transaction-local) statement timeout —
+    // see bulkTimeoutSql(). Override via DB_BULK_STATEMENT_TIMEOUT_MS.
+    this.bulkStatementTimeoutMs = safeInt(process.env["DB_BULK_STATEMENT_TIMEOUT_MS"], 180_000)
     const connConfigWithOptions = connConfig as typeof connConfig & { options?: string }
     const existingOptions =
       typeof connConfigWithOptions.options === "string" ? connConfigWithOptions.options.trim() : ""
@@ -347,8 +351,22 @@ class DatabaseDriver {
     }
   }
 
+  /**
+   * Session default statement_timeout (30s) is sized for interactive queries.
+   * Bulk ingest INSERTs are legitimately slow on a busy/bloated database —
+   * with the tight timeout they died with "canceling statement due to
+   * statement timeout" and took the whole extraction batch with them
+   * (observed live: 2,260 of 2,278 files lost to one slow phase).
+   * SET LOCAL scopes the relaxed cap to the write transaction only.
+   */
+  private bulkTimeoutSql(): string {
+    const ms = Math.max(1000, Math.floor(this.bulkStatementTimeoutMs))
+    return `SET LOCAL statement_timeout = ${ms}`
+  }
+
   public async batchInsert(statements: { text: string; params: unknown[] }[]): Promise<void> {
     await this.transaction(async (client) => {
+      await client.query(this.bulkTimeoutSql())
       for (const stmt of statements) {
         await client.query(stmt.text, stmt.params)
       }
@@ -433,6 +451,9 @@ class DatabaseDriver {
     }
 
     if (options.client) {
+      // Caller's transaction: relax the timeout for it too (SET LOCAL reverts
+      // at that transaction's end, so we never leak the long cap).
+      await options.client.query(this.bulkTimeoutSql())
       for (let offset = 0; offset < rows.length; offset += maxRowsPerChunk) {
         const chunk = rows.slice(offset, offset + maxRowsPerChunk)
         totalInserted += await runStatement(chunk, options.client)
@@ -441,6 +462,7 @@ class DatabaseDriver {
       // No external client — wrap in our own transaction so multi-chunk
       // inserts are still atomic.
       await this.transaction(async (client) => {
+        await client.query(this.bulkTimeoutSql())
         for (let offset = 0; offset < rows.length; offset += maxRowsPerChunk) {
           const chunk = rows.slice(offset, offset + maxRowsPerChunk)
           totalInserted += await runStatement(chunk, client)

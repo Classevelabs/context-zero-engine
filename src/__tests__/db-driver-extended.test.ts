@@ -266,9 +266,10 @@ describe("DatabaseDriver.batchInsert", () => {
 
     await db.batchInsert(statements)
 
-    // BEGIN + 3 inserts + COMMIT = 5 calls
-    expect(mockClient.query).toHaveBeenCalledTimes(5)
+    // BEGIN + SET LOCAL statement_timeout + 3 inserts + COMMIT = 6 calls
+    expect(mockClient.query).toHaveBeenCalledTimes(6)
     expect(mockClient.query).toHaveBeenCalledWith("BEGIN")
+    expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining("SET LOCAL statement_timeout"))
     expect(mockClient.query).toHaveBeenCalledWith("INSERT INTO a VALUES ($1)", [1])
     expect(mockClient.query).toHaveBeenCalledWith("INSERT INTO b VALUES ($1)", [2])
     expect(mockClient.query).toHaveBeenCalledWith("INSERT INTO c VALUES ($1)", [3])
