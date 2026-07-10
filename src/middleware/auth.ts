@@ -173,7 +173,8 @@ export function currentLockoutMsForIp(ip: string): number {
 
 function markAuthFailure(res: Response): void {
   if (!res.locals) {
-    ;(res as Response & { locals: Record<string, unknown> }).locals = {}
+    const bare = res as Response & { locals: Record<string, unknown> }
+    bare.locals = {}
   }
   res.locals["authFailure"] = true
 }

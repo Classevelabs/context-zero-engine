@@ -17,7 +17,7 @@ export async function mapWithConcurrency<T, R>(
   let nextIndex = 0
 
   const worker = async (): Promise<void> => {
-    while (true) {
+    for (;;) {
       const index = nextIndex++
       if (index >= items.length) return
       results[index] = await fn(items[index] as T, index)
