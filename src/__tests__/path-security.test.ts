@@ -1,50 +1,52 @@
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import { resolvePathWithinBase } from '../path-security';
+import * as fs from "fs"
+import * as os from "os"
+import * as path from "path"
+import { resolvePathWithinBase } from "../path-security"
 
 function symlinkDirectory(target: string, linkPath: string): void {
-    fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+  fs.symlinkSync(target, linkPath, process.platform === "win32" ? "junction" : "dir")
 }
 
-describe('path-security', () => {
-    let tempRoot: string;
+describe("path-security", () => {
+  let tempRoot: string
 
-    beforeEach(() => {
-        tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'contextzero-path-'));
-    });
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "contextzero-path-"))
+  })
 
-    afterEach(() => {
-        fs.rmSync(tempRoot, { recursive: true, force: true });
-    });
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  })
 
-    test('allows regular paths inside the repository root', () => {
-        const repoRoot = path.join(tempRoot, 'repo');
-        fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  test("allows regular paths inside the repository root", () => {
+    const repoRoot = path.join(tempRoot, "repo")
+    fs.mkdirSync(path.join(repoRoot, "src"), { recursive: true })
 
-        const resolved = resolvePathWithinBase(repoRoot, 'src/index.ts', { allowMissing: true });
+    const resolved = resolvePathWithinBase(repoRoot, "src/index.ts", { allowMissing: true })
 
-        expect(resolved.realBase).toBe(fs.realpathSync(repoRoot));
-        expect(resolved.resolvedPath).toBe(path.join(fs.realpathSync(repoRoot), 'src', 'index.ts'));
-        expect(resolved.existed).toBe(false);
-    });
+    expect(resolved.realBase).toBe(fs.realpathSync(repoRoot))
+    expect(resolved.resolvedPath).toBe(path.join(fs.realpathSync(repoRoot), "src", "index.ts"))
+    expect(resolved.existed).toBe(false)
+  })
 
-    test('blocks lexical path traversal outside the repository root', () => {
-        const repoRoot = path.join(tempRoot, 'repo');
-        fs.mkdirSync(repoRoot, { recursive: true });
+  test("blocks lexical path traversal outside the repository root", () => {
+    const repoRoot = path.join(tempRoot, "repo")
+    fs.mkdirSync(repoRoot, { recursive: true })
 
-        expect(() => resolvePathWithinBase(repoRoot, '../secrets.txt', { allowMissing: true }))
-            .toThrow('Path traversal attempt blocked');
-    });
+    expect(() => resolvePathWithinBase(repoRoot, "../secrets.txt", { allowMissing: true })).toThrow(
+      "Path traversal attempt blocked",
+    )
+  })
 
-    test('blocks symlink escapes through an existing parent directory', () => {
-        const repoRoot = path.join(tempRoot, 'repo');
-        const outsideRoot = path.join(tempRoot, 'outside');
-        fs.mkdirSync(repoRoot, { recursive: true });
-        fs.mkdirSync(outsideRoot, { recursive: true });
-        symlinkDirectory(outsideRoot, path.join(repoRoot, 'linked'));
+  test("blocks symlink escapes through an existing parent directory", () => {
+    const repoRoot = path.join(tempRoot, "repo")
+    const outsideRoot = path.join(tempRoot, "outside")
+    fs.mkdirSync(repoRoot, { recursive: true })
+    fs.mkdirSync(outsideRoot, { recursive: true })
+    symlinkDirectory(outsideRoot, path.join(repoRoot, "linked"))
 
-        expect(() => resolvePathWithinBase(repoRoot, 'linked/new-file.ts', { allowMissing: true }))
-            .toThrow('symlink escape');
-    });
-});
+    expect(() => resolvePathWithinBase(repoRoot, "linked/new-file.ts", { allowMissing: true })).toThrow(
+      "symlink escape",
+    )
+  })
+})
