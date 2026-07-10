@@ -1,8 +1,8 @@
-const { execFileSync } = jest.requireActual('child_process') as typeof import('child_process');
+const { execFileSync } = jest.requireActual("child_process") as typeof import("child_process")
 
-describe('universal tree-sitter adapter', () => {
-    test('extracts script, mobile, and CUDA symbols in a real Node process', () => {
-        const script = `
+describe("universal tree-sitter adapter", () => {
+  test("extracts script, mobile, and CUDA symbols in a real Node process", () => {
+    const script = `
             require('ts-node/register');
             const { extractWithTreeSitter } = require('./src/adapters/universal');
             const cases = {
@@ -21,20 +21,23 @@ describe('universal tree-sitter adapter', () => {
                 };
             }
             process.stdout.write(JSON.stringify(output));
-        `;
+        `
 
-        const raw = execFileSync(process.execPath, ['-e', script], {
-            cwd: process.cwd(),
-            encoding: 'utf8',
-            env: { ...process.env, LOG_LEVEL: 'fatal' },
-        });
-        const output = JSON.parse(raw) as Record<string, { symbols: string[]; behaviorHints: string[]; uncertaintyFlags: string[] }>;
+    const raw = execFileSync(process.execPath, ["-e", script], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: { ...process.env, LOG_LEVEL: "fatal" },
+    })
+    const output = JSON.parse(raw) as Record<
+      string,
+      { symbols: string[]; behaviorHints: string[]; uncertaintyFlags: string[] }
+    >
 
-        expect(output['bash']?.symbols).toContain('deploy');
-        expect(output['bash']?.behaviorHints).toContain('bash_curl');
-        expect(output['php']?.symbols).toEqual(expect.arrayContaining(['add', 'Box', 'get']));
-        expect(output['swift']?.symbols).toEqual(expect.arrayContaining(['Client', 'fetch']));
-        expect(output['swift']?.behaviorHints).toContain('swift_urlsession');
-        expect(output['cpp']?.symbols).toEqual(expect.arrayContaining(['saxpy', 'host_add']));
-    });
-});
+    expect(output["bash"]?.symbols).toContain("deploy")
+    expect(output["bash"]?.behaviorHints).toContain("bash_curl")
+    expect(output["php"]?.symbols).toEqual(expect.arrayContaining(["add", "Box", "get"]))
+    expect(output["swift"]?.symbols).toEqual(expect.arrayContaining(["Client", "fetch"]))
+    expect(output["swift"]?.behaviorHints).toContain("swift_urlsession")
+    expect(output["cpp"]?.symbols).toEqual(expect.arrayContaining(["saxpy", "host_add"]))
+  })
+})
