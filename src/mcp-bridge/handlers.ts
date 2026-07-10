@@ -681,13 +681,18 @@ export async function handleRegisterRepo(args: Record<string, unknown>, log: Mcp
 
   log.debug("scg_register_repo", { repo_name, repo_path: resolvedPath, visibility })
 
-  const repo_id = await coreDataService.createRepository({
-    name: repo_name,
-    default_branch,
-    visibility,
-    language_set: [],
-    base_path: resolvedPath,
-  })
+  // Explicit registration is the ONE caller allowed to redefine a path-matched
+  // repo's identity (name/branch/visibility) — ingest callers only reuse it.
+  const repo_id = await coreDataService.createRepository(
+    {
+      name: repo_name,
+      default_branch,
+      visibility,
+      language_set: [],
+      base_path: resolvedPath,
+    },
+    { updateIdentityOnPathMatch: true },
+  )
 
   return textResult({ repo_id, registered_path: resolvedPath })
 }

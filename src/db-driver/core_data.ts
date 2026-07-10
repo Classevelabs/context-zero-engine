@@ -84,8 +84,12 @@ export interface SymbolVersionInput {
 export type { SymbolVersionRow } from "./result"
 
 export class CoreDataService {
-  public async createRepository(input: RepositoryInput): Promise<string> {
+  public async createRepository(
+    input: RepositoryInput,
+    opts?: { updateIdentityOnPathMatch?: boolean },
+  ): Promise<string> {
     const canonicalBasePath = input.base_path ? resolveExistingPath(input.base_path) : null
+    const updateIdentity = opts?.updateIdentityOnPathMatch === true
 
     // Repository identity is the canonical filesystem path, not the human-readable name.
     // Different repos can share a name; they must never share a repo_id unless the path matches.
@@ -93,19 +97,34 @@ export class CoreDataService {
       const byPath = await db.query(`SELECT repo_id FROM repositories WHERE base_path = $1`, [canonicalBasePath])
       if (byPath.rowCount && byPath.rowCount > 0) {
         const existingId = extractId(byPath.rows[0] as Record<string, unknown> | undefined, "repo_id")
-        await db.query(
-          `
-                    UPDATE repositories
-                    SET name = $1, default_branch = $2, visibility = $3, language_set = $4, updated_at = NOW()
-                    WHERE repo_id = $5
-                `,
-          [input.name, input.default_branch, input.visibility, input.language_set, existingId],
-        )
-        log.info("Repository matched by base_path — updated metadata", {
-          repo_id: existingId,
-          name: input.name,
-          base_path: canonicalBasePath,
-        })
+        if (updateIdentity) {
+          // Explicit registration: the caller intends to (re)define this repo's identity.
+          await db.query(
+            `
+                        UPDATE repositories
+                        SET name = $1, default_branch = $2, visibility = $3, language_set = $4, updated_at = NOW()
+                        WHERE repo_id = $5
+                    `,
+            [input.name, input.default_branch, input.visibility, input.language_set, existingId],
+          )
+          log.info("Repository matched by base_path — identity updated (explicit registration)", {
+            repo_id: existingId,
+            name: input.name,
+            base_path: canonicalBasePath,
+          })
+        } else {
+          // Ingest-path callers must NOT rewrite identity: a one-off ingest of the
+          // same path under a different label used to silently RENAME the canonical
+          // repo row — after which anything keyed on the old name (cleanup scripts,
+          // humans) operated on the wrong repository.
+          await db.query(`UPDATE repositories SET updated_at = NOW() WHERE repo_id = $1`, [existingId])
+          log.info("Repository matched by base_path — reusing existing identity", {
+            repo_id: existingId,
+            existing_kept: true,
+            requested_name: input.name,
+            base_path: canonicalBasePath,
+          })
+        }
         return existingId
       }
     }
@@ -129,17 +148,24 @@ export class CoreDataService {
         const byPath = await db.query(`SELECT repo_id FROM repositories WHERE base_path = $1`, [canonicalBasePath])
         if (byPath.rowCount && byPath.rowCount > 0) {
           const existingId = extractId(byPath.rows[0] as Record<string, unknown> | undefined, "repo_id")
-          await db.query(
-            `
-                        UPDATE repositories
-                        SET name = $1, default_branch = $2, visibility = $3, language_set = $4, updated_at = NOW()
-                        WHERE repo_id = $5
-                    `,
-            [input.name, input.default_branch, input.visibility, input.language_set, existingId],
-          )
+          // Same identity rule as the pre-check above: only explicit registration
+          // may rewrite name/branch/visibility on a path match.
+          if (updateIdentity) {
+            await db.query(
+              `
+                            UPDATE repositories
+                            SET name = $1, default_branch = $2, visibility = $3, language_set = $4, updated_at = NOW()
+                            WHERE repo_id = $5
+                        `,
+              [input.name, input.default_branch, input.visibility, input.language_set, existingId],
+            )
+          } else {
+            await db.query(`UPDATE repositories SET updated_at = NOW() WHERE repo_id = $1`, [existingId])
+          }
           log.info("Repository create raced on base_path — reused existing row", {
             repo_id: existingId,
             name: input.name,
+            identity_updated: updateIdentity,
             base_path: canonicalBasePath,
           })
           return existingId

@@ -435,13 +435,18 @@ app.post(
 
     // Create or reuse repository — deduplicate by base_path to prevent
     // orphaning data when a repo is re-registered after restart (BUG-001).
-    const repoId = await coreDataService.createRepository({
-      name: repo_name,
-      default_branch: default_branch || "main",
-      visibility: visibility || "private",
-      language_set: [],
-      base_path: resolvedPath,
-    })
+    // Explicit registration may redefine identity on a path match; ingest
+    // callers only reuse the existing row.
+    const repoId = await coreDataService.createRepository(
+      {
+        name: repo_name,
+        default_branch: default_branch || "main",
+        visibility: visibility || "private",
+        language_set: [],
+        base_path: resolvedPath,
+      },
+      { updateIdentityOnPathMatch: true },
+    )
 
     log.info("Repository registered", { repo_id: repoId, name: repo_name, path: resolvedPath })
     res.json({ repo_id: repoId, registered_path: resolvedPath })
