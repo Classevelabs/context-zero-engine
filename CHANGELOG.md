@@ -64,6 +64,19 @@ be silent are now loud and attributed.
 - **tsconfig parse crashes.** A malformed or unresolvable tsconfig
   (bad `extends`) no longer aborts extraction — the engine falls back to
   default compiler options and flags `incomplete_type_info`.
+- **Repo identity hijack via ingest.** Ingesting an already-registered
+  path under a different name silently RENAMED the canonical repository
+  row — after which anything keyed on the old name (cleanup scripts,
+  humans) operated on the wrong repository. Identity now changes only on
+  explicit registration; ingest callers reuse the existing row as-is.
+- **Bulk writes killed by the interactive statement timeout.** The
+  session-wide 30-second `statement_timeout` is sized for interactive
+  queries; bulk ingest INSERTs on a busy or vacuum-lagged database
+  legitimately run longer and died with "canceling statement due to
+  statement timeout" — which was the root cause behind lost extraction
+  batches. Bulk writes now `SET LOCAL` their own bounded timeout
+  (default 180s, `DB_BULK_STATEMENT_TIMEOUT_MS`) scoped to the write
+  transaction; interactive queries keep the tight default.
 
 ### Changed
 
