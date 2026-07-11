@@ -25,48 +25,24 @@ import type {
   ContractHint,
 } from "../../types"
 import { normalizeForComparison } from "./ast-normalizer"
+import { resolveEffectHints } from "./effect-resolver"
 
 const log = new Logger("ts-adapter")
 
-/** Side-effect detection patterns for behavioral hints */
+/**
+ * Syntactic side-effect patterns for behavioral hints.
+ *
+ * SCOPE CHANGE (v2.5): external-effect categories — db_read, db_write,
+ * network_call, file_io, cache_op — are now produced by the TYPE-RESOLVED
+ * analyzer (./effect-resolver), which follows each call's receiver back to
+ * its source module through the checker. Pattern guesses for those
+ * categories were the false-positive factory (`.request(` on any object,
+ * `WebSocket` in a type position, "stripe" in a string) and are gone.
+ * Patterns below only cover LOCAL/SYNTACTIC categories the resolver can't
+ * see: throws/catches, state mutation, locking, serialization, validation,
+ * auth idioms, `.transaction(` and logging.
+ */
 const BEHAVIOR_PATTERNS: { pattern: RegExp; hint_type: BehaviorHint["hint_type"]; detail: string }[] = [
-  // DB reads — require ORM-specific method suffixes or contextual DB object prefix
-  // to avoid matching Map.get(), Array.find(), etc.
-  { pattern: /\.find(One|Many|All|ById|Unique|First|Where)\s*\(/, hint_type: "db_read", detail: "orm_find" },
-  { pattern: /\.select\s*\(\s*['"`{]/, hint_type: "db_read", detail: "query_select" },
-  { pattern: /\.query\s*\(\s*['"`]/, hint_type: "db_read", detail: "raw_query" },
-  {
-    pattern:
-      /\b(db|model|repo|repository|collection|table|prisma|knex|sequelize|typeorm|pool|client)\.\w*(?:get|find|select|query|count|aggregate)\w*\s*\(/,
-    hint_type: "db_read",
-    detail: "db_contextual_read",
-  },
-  // DB writes — require ORM-specific suffixes or contextual DB object prefix
-  // to avoid matching Map.delete(), Set.delete(), Array.splice().create(), etc.
-  { pattern: /\.save\s*\(\s*\{/, hint_type: "db_write", detail: "orm_save" },
-  { pattern: /\.insert(One|Many)?\s*\(/, hint_type: "db_write", detail: "db_insert" },
-  { pattern: /\.update(One|Many|ById|Where)?\s*\(\s*\{/, hint_type: "db_write", detail: "db_update" },
-  { pattern: /\.delete(One|Many|ById|Where)\s*\(/, hint_type: "db_write", detail: "db_delete" },
-  { pattern: /\.destroy\s*\(/, hint_type: "db_write", detail: "db_destroy" },
-  {
-    pattern:
-      /\b(db|model|repo|repository|collection|table|prisma|knex|sequelize|typeorm|pool|client)\.\w*(?:save|insert|update|delete|remove|create|upsert|destroy)\w*\s*\(/,
-    hint_type: "db_write",
-    detail: "db_contextual_write",
-  },
-  // Network calls
-  { pattern: /fetch\s*\(/, hint_type: "network_call", detail: "fetch" },
-  { pattern: /axios\.(get|post|put|patch|delete)\s*\(/, hint_type: "network_call", detail: "axios" },
-  { pattern: /\.request\s*\(/, hint_type: "network_call", detail: "http_request" },
-  { pattern: /https?\.\s*(get|request)\s*\(/, hint_type: "network_call", detail: "node_http" },
-  { pattern: /WebSocket/, hint_type: "network_call", detail: "websocket" },
-  // File I/O
-  { pattern: /fs\.(read|write|append|unlink|mkdir|rmdir)/, hint_type: "file_io", detail: "fs_operation" },
-  { pattern: /readFile(Sync)?\s*\(/, hint_type: "file_io", detail: "read_file" },
-  { pattern: /writeFile(Sync)?\s*\(/, hint_type: "file_io", detail: "write_file" },
-  // Cache operations
-  { pattern: /\.cache\.(get|set|del|clear)/, hint_type: "cache_op", detail: "cache_operation" },
-  { pattern: /redis\.(get|set|hget|hset|del)/, hint_type: "cache_op", detail: "redis" },
   // Auth
   { pattern: /\.authenticate\s*\(/, hint_type: "auth_check", detail: "authenticate" },
   { pattern: /\.authorize\s*\(/, hint_type: "auth_check", detail: "authorize" },
@@ -275,10 +251,10 @@ export async function extractFromTypeScript(
    * retry each file as its own single-file program so one poison file (or a
    * transient resource failure) costs one file, not the entire repository.
    */
-  const extractPerFileFallback = async (paths: string[]): Promise<void> => {
+  const extractPerFileFallback = async (paths: string[], options: ts.CompilerOptions = compilerOptions): Promise<void> => {
     for (const filePath of paths) {
       try {
-        const program = ts.createProgram([filePath], compilerOptions)
+        const program = ts.createProgram([filePath], options)
         await extractProgramFiles([filePath], program, program.getTypeChecker())
       } catch (err) {
         uncertaintyFlags.push("parse_error")
@@ -329,6 +305,19 @@ export async function extractFromTypeScript(
       }
       await yieldLoop()
     }
+  }
+
+  // JS retry: repos whose tsconfig lacks allowJs get their .js/.mjs files
+  // refused by the program ("source file not found"). Those aren't broken
+  // files — re-extract each with allowJs forced so scripts still index.
+  const jsRefused = failedFiles.filter((f) => /\.(m|c)?jsx?$/i.test(f))
+  if (jsRefused.length > 0 && compilerOptions.allowJs !== true) {
+    for (const f of jsRefused) {
+      const idx = failedFiles.indexOf(f)
+      if (idx >= 0) failedFiles.splice(idx, 1)
+    }
+    log.info("Retrying JS files with allowJs forced", { count: jsRefused.length })
+    await extractPerFileFallback(jsRefused, { ...compilerOptions, allowJs: true, checkJs: false })
   }
 
   timer({
@@ -429,6 +418,27 @@ function extractFromSourceFile(
             normalized_ast_hash: declNormalizedAstHash,
             visibility: getVisibility(node),
           })
+
+          // `const f = async () => { ... }` bodies used to get NO behavior
+          // hints at all — arrow-declared functions are the dominant style in
+          // modern TS, so that hole hid most real effects. Same hint pipeline
+          // as declared functions: syntactic patterns + type-resolved effects.
+          if (decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
+            extractBehaviorHints(
+              codeOnlyScanText(decl.initializer, sourceFile),
+              declStableKey,
+              declStartLine + 1,
+              behaviorHints,
+            )
+            for (const resolved of resolveEffectHints(decl.initializer, sourceFile, checker)) {
+              behaviorHints.push({
+                symbol_key: declStableKey,
+                hint_type: resolved.hint_type,
+                detail: resolved.detail,
+                line: resolved.line,
+              })
+            }
+          }
         }
       } else if ("name" in node && node.name) {
         name = (node.name as ts.Identifier).getText(sourceFile)
@@ -479,11 +489,18 @@ function extractFromSourceFile(
         })
 
         // Extract behavior hints from function/method bodies.
-        // Scan code-only text: with raw text, a pattern-table string literal or a
-        // "// TODO: call .destroy()" comment counts as a real side effect, and
-        // transitive propagation then smears that phantom effect across the graph.
+        // External-effect categories come from the TYPE-RESOLVED analyzer;
+        // syntactic patterns (on code-only text) fill the local categories.
         if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) {
           extractBehaviorHints(codeOnlyScanText(node, sourceFile), stableKey, startLine + 1, behaviorHints)
+          for (const resolved of resolveEffectHints(node, sourceFile, checker)) {
+            behaviorHints.push({
+              symbol_key: stableKey,
+              hint_type: resolved.hint_type,
+              detail: resolved.detail,
+              line: resolved.line,
+            })
+          }
           extractContractHint(node, sourceFile, checker, stableKey, contractHints, uncertaintyFlags)
         }
 

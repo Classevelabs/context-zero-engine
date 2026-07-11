@@ -191,6 +191,67 @@ From an instrumented full-analysis run on the engine's own codebase:
 
 ---
 
+## Effect-Analysis Accuracy (v2.5.0)
+
+v2.5.0 replaced pattern-guessed external effects with a type-resolved
+analyzer for TypeScript/JavaScript (every call resolved through the
+compiler back to its source module). Accuracy is measured against a
+hand-labeled fixture suite shipped in the repository — 22 functions across
+8 external-effect categories, including the known failure traps of the old
+analyzer (`Map.get`, `crypto.update`, effect words in comments and string
+literals, calls on untyped local receivers, `WebSocket` as a type
+annotation).
+
+| Analyzer | Precision | Recall | F1 |
+|---|---:|---:|---:|
+| **v2.5 type-resolved** | **100%** | **100%** | **100%** |
+| v2.3/v2.4 pattern-based (same suite) | 50.0% | 68.8% | 57.9% |
+
+Honest framing:
+
+- These are **fixture-suite numbers, not a field study**. The suite was
+  designed alongside the analyzer; it includes the traps that made the old
+  system lie, but the wild contains receiver shapes the suite doesn't.
+- **Known recall limit by design**: calls on receivers the checker cannot
+  trace to a module (`any`-typed parameters, dependency-injected clients
+  without type annotations) produce **no** external-effect tag rather than
+  a guess. Transitive propagation usually recovers these when the injected
+  implementation lives in the same repository.
+- Per-symbol behavioral profiles are now strictly **direct** (what the
+  function's own body does); transitive effects are provenance-labeled
+  (`direct` vs `transitive`, with hop counts) in effect signatures instead
+  of being silently merged in.
+- Reproduce: `npx ts-node scripts/effect-eval.ts` (add `--json` for
+  machine-readable output). A CI test (`effect-resolver.test.ts`) pins the
+  fixture suite so the table above cannot silently rot.
+
+---
+
+## Real-Project Benchmark Refresh (v2.5.0, 2026-07-10)
+
+Re-measured token savings with the v2.5.0 engine on four real, private,
+actively developed repositories (same methodology as above: `ceil(bytes/4)`
+token policy, 8 real symbols per repository, exact-symbol grep-and-read
+baseline vs one strict context capsule per symbol). Run on a freshly
+compacted local PostgreSQL 16; the repositories are ClassEve production
+codebases, not toy corpora.
+
+| Repository | Files indexed | Symbols | Exact-symbol baseline (tokens) | ContextZero (tokens) | Reduction | Savings |
+|---|---:|---:|---:|---:|---:|---:|
+| Engine self-ingest | 122 | 1,785 | 333,000 | 123,323 | **2.7x** | **63.0%** |
+| Next.js website (~80 routes) | 141 | 492 | 239,868 | 64,804 | **3.7x** | **73.0%** |
+| Cloudflare worker API | 46 | 384 | 4,127,654 | 111,289 | **37.1x** | **97.3%** |
+| Desktop-app monorepo | 2,411 | 27,095 | 15,534,914 | 211,613 | **73.4x** | **98.6%** |
+
+Consistent with the earlier runs: savings scale with repository size and
+file granularity. The worker's outsized ratio comes from its shape — a few
+very large route/webhook files, so the grep-and-read baseline pays for
+entire multi-thousand-line files where a capsule pays for one symbol
+neighborhood. Whole-source baselines for the same runs: 45.0x / 63.0x /
+51.1x / 725.5x.
+
+---
+
 ## Reproducing
 
 All benchmark scripts are in the repository and run with `ts-node` against

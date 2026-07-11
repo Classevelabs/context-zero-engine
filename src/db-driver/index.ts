@@ -176,7 +176,12 @@ class DatabaseDriver {
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
     }
     const maxConnections = safeInt(process.env["DB_MAX_CONNECTIONS"], 20)
-    const statementTimeoutMs = safeInt(process.env["DB_STATEMENT_TIMEOUT_MS"], 30_000)
+    // 120s, not 30s: ingestion legitimately runs long statements (bulk symbol
+    // lookups, relation resolution) on a busy/vacuum-lagged database, and a
+    // canceled statement there costs a whole extraction batch. This is a
+    // local single-user engine — protecting ingest beats sniping slow
+    // interactive queries. Override via DB_STATEMENT_TIMEOUT_MS.
+    const statementTimeoutMs = safeInt(process.env["DB_STATEMENT_TIMEOUT_MS"], 120_000)
     const lockTimeoutMs = safeInt(process.env["DB_LOCK_TIMEOUT_MS"], 5_000)
     const idleInTxnTimeoutMs = safeInt(process.env["DB_IDLE_IN_TXN_TIMEOUT_MS"], 60_000)
     this.slowQueryMs = safeInt(process.env["DB_SLOW_QUERY_MS"], 500)

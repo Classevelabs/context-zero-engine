@@ -36,8 +36,8 @@ for full methodology, results, and honest caveats.
 |-----------|-------------|
 | **Context Capsules** | Token-budgeted context packages: source, dependencies, contracts, and effects in one call, with a 5-level degradation ladder. |
 | **Blast Radius** | 5-dimensional impact analysis (structural, behavioral, contract, homolog, historical) with severity and confidence scoring. |
-| **Behavioral Profiling** | Every function classified: pure / read_only / read_write / side_effecting, with transitive propagation through the call graph. |
-| **Effect Signatures** | 9 typed effects (reads, writes, opens, throws, calls_external, logs, emits, normalizes, acquires_lock) propagated transitively. |
+| **Behavioral Profiling** | Every function classified: pure / read_only / read_write / side_effecting. TS/JS external effects are **type-resolved** — each call traced through the compiler to its source module (pg, fs, axios, …), not pattern-guessed. Purity propagates through the call graph; resource lists stay per-symbol. Measured 100%/100% precision-recall on the shipped ground-truth suite (see [BENCHMARKS.md](BENCHMARKS.md)). |
+| **Effect Signatures** | 9 typed effects (reads, writes, opens, throws, calls_external, logs, emits, normalizes, acquires_lock), provenance-labeled (`direct` vs `transitive` with hop counts) and propagated with a bounded, kind-filtered policy. |
 | **Contract Extraction** | Input/output types, error contracts, security contracts, guard clauses, derived invariants — mined from the code itself. |
 | **Homolog Detection** | Finds behaviorally equivalent code (not just textual clones) via 7-dimensional evidence scoring with contradiction flags. |
 | **Smart Context** | One call: source + blast radius + callers + tests + contracts. Replaces 8+ separate lookups. |
