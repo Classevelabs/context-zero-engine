@@ -29,6 +29,7 @@ import { v4 as uuidv4 } from "uuid"
 import { db } from "../db-driver"
 import { jsonField, validateRows, validateBehavioralProfile, validateContractProfile } from "../db-driver/result"
 import { Logger } from "../logger"
+import { stripLiteralsAndComments } from "./code-text"
 import type { BehaviorHint, BehavioralProfile, ContractProfile } from "../types"
 
 const log = new Logger("effect-engine")
@@ -62,7 +63,34 @@ export interface EffectEntry {
   provenance: "direct" | "transitive"
   /** If transitive, the originating symbol version ID */
   origin_symbol_version_id?: string
+  /** If transitive, call-graph distance from the direct observation (1 = immediate callee) */
+  hops?: number
 }
+
+/**
+ * Effect kinds that remain MEANINGFUL when lifted to a caller. A caller
+ * really does read the DB / hit the network / open files through its
+ * callees. Logging, data normalization, and receiver-local state mutation
+ * do not describe the caller — propagating them was pure noise (every
+ * function transitively "logs" through anything that logs).
+ */
+const TRANSITIVE_EFFECT_KINDS: ReadonlySet<EffectKind> = new Set([
+  "reads",
+  "writes",
+  "opens",
+  "calls_external",
+  "emits",
+  "requires",
+  "acquires_lock",
+  "throws",
+] as EffectKind[])
+
+/**
+ * Stop lifting an effect past this call-graph distance. Beyond a few hops
+ * the attribution is technically true but analytically useless — it turns
+ * every entry point into a copy of the whole system's effect set.
+ */
+const MAX_EFFECT_HOPS = 4
 
 /**
  * Effect class — 5-tier classification derived from the effect set.
@@ -126,9 +154,10 @@ interface FrameworkPattern {
 }
 
 const FRAMEWORK_BEHAVIOR_MAP: FrameworkPattern[] = [
-  // Database ORMs
+  // Database ORMs — bare `.get`/`.find` removed: they matched every Map/dict
+  // get and array find in every language, tagging pure helpers as DB readers.
   {
-    pattern: /\.(find|findOne|findMany|findById|select|get|query|count|aggregate)\b/i,
+    pattern: /\.(findOne|findMany|findById|findAll|selectFrom|query|aggregate)\s*\(/i,
     effects: [{ kind: "reads", descriptor: "db.query", detail: "ORM read operation" }],
   },
   {
@@ -151,9 +180,10 @@ const FRAMEWORK_BEHAVIOR_MAP: FrameworkPattern[] = [
     ],
   },
 
-  // HTTP / Network
+  // HTTP / Network — require an actual call/member use; the bare word
+  // `request` is one of the most common variable names in existence.
   {
-    pattern: /\b(fetch|axios|got|superagent|request)\b/i,
+    pattern: /\b(fetch|axios|got|superagent)\s*[.(]/i,
     effects: [{ kind: "calls_external", descriptor: "network.http", detail: "HTTP client call" }],
   },
   {
@@ -249,17 +279,19 @@ const FRAMEWORK_BEHAVIOR_MAP: FrameworkPattern[] = [
     effects: [{ kind: "normalizes", descriptor: "data.normalize", detail: "Data normalization/validation" }],
   },
 
-  // Payment / external services
+  // Payment / external services — require a member CALL on the client
+  // object; the bare service name matched prose, identifiers, and (before
+  // literal-blanking) every string mentioning the service.
   {
-    pattern: /\bstripe\b/i,
+    pattern: /\bstripe\.\w+[\w.]*\s*\(/i,
     effects: [{ kind: "calls_external", descriptor: "network.stripe", detail: "Stripe payment API" }],
   },
   {
-    pattern: /\b(twilio|sendgrid|mailgun|ses)\b/i,
+    pattern: /\b(twilio|sendgrid|mailgun|ses)\.\w+[\w.]*\s*\(/i,
     effects: [{ kind: "calls_external", descriptor: "network.email_sms", detail: "Email/SMS service" }],
   },
   {
-    pattern: /\b(s3|gcs|azure\.storage|cloudStorage)\b/i,
+    pattern: /\b(s3|gcs|cloudStorage)\.\w+[\w.]*\s*\(|\bazure\.storage\b/i,
     effects: [{ kind: "calls_external", descriptor: "network.cloud_storage", detail: "Cloud storage API" }],
   },
 
@@ -1007,8 +1039,12 @@ export class EffectEngine {
 
         let callerChanged = false
 
-        // Propagate each callee effect into the caller
+        // Propagate each callee effect into the caller — only kinds that stay
+        // meaningful transitively, and only within the hop budget.
         for (const calleeEffect of calleeSig.effects) {
+          if (!TRANSITIVE_EFFECT_KINDS.has(calleeEffect.kind)) continue
+          const hops = (calleeEffect.provenance === "transitive" ? (calleeEffect.hops ?? 1) : 0) + 1
+          if (hops > MAX_EFFECT_HOPS) continue
           const transitiveKey = `${calleeEffect.kind}:${calleeEffect.descriptor}`
 
           if (!callerKeys.has(transitiveKey)) {
@@ -1019,6 +1055,7 @@ export class EffectEngine {
               provenance: "transitive",
               origin_symbol_version_id:
                 calleeEffect.provenance === "transitive" ? calleeEffect.origin_symbol_version_id : calleeId,
+              hops,
             })
             callerKeys.add(transitiveKey)
             callerChanged = true
@@ -1091,6 +1128,13 @@ export class EffectEngine {
           const sig = signatures.get(nodeId)
           if (!sig) continue
           for (const effect of sig.effects) {
+            // Same policy as acyclic propagation: only transitively meaningful
+            // kinds join the cluster union, and only DIRECT observations do —
+            // unioning already-transitive entries let one member's 4-hop tail
+            // smear across every cycle member (how a license-file helper ended
+            // up "calling Stripe").
+            if (!TRANSITIVE_EFFECT_KINDS.has(effect.kind)) continue
+            if (effect.provenance !== "direct") continue
             const key = `${effect.kind}:${effect.descriptor}`
             if (!clusterEffectKeys.has(key)) {
               clusterEffectKeys.add(key)
@@ -1121,6 +1165,7 @@ export class EffectEngine {
                 detail: `[cycle-propagated] ${effect.detail}`,
                 provenance: "transitive",
                 origin_symbol_version_id: effect.provenance === "transitive" ? effect.origin_symbol_version_id : nodeId,
+                hops: 1,
               })
               nodeKeys.add(key)
               changed = true
@@ -1723,13 +1768,27 @@ export class EffectEngine {
   private mineFromFrameworkPatterns(codeText: string, language: string = ""): EffectEntry[] {
     if (!codeText || codeText.length === 0) return []
 
+    const lang = language.toLowerCase()
+
+    // TypeScript/JavaScript external effects come from the TYPE-RESOLVED
+    // behavioral profiles (adapters/ts/effect-resolver) — module-attributed,
+    // checker-verified. Re-mining the same body with generic word patterns
+    // only re-introduced the false positives that layer removed (the engine's
+    // own pattern table used to "call Stripe"). Language-tagged patterns
+    // (none for ts/js today) would still apply.
+    const skipGenericPatterns = lang === "typescript" || lang === "javascript"
+
+    // Pattern scans must not see string literals or comments — stored
+    // body_source is raw text, so blank them heuristically first.
+    const scanText = stripLiteralsAndComments(codeText, lang)
+
     const effects: EffectEntry[] = []
     const seen = new Set<string>()
-    const lang = language.toLowerCase()
 
     for (const entry of FRAMEWORK_BEHAVIOR_MAP) {
       if (entry.languages && !entry.languages.includes(lang)) continue
-      if (entry.pattern.test(codeText)) {
+      if (!entry.languages && skipGenericPatterns) continue
+      if (entry.pattern.test(scanText)) {
         for (const template of entry.effects) {
           const key = `${template.kind}:${template.descriptor}`
           if (!seen.has(key)) {

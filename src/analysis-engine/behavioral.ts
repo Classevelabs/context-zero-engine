@@ -329,49 +329,6 @@ export class BehavioralEngine {
       }
     }
 
-    // O(1) set-based merge utility
-    const mergeUnique = (target: string[], source: string[], targetSet: Set<string>): boolean => {
-      let merged = false
-      for (const item of source) {
-        if (!targetSet.has(item)) {
-          target.push(item)
-          targetSet.add(item)
-          merged = true
-        }
-      }
-      return merged
-    }
-
-    // Build per-profile Sets for O(1) membership checks
-    const profileSets = new Map<
-      string,
-      {
-        resource_touches: Set<string>
-        db_reads: Set<string>
-        db_writes: Set<string>
-        network_calls: Set<string>
-        cache_ops: Set<string>
-        file_io: Set<string>
-        auth_operations: Set<string>
-        state_mutation_profile: Set<string>
-        transaction_profile: Set<string>
-      }
-    >()
-
-    for (const [svId, profile] of profiles) {
-      profileSets.set(svId, {
-        resource_touches: new Set(profile.resource_touches),
-        db_reads: new Set(profile.db_reads),
-        db_writes: new Set(profile.db_writes),
-        network_calls: new Set(profile.network_calls),
-        cache_ops: new Set(profile.cache_ops),
-        file_io: new Set(profile.file_io),
-        auth_operations: new Set(profile.auth_operations),
-        state_mutation_profile: new Set(profile.state_mutation_profile),
-        transaction_profile: new Set(profile.transaction_profile),
-      })
-    }
-
     // Kahn's algorithm: start with nodes that have no profiled callees (in-degree 0)
     const queue: string[] = []
     let queueIdx = 0
@@ -387,56 +344,29 @@ export class BehavioralEngine {
 
       const calleeProfile = profiles.get(calleeId)
       if (!calleeProfile) continue
-      const calleeSets = profileSets.get(calleeId)
-      if (!calleeSets) continue
 
-      // Propagate this callee's effects to all its callers
+      // Propagate this callee's purity to all its callers
       const callers = reverseGraph.get(calleeId) || []
       for (const callerId of callers) {
         const callerProfile = profiles.get(callerId)
         if (!callerProfile) continue
-        const callerSets = profileSets.get(callerId)
-        if (!callerSets) continue
 
-        let changed = false
-
-        // Escalate purity
+        // PURITY-ONLY propagation. This pass used to merge every resource
+        // array (db_reads, network_calls, file_io, …) into every transitive
+        // caller — and because behavioral profiles carry no provenance, the
+        // effect engine then republished those inherited resources as DIRECT
+        // effects of the caller (a fixture file's axios.get showed up as a
+        // "direct" effect of ingestRepo). Resource-level transitivity is the
+        // effect engine's job, where entries are provenance-labeled,
+        // hop-bounded, and kind-filtered. Behavioral profiles stay
+        // per-symbol: what THIS function's own body does. Purity still
+        // escalates — a caller of a side-effecting callee is not pure.
         const callerLevel = purityOrder[callerProfile.purity_class]
         const calleeLevel = purityOrder[calleeProfile.purity_class]
         if (calleeLevel > callerLevel) {
           callerProfile.purity_class = calleeProfile.purity_class
-          changed = true
+          changedSvIds.add(callerId)
         }
-
-        // Merge resources with O(1) Set lookups
-        if (mergeUnique(callerProfile.resource_touches, calleeProfile.resource_touches, callerSets.resource_touches))
-          changed = true
-        if (mergeUnique(callerProfile.db_reads, calleeProfile.db_reads, callerSets.db_reads)) changed = true
-        if (mergeUnique(callerProfile.db_writes, calleeProfile.db_writes, callerSets.db_writes)) changed = true
-        if (mergeUnique(callerProfile.network_calls, calleeProfile.network_calls, callerSets.network_calls))
-          changed = true
-        if (mergeUnique(callerProfile.cache_ops, calleeProfile.cache_ops, callerSets.cache_ops)) changed = true
-        if (mergeUnique(callerProfile.file_io, calleeProfile.file_io, callerSets.file_io)) changed = true
-        if (mergeUnique(callerProfile.auth_operations, calleeProfile.auth_operations, callerSets.auth_operations))
-          changed = true
-        if (
-          mergeUnique(
-            callerProfile.state_mutation_profile,
-            calleeProfile.state_mutation_profile,
-            callerSets.state_mutation_profile,
-          )
-        )
-          changed = true
-        if (
-          mergeUnique(
-            callerProfile.transaction_profile,
-            calleeProfile.transaction_profile,
-            callerSets.transaction_profile,
-          )
-        )
-          changed = true
-
-        if (changed) changedSvIds.add(callerId)
 
         // Decrement caller's in-degree; when 0, all its callees are processed
         const newDegree = (inDegree.get(callerId) || 1) - 1
@@ -485,94 +415,38 @@ export class BehavioralEngine {
           }
         }
 
-        // Compute the union of all effects across the cluster
-        const clusterResourceTouches = new Set<string>()
-        const clusterDbReads = new Set<string>()
-        const clusterDbWrites = new Set<string>()
-        const clusterNetworkCalls = new Set<string>()
-        const clusterCacheOps = new Set<string>()
-        const clusterFileIo = new Set<string>()
-        const clusterAuthOps = new Set<string>()
-        const clusterStateMutation = new Set<string>()
-        const clusterTransaction = new Set<string>()
+        // Purity-only cluster recovery (see the acyclic pass above for why
+        // resource arrays are no longer merged): every cycle member takes the
+        // cluster's most impure class.
         let clusterMaxPurity: PurityClass = "pure"
-
         for (const nodeId of cluster) {
           const p = profiles.get(nodeId)
           if (!p) continue
-          for (const v of p.resource_touches) clusterResourceTouches.add(v)
-          for (const v of p.db_reads) clusterDbReads.add(v)
-          for (const v of p.db_writes) clusterDbWrites.add(v)
-          for (const v of p.network_calls) clusterNetworkCalls.add(v)
-          for (const v of p.cache_ops) clusterCacheOps.add(v)
-          for (const v of p.file_io) clusterFileIo.add(v)
-          for (const v of p.auth_operations) clusterAuthOps.add(v)
-          for (const v of p.state_mutation_profile) clusterStateMutation.add(v)
-          for (const v of p.transaction_profile) clusterTransaction.add(v)
           if (purityOrder[p.purity_class] > purityOrder[clusterMaxPurity]) {
             clusterMaxPurity = p.purity_class
           }
         }
 
-        // Assign the union to every member of the cluster
         for (const nodeId of cluster) {
           const p = profiles.get(nodeId)
           if (!p) continue
-          const s = profileSets.get(nodeId)
-          if (!s) continue
-
-          let changed = false
           if (purityOrder[clusterMaxPurity] > purityOrder[p.purity_class]) {
             p.purity_class = clusterMaxPurity
-            changed = true
+            changedSvIds.add(nodeId)
           }
-          if (mergeUnique(p.resource_touches, Array.from(clusterResourceTouches), s.resource_touches)) changed = true
-          if (mergeUnique(p.db_reads, Array.from(clusterDbReads), s.db_reads)) changed = true
-          if (mergeUnique(p.db_writes, Array.from(clusterDbWrites), s.db_writes)) changed = true
-          if (mergeUnique(p.network_calls, Array.from(clusterNetworkCalls), s.network_calls)) changed = true
-          if (mergeUnique(p.cache_ops, Array.from(clusterCacheOps), s.cache_ops)) changed = true
-          if (mergeUnique(p.file_io, Array.from(clusterFileIo), s.file_io)) changed = true
-          if (mergeUnique(p.auth_operations, Array.from(clusterAuthOps), s.auth_operations)) changed = true
-          if (mergeUnique(p.state_mutation_profile, Array.from(clusterStateMutation), s.state_mutation_profile))
-            changed = true
-          if (mergeUnique(p.transaction_profile, Array.from(clusterTransaction), s.transaction_profile)) changed = true
-
-          if (changed) changedSvIds.add(nodeId)
         }
       }
     }
 
-    // Persist only changed profiles back to DB
+    // Persist only changed profiles back to DB (purity is the only field
+    // this pass mutates now)
     const statements: { text: string; params: unknown[] }[] = []
     for (const svId of changedSvIds) {
       const profile = profiles.get(svId)
       if (!profile) continue
       statements.push({
-        text: `UPDATE behavioral_profiles SET
-                    purity_class = $1,
-                    resource_touches = $2,
-                    db_reads = $3,
-                    db_writes = $4,
-                    network_calls = $5,
-                    cache_ops = $6,
-                    file_io = $7,
-                    auth_operations = $8,
-                    state_mutation_profile = $9,
-                    transaction_profile = $10
-                WHERE symbol_version_id = $11`,
-        params: [
-          profile.purity_class,
-          profile.resource_touches,
-          profile.db_reads,
-          profile.db_writes,
-          profile.network_calls,
-          profile.cache_ops,
-          profile.file_io,
-          profile.auth_operations,
-          profile.state_mutation_profile,
-          profile.transaction_profile,
-          svId,
-        ],
+        text: `UPDATE behavioral_profiles SET purity_class = $1 WHERE symbol_version_id = $2`,
+        params: [profile.purity_class, svId],
       })
     }
 

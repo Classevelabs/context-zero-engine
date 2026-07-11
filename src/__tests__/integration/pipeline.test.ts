@@ -42,8 +42,10 @@ jest.mock("../../db-driver/core_data", () => ({
 // ── Fixtures ────────────────────────────────────────────────────────
 
 const SAMPLE_SERVICE_CODE = `
-import { db } from './database';
+import { Pool } from 'pg';
 import { UserDTO } from './types';
+
+const db = new Pool();
 
 export async function fetchUserById(userId: string): Promise<UserDTO> {
     const result = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
@@ -58,8 +60,8 @@ export async function createUser(name: string, email: string): Promise<UserDTO> 
     if (existing.rows.length > 0) {
         throw new Error('Duplicate email');
     }
-    const result = await db.insert({ table: 'users', data: { name, email } });
-    return result as UserDTO;
+    const result = await db.query('INSERT INTO users (name, email) VALUES ($1, $2)', [name, email]);
+    return result as unknown as UserDTO;
 }
 
 export async function syncUserToExternalService(user: UserDTO): Promise<void> {
@@ -81,13 +83,16 @@ export class UserRepository {
     }
 
     async remove(userId: string): Promise<void> {
-        await db.delete({ table: 'users', where: { id: userId } });
+        await db.query('DELETE FROM users WHERE id = $1', [userId]);
     }
 }
 `
 
 const SAMPLE_AUTH_CODE = `
 import { verifyToken } from './auth';
+import Redis from 'ioredis';
+
+const redis = new Redis();
 
 export async function protectedEndpoint(req: any, res: any): Promise<void> {
     try {
@@ -198,17 +203,16 @@ describe("Pipeline Integration — Behavioral Hint Detection", () => {
     result = await extractFromTypeScript([sampleServicePath, sampleAuthPath])
   })
 
-  test("detects db_read hints from .query()", () => {
+  test("detects db_read hints from pool.query(SELECT) with module attribution", () => {
     const dbReads = result.behavior_hints.filter((h) => h.hint_type === "db_read")
     expect(dbReads.length).toBeGreaterThanOrEqual(1)
-    expect(dbReads.some((h) => h.detail === "raw_query")).toBe(true)
+    expect(dbReads.some((h) => h.detail === "pg.query")).toBe(true)
   })
 
-  test("detects db_write hints from .insert() and .delete()", () => {
+  test("detects db_write hints from pool.query(INSERT/DELETE) via SQL sniffing", () => {
     const dbWrites = result.behavior_hints.filter((h) => h.hint_type === "db_write")
-    expect(dbWrites.length).toBeGreaterThanOrEqual(1)
-    const details = dbWrites.map((h) => h.detail)
-    expect(details).toContain("db_insert")
+    expect(dbWrites.length).toBeGreaterThanOrEqual(2)
+    expect(dbWrites.every((h) => h.detail === "pg.query")).toBe(true)
   })
 
   test("detects network_call hints from fetch()", () => {
@@ -233,10 +237,10 @@ describe("Pipeline Integration — Behavioral Hint Detection", () => {
     expect(authHints.some((h) => h.detail === "token_verify")).toBe(true)
   })
 
-  test("detects cache_op hints from redis.get", () => {
+  test("detects cache_op hints from redis.get with module attribution", () => {
     const cacheHints = result.behavior_hints.filter((h) => h.hint_type === "cache_op")
     expect(cacheHints.length).toBeGreaterThanOrEqual(1)
-    expect(cacheHints.some((h) => h.detail === "redis")).toBe(true)
+    expect(cacheHints.some((h) => h.detail === "redis.get")).toBe(true)
   })
 
   test("behavior hints reference the correct symbol keys", () => {

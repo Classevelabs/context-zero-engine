@@ -52,39 +52,78 @@ function ofType(h: any[], t: string) {
 // ── Behavioral Hints: Positive Cases ──
 
 describe("Behavioral Hints — Positive", () => {
-  test("detects .findOne()", async () => {
-    expect(ofType(await hints("function f() { return db.findOne({ id: 1 }); }"), "db_read").length).toBeGreaterThan(0)
+  test("detects .findOne() on a typed ORM client (type-resolved)", async () => {
+    const src = [
+      'import knex from "knex"',
+      'const db = knex({ client: "pg" })',
+      'async function f() { return db("users").where({ id: 1 }).first(); }',
+    ].join("\n")
+    expect(ofType(await hints(src), "db_read").length).toBeGreaterThan(0)
   })
-  test('detects .query("SQL")', async () => {
-    expect(ofType(await hints('function f() { return db.query("SELECT 1"); }'), "db_read").length).toBeGreaterThan(0)
+
+  test("does NOT tag .findOne() on an unresolvable receiver", async () => {
+    expect(ofType(await hints("function f(db: any) { return db.findOne({ id: 1 }); }"), "db_read").length).toBe(0)
   })
-  test("detects db.insertOne()", async () => {
-    expect(ofType(await hints("function f() { return db.insertOne({ x: 1 }); }"), "db_write").length).toBeGreaterThan(0)
+  test('detects pool.query("SELECT ...") (type-resolved, SQL-sniffed)', async () => {
+    const src = [
+      'import { Pool } from "pg"',
+      "const pool = new Pool()",
+      'async function f() { return pool.query("SELECT 1"); }',
+    ].join("\n")
+    expect(ofType(await hints(src), "db_read").length).toBeGreaterThan(0)
   })
-  test("detects db.update()", async () => {
-    expect(ofType(await hints("function f() { return db.update({ x: 1 }); }"), "db_write").length).toBeGreaterThan(0)
+  test("detects insertOne() on a typed mongo collection (type-resolved)", async () => {
+    const src = [
+      'import { MongoClient } from "mongodb"',
+      "const mongo = new MongoClient(\"mongodb://localhost\")",
+      "async function f() { return mongo.insertOne({ x: 1 }); }",
+    ].join("\n")
+    expect(ofType(await hints(src), "db_write").length).toBeGreaterThan(0)
   })
-  test("detects .deleteOne()", async () => {
-    expect(ofType(await hints("function f() { return repo.deleteOne({ id: 1 }); }"), "db_write").length).toBeGreaterThan(0)
+  test("detects pg pool UPDATE (type-resolved)", async () => {
+    const src = [
+      'import { Pool } from "pg"',
+      "const pool = new Pool()",
+      'async function f() { return pool.query("UPDATE users SET x = 1"); }',
+    ].join("\n")
+    expect(ofType(await hints(src), "db_write").length).toBeGreaterThan(0)
   })
-  test("detects .updateMany({)", async () => {
-    expect(ofType(await hints("function f() { return model.updateMany({ a: true }); }"), "db_write").length).toBeGreaterThan(
-      0,
-    )
+
+  test("does NOT tag .update() on an unresolvable receiver (was a guess before)", async () => {
+    expect(ofType(await hints("function f(db: any) { return db.update({ x: 1 }); }"), "db_write").length).toBe(0)
+  })
+  test("detects deleteOne() on a typed mongo collection (type-resolved)", async () => {
+    const src = [
+      'import { MongoClient } from "mongodb"',
+      "const mongo = new MongoClient(\"mongodb://localhost\")",
+      "async function f() { return mongo.deleteOne({ id: 1 }); }",
+    ].join("\n")
+    expect(ofType(await hints(src), "db_write").length).toBeGreaterThan(0)
+  })
+  test("detects updateMany() on a typed mongo collection (type-resolved)", async () => {
+    const src = [
+      'import { MongoClient } from "mongodb"',
+      "const mongo = new MongoClient(\"mongodb://localhost\")",
+      "async function f() { return mongo.updateMany({ a: true }); }",
+    ].join("\n")
+    expect(ofType(await hints(src), "db_write").length).toBeGreaterThan(0)
   })
   test("detects fetch()", async () => {
     expect(
       ofType(await hints('async function f() { return fetch("https://api.com"); }'), "network_call").length,
     ).toBeGreaterThan(0)
   })
-  test("detects axios.get()", async () => {
-    expect(ofType(await hints('async function f() { return axios.get("/api"); }'), "network_call").length).toBeGreaterThan(0)
+  test("detects axios.get() via import (type-resolved)", async () => {
+    const src = ['import axios from "axios"', 'async function f() { return axios.get("/api"); }'].join("\n")
+    expect(ofType(await hints(src), "network_call").length).toBeGreaterThan(0)
   })
-  test("detects readFileSync()", async () => {
-    expect(ofType(await hints('function f() { return readFileSync("f.txt"); }'), "file_io").length).toBeGreaterThan(0)
+  test("detects readFileSync() via fs import (type-resolved)", async () => {
+    const src = ['import { readFileSync } from "fs"', 'function f() { return readFileSync("f.txt"); }'].join("\n")
+    expect(ofType(await hints(src), "file_io").length).toBeGreaterThan(0)
   })
-  test("detects fs.writeFile()", async () => {
-    expect(ofType(await hints('function f() { fs.writeFile("o.txt", "d", () => {}); }'), "file_io").length).toBeGreaterThan(0)
+  test("detects fs.writeFile() via fs import (type-resolved)", async () => {
+    const src = ['import * as fs from "fs"', 'function f() { fs.writeFile("o.txt", "d", () => {}); }'].join("\n")
+    expect(ofType(await hints(src), "file_io").length).toBeGreaterThan(0)
   })
   test("detects .transaction()", async () => {
     expect(
