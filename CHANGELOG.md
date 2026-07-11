@@ -5,6 +5,75 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] — Type-resolved effect analysis
+
+The effect/behavioral layer stops guessing. Measured on the ground-truth
+fixture suite (`npx ts-node scripts/effect-eval.ts`): **100% precision /
+100% recall** across 22 labeled functions and 8 effect categories, vs
+**50% precision / 68.8% recall** for the previous pattern-based analyzer
+on the identical suite. (Fixture-suite numbers, not a field study — the
+suite includes the known failure traps, and the eval script is shipped so
+the numbers are reproducible. Unresolvable receivers in the wild — `any`
+typed, dependency-injected clients — still produce no tag by design.)
+
+### Added
+
+- **Type-resolved effect analyzer for TypeScript/JavaScript**
+  (`src/adapters/ts/effect-resolver.ts`). Every call and `new` expression
+  is resolved through the TypeScript checker back to the module its
+  receiver comes from (import declarations, `require()` initializers,
+  one-hop local aliases like `const pool = new Pool()`, declaring-file
+  package names) and classified from a curated module map (node builtins,
+  pg/knex/prisma/mongo/…, axios/undici/got/…, ioredis, child_process,
+  jsonwebtoken, zod, …). Raw SQL first-arguments are sniffed to split
+  db_read / db_write / transaction. Effectful globals (fetch, WebSocket,
+  localStorage) are tagged only when they genuinely resolve to the
+  ambient lib — a local `fetch` shadow doesn't count.
+- **Arrow-function coverage**: `const f = async () => { … }` bodies now
+  get behavioral hints at all — the previous analyzer only hinted
+  `function`/method declarations, which silently skipped the dominant
+  modern style.
+- **Ground-truth eval harness** (`scripts/effect-eval.ts` + labeled
+  fixtures + a CI regression test) so effect-analysis quality is a
+  number, not an adjective.
+- **Benchmark refresh on four real production repositories** (46–2,411
+  files): exact-symbol token savings measured at 63.0% / 73.0% / 97.3% /
+  98.6% — see BENCHMARKS.md "Real-Project Benchmark Refresh".
+- **JS retry with `allowJs` forced**: repositories whose tsconfig lacks
+  `allowJs` used to silently produce zero symbols for their .js/.mjs
+  scripts; those files are now re-extracted per-file with allowJs on.
+
+### Fixed
+
+- **Interactive statement timeout killing ingest queries.** The 2.4.0 fix
+  covered bulk INSERT transactions, but long SELECTs inside persistence
+  (symbol maps, relation resolution) could still hit the 30s session cap
+  on a busy database and cost a whole extraction batch. Default session
+  `statement_timeout` is now 120s (`DB_STATEMENT_TIMEOUT_MS` to override)
+  — sized for a local single-user engine where protecting ingestion beats
+  sniping slow interactive queries.
+
+### Changed
+
+- **Syntactic patterns no longer produce external-effect categories in
+  TS/JS.** db/network/file/cache guesses (`.request(` on any object,
+  `WebSocket` in a type position, `.get(` as a DB read) were the false-
+  positive factory; those categories now come exclusively from the
+  type resolver. Patterns still cover local categories (throws/catches,
+  state mutation, locks, serialization, validation, logging,
+  `.transaction(`).
+- **Framework-pattern mining in the effect engine is scoped**: skipped
+  entirely for TS/JS (the resolver owns externals), and for the other
+  languages it now scans literal-and-comment-blanked text with tightened
+  patterns (`stripe`/`twilio`/`s3` require a member call; bare `.get`/
+  `.find`/`request` removed).
+- **Transitive effect propagation is bounded and filtered**: only kinds
+  that stay meaningful across a call boundary propagate (db/network/
+  file/emits/auth/locks/throws — not logging, normalization, or
+  receiver-local mutation), propagation stops after 4 hops, and cycle
+  clusters union only their members' DIRECT effects. This ends the
+  smearing that once put a Stripe call on a license-file helper.
+
 ## [2.4.0] — Robustness release
 
 Found by running the engine against a 2,300-file monorepo through the MCP

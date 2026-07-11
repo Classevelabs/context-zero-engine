@@ -707,37 +707,43 @@ describe("EffectEngine", () => {
 
     test("mineFromFrameworkPatterns detects ORM reads", () => {
       const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
-      const code = "const user = await db.findOne({ id: 1 });"
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = "user = db.findOne({ id: 1 })"
+      const effects: EffectEntry[] = mine(code, "ruby")
       expect(effects.some((e: EffectEntry) => e.kind === "reads")).toBe(true)
     })
 
     test("mineFromFrameworkPatterns detects ORM writes", () => {
       const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
-      const code = "await repository.save(entity);"
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = "repository.save({ name: name })"
+      const effects: EffectEntry[] = mine(code, "ruby")
       expect(effects.some((e: EffectEntry) => e.kind === "writes")).toBe(true)
     })
 
     test("mineFromFrameworkPatterns detects HTTP calls", () => {
       const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
-      const code = 'const res = await fetch("https://api.example.com");'
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = 'res = fetch("https://api.example.com")'
+      const effects: EffectEntry[] = mine(code, "python")
       expect(effects.some((e: EffectEntry) => e.kind === "calls_external")).toBe(true)
     })
 
     test("mineFromFrameworkPatterns detects event emission", () => {
       const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
-      const code = 'this.eventEmitter.emit("user_created", data);'
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = 'event_emitter.emit("user_created", data)'
+      const effects: EffectEntry[] = mine(code, "python")
       expect(effects.some((e: EffectEntry) => e.kind === "emits")).toBe(true)
     })
 
     test("mineFromFrameworkPatterns detects logging", () => {
       const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
-      const code = 'console.log("debug info");'
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = 'logger.info("debug info")'
+      const effects: EffectEntry[] = mine(code, "python")
       expect(effects.some((e: EffectEntry) => e.kind === "logs")).toBe(true)
+    })
+
+    test("mineFromFrameworkPatterns skips generic patterns for typescript (type-resolver owns externals)", () => {
+      const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
+      const code = 'const user = await db.findOne({ id: 1 }); await fetch("https://x");'
+      expect(mine(code, "typescript")).toEqual([])
     })
 
     test("mineFromFrameworkPatterns returns empty for empty code", () => {

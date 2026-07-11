@@ -297,30 +297,45 @@ describe("EffectEngine", () => {
   describe("mineFromFrameworkPatterns", () => {
     const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
 
+    // ts/js external effects now come from the type-resolved adapter layer;
+    // the framework map serves the remaining languages, so these exercise it
+    // through non-TS language tags.
     test("detects ORM read patterns", () => {
-      const code = "const user = await db.findOne({ id });\nconst list = repo.findMany();"
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = "user = db.findOne({ id })\nlist = repo.findMany()"
+      const effects: EffectEntry[] = mine(code, "ruby")
 
       expect(effects.some((e) => e.kind === "reads")).toBe(true)
     })
 
     test("detects ORM write patterns", () => {
-      const code = "await db.save(entity);\nawait repo.insert(record);"
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = "db.save(entity)\nrepo.insertOne(record)"
+      const effects: EffectEntry[] = mine(code, "ruby")
 
       expect(effects.some((e) => e.kind === "writes")).toBe(true)
     })
 
     test("detects HTTP client calls", () => {
-      const code = 'const res = await fetch("https://api.com/users");'
-      const effects: EffectEntry[] = mine(code, "typescript")
+      const code = 'res = fetch("https://api.com/users")'
+      const effects: EffectEntry[] = mine(code, "python")
 
       expect(effects.some((e) => e.kind === "calls_external")).toBe(true)
     })
 
-    test("returns empty for pure code", () => {
-      const code = "function add(a: number, b: number) { return a + b; }"
+    test("skips generic patterns for typescript (type resolver owns externals)", () => {
+      const code = 'const user = await db.findOne({ id });\nconst res = await fetch("https://api.com");'
       const effects: EffectEntry[] = mine(code, "typescript")
+      expect(effects.length).toBe(0)
+    })
+
+    test("does not match patterns inside string literals or comments", () => {
+      const code = 'msg = "call db.findOne or fetch(url) later"  # fetch( the list\nvalue = 1'
+      const effects: EffectEntry[] = mine(code, "python")
+      expect(effects.length).toBe(0)
+    })
+
+    test("returns empty for pure code", () => {
+      const code = "def add(a, b):\n    return a + b"
+      const effects: EffectEntry[] = mine(code, "python")
       expect(effects.length).toBe(0)
     })
   })
