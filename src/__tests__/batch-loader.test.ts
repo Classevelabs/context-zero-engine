@@ -214,4 +214,52 @@ describe("BatchLoader — paginated loading", () => {
     const sql = mockQuery.mock.calls[0][0] as string
     expect(sql).toContain("> $2")
   })
+
+  // The cursor must come from the last RAW row, not the last row that survived
+  // validateRows. Deriving it from the survivors rewinds the scan onto rows it
+  // has already returned, and a page where every row fails validation used to
+  // end the scan outright — silently skipping the rest of the snapshot.
+  test("cursor skips past unparseable trailing rows instead of rewinding", async () => {
+    mockQuery.mockResolvedValueOnce({
+      // sv-2 and sv-3 are unparseable (no string symbol_version_id).
+      rows: [{ symbol_version_id: "sv-1" }, { symbol_version_id: null }, { symbol_version_id: 42 }],
+      rowCount: 3,
+    })
+
+    const loader = new BatchLoader()
+    const result = await loader.loadSymbolVersionsBySnapshotPaginated("snap-1", { pageSize: 2 })
+
+    // Only sv-1 parses, but the cursor must reflect where the page really ended.
+    expect(result.rows.map((r) => r.symbol_version_id)).toEqual(["sv-1"])
+    expect(result.nextCursor).not.toBe("sv-1")
+  })
+
+  test("keeps scanning when every parseable row is dropped mid-page", async () => {
+    mockQuery.mockResolvedValueOnce({
+      // Both returned rows are unparseable, but the page still ended at sv-2.
+      rows: [{ symbol_version_id: null }, { symbol_version_id: "sv-2" }, { symbol_version_id: "sv-3" }],
+      rowCount: 3,
+    })
+
+    const loader = new BatchLoader()
+    const result = await loader.loadSymbolVersionsBySnapshotPaginated("snap-1", { pageSize: 2 })
+
+    expect(result.rows.map((r) => r.symbol_version_id)).toEqual(["sv-2"])
+    // hasMore was true, so the caller must be able to keep going from sv-2.
+    expect(result.nextCursor).toBe("sv-2")
+  })
+
+  test("cursor always tracks the last row the page actually returned", async () => {
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ symbol_version_id: "sv-1" }, { symbol_version_id: "sv-2" }, { symbol_version_id: "sv-3" }],
+      rowCount: 3,
+    })
+
+    const loader = new BatchLoader()
+    const result = await loader.loadSymbolVersionsBySnapshotPaginated("snap-1", { pageSize: 2 })
+
+    // Never the id of a row already handed back on an earlier page, and never
+    // the look-ahead row (sv-3) — which would skip it entirely.
+    expect(result.nextCursor).toBe("sv-2")
+  })
 })

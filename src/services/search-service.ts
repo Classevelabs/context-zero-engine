@@ -28,7 +28,17 @@ export interface SearchCodeResult {
   mode: "regex" | "literal"
   total_matches: number
   matches: SearchMatch[]
+  /** True when the scan stopped early on the time budget — results are partial. */
+  timed_out?: boolean
 }
+
+/**
+ * Wall-clock budget for a whole search. Bounds the aggregate cost of a slow
+ * (but not provably catastrophic) pattern over thousands of files, so the
+ * single-threaded process stays responsive. Checked between files, so it cannot
+ * interrupt one pathological line — that is what buildSafeRegex guards.
+ */
+const SEARCH_DEADLINE_MS = 10_000
 
 export interface SearchCodeOptions {
   filePattern?: string
@@ -46,13 +56,90 @@ interface MinimalLogger {
 // ────────── ReDoS Protection ──────────
 
 /**
- * Detect patterns with known catastrophic backtracking constructs.
- * Patterns like (a+)+, (a|a)+, (a*)* cause exponential time on non-matching input.
+ * Detect patterns with catastrophic-backtracking potential.
+ *
+ * The whole classic family is "a quantified group whose body can match the same
+ * input more than one way" — i.e. a group carrying +/*\/{n,} that contains
+ * either an alternation or another quantifier. That covers (a+)+, (a*)*,
+ * (a|aa)+, (a|a?)+, (\w|\w\w)+ and friends.
+ *
+ * The previous pattern-pair only caught an inner quantifier written directly
+ * inside a flat group, so overlapping-alternation forms went straight through:
+ * `(a|aa)+$` took ~900ms against a 30-character line, and `(a|a?)+$` never
+ * returned at all. Node has no regex timeout and the engine is single-threaded,
+ * so one such search hangs the whole process across every indexed file.
+ *
+ * This over-approximates: a non-overlapping pattern like `(foo|bar)+` is also
+ * flagged. That is deliberate — the fallback is an escaped literal search, which
+ * still returns useful results, and callers are told via the `mode` field.
+ * Detecting genuine overlap needs full regex analysis; refusing to backtrack on
+ * anything of this shape is the honest trade.
+ *
+ * Residual risk: this is a static heuristic, not a proof. A guaranteed bound
+ * needs the match to run off-thread with a hard kill. SEARCH_DEADLINE_MS below
+ * caps the aggregate damage in the meantime.
  */
-const REDOS_SUSPECT = /(\([^)]*[+*][^)]*\))[+*]|\(\?[^)]*\|[^)]*\)[+*]/
+function hasQuantifiedComplexGroup(pattern: string): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] === "\\") {
+      i++ // skip the escaped character
+      continue
+    }
+    if (pattern[i] !== "(") continue
+
+    // Walk to this group's matching ')', tracking escapes, nesting and classes.
+    let depth = 0
+    let inClass = false
+    let bodyHasAlternation = false
+    let bodyHasQuantifier = false
+    let end = -1
+    for (let j = i; j < pattern.length; j++) {
+      const ch = pattern[j]
+      if (ch === "\\") {
+        j++
+        continue
+      }
+      if (inClass) {
+        if (ch === "]") inClass = false
+        continue
+      }
+      if (ch === "[") {
+        inClass = true
+        continue
+      }
+      if (ch === "(") {
+        depth++
+        continue
+      }
+      if (ch === ")") {
+        depth--
+        if (depth === 0) {
+          end = j
+          break
+        }
+        continue
+      }
+      if (depth === 1) {
+        if (ch === "|") bodyHasAlternation = true
+        if (ch === "+" || ch === "*" || ch === "?" || ch === "{") bodyHasQuantifier = true
+      } else if (depth > 1) {
+        // A nested group is itself a way for the body to match ambiguously.
+        bodyHasQuantifier = true
+      }
+    }
+    if (end === -1) continue // unbalanced — new RegExp() will reject it anyway
+
+    const next = pattern[end + 1]
+    const groupIsQuantified = next === "+" || next === "*" || next === "{"
+    if (groupIsQuantified && (bodyHasAlternation || bodyHasQuantifier)) {
+      return true
+    }
+  }
+  return false
+}
 
 function buildSafeRegex(pattern: string, log?: MinimalLogger): { regex: RegExp; mode: "regex" | "literal" } {
-  const useRegex = !REDOS_SUSPECT.test(pattern)
+  const useRegex = !hasQuantifiedComplexGroup(pattern)
   try {
     if (!useRegex) throw new Error("ReDoS-suspect pattern")
     return { regex: new RegExp(pattern, "gi"), mode: "regex" }
@@ -135,7 +222,24 @@ export async function searchCode(
 
   // Process files in parallel batches for better throughput
   const BATCH_SIZE = 50
+  const deadline = Date.now() + SEARCH_DEADLINE_MS
+  let timedOut = false
   for (let batchStart = 0; batchStart < files.length && matches.length < maxResults; batchStart += BATCH_SIZE) {
+    if (Date.now() > deadline) {
+      timedOut = true
+      if (log) {
+        log.warn("Search exceeded its time budget — returning partial results", {
+          repo_id: repoId,
+          pattern,
+          mode: searchMode,
+          budget_ms: SEARCH_DEADLINE_MS,
+          files_scanned: batchStart,
+          files_total: files.length,
+          matches: matches.length,
+        })
+      }
+      break
+    }
     const batchEnd = Math.min(batchStart + BATCH_SIZE, files.length)
     const batch = files.slice(batchStart, batchEnd)
 
@@ -198,5 +302,6 @@ export async function searchCode(
     mode: searchMode,
     total_matches: matches.length,
     matches,
+    ...(timedOut ? { timed_out: true } : {}),
   }
 }

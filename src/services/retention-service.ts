@@ -252,10 +252,14 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
   const start = Date.now()
   const errors: string[] = []
 
-  // Try to acquire advisory lock (non-blocking)
-  const lockResult = await db.query(`SELECT pg_try_advisory_lock($1) AS acquired`, [RETENTION_LOCK_ID])
-  const acquired = (lockResult.rows[0] as { acquired: boolean })?.acquired
-  if (!acquired) {
+  // Try to acquire advisory lock (non-blocking).
+  // Pinned to a single connection — advisory locks are session-scoped, and
+  // taking/releasing one through db.query() lets the unlock land on a different
+  // pooled session, leaving the lock held for the life of that connection. On
+  // the long-running HTTP server that permanently disabled retention, which is
+  // precisely the failure retention exists to prevent (unbounded snapshot growth).
+  const retentionLock = await db.tryAdvisoryLock(RETENTION_LOCK_ID)
+  if (!retentionLock) {
     log.info("Retention policy already running — skipping")
     return {
       snapshotsExpired: 0,
@@ -309,7 +313,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
       errors.push(`orphan_cleanup: ${wrapped.message}`)
     }
   } finally {
-    await db.query(`SELECT pg_advisory_unlock($1)`, [RETENTION_LOCK_ID])
+    await retentionLock.release()
   }
 
   const durationMs = Date.now() - start
