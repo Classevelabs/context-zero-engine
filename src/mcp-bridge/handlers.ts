@@ -535,6 +535,7 @@ export async function handleApplyPatch(args: Record<string, unknown>, log: McpLo
   }
   // Hoist module import outside loop — dynamic import inside a loop adds async overhead per patch
   const path = await import("path")
+  const seenPaths = new Set<string>()
   for (let i = 0; i < patches.length; i++) {
     const p = patches[i] as Record<string, unknown>
     if (!p || typeof p.file_path !== "string" || typeof p.new_content !== "string") {
@@ -563,6 +564,15 @@ export async function handleApplyPatch(args: Record<string, unknown>, log: McpLo
     if (normalized.startsWith("..") || path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
       return errorResult(`patches[${i}].file_path: path traversal or absolute path not allowed`)
     }
+    // Same guard as requirePatchArray on the HTTP side: two patches for one file
+    // collide on the shared `<path>.scg-tmp`, so the second rename fails ENOENT
+    // and aborts the batch after earlier files already landed.
+    if (seenPaths.has(normalized)) {
+      return errorResult(
+        `patches[${i}].file_path: duplicate path '${slashNormalized}' — each file may appear at most once`,
+      )
+    }
+    seenPaths.add(normalized)
     patches[i] = { ...p, file_path: slashNormalized }
   }
 

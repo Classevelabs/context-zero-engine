@@ -263,15 +263,14 @@ function resetFailures(ip: string, fingerprint: string): void {
 const AUTH_CLEANUP_INTERVAL_MS = 60_000
 function cleanupFailureMap(map: Map<string, FailureRecord>, now: number): void {
   for (const [key, record] of map.entries()) {
-    // Delete if EITHER the entry is stale OR the lock has expired.
-    // Using OR prevents unbounded growth under sustained attack where
-    // attackers continually refresh lastFailureAt while locked.
+    // Drop an entry only once it is stale AND no longer serving an active
+    // lockout — releasing a live lock early would hand an attacker a free
+    // reset. Unbounded growth is handled by the hard cap below, not here.
+    // (The comment here used to claim an OR rule while the code did AND, and
+    // carried a second branch that was a strict subset of the first.)
     const isStale = record.lastFailureAt < now - STALE_FAILURE_RETENTION_MS
-    const lockExpired = record.lockedUntil > 0 && record.lockedUntil < now
-    const neverLocked = record.lockedUntil === 0
-    if (isStale && (neverLocked || lockExpired)) {
-      map.delete(key)
-    } else if (lockExpired && isStale) {
+    const lockInactive = record.lockedUntil === 0 || record.lockedUntil < now
+    if (isStale && lockInactive) {
       map.delete(key)
     }
   }

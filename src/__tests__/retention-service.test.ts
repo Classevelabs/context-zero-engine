@@ -7,10 +7,13 @@
  */
 
 const mockQuery = jest.fn()
+const mockTryAdvisoryLock = jest.fn()
+const mockAdvisoryRelease = jest.fn()
 
 jest.mock("../db-driver", () => ({
   db: {
     query: (...args: unknown[]) => mockQuery(...args),
+    tryAdvisoryLock: (...args: unknown[]) => mockTryAdvisoryLock(...args),
   },
 }))
 
@@ -164,10 +167,18 @@ describe("cleanupOrphanedData", () => {
 // ────────── runRetentionPolicy ──────────
 
 describe("runRetentionPolicy", () => {
-  it("acquires advisory lock, runs all phases, releases lock", async () => {
-    // Advisory lock acquisition
-    mockQuery.mockResolvedValueOnce({ rows: [{ acquired: true }], rowCount: 1 })
+  // The advisory lock is taken through db.tryAdvisoryLock, which pins one pooled
+  // connection for the whole run. Taking it through db.query() let the unlock
+  // land on a different session, which left the lock held and silently disabled
+  // retention for the life of that connection.
+  beforeEach(() => {
+    mockTryAdvisoryLock.mockReset()
+    mockAdvisoryRelease.mockReset()
+    mockAdvisoryRelease.mockResolvedValue(undefined)
+    mockTryAdvisoryLock.mockResolvedValue({ release: mockAdvisoryRelease })
+  })
 
+  it("acquires advisory lock, runs all phases, releases lock", async () => {
     // Phase 1: cleanupStaleTransactions
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
@@ -182,34 +193,32 @@ describe("runRetentionPolicy", () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
-    // Advisory lock release
-    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
-
     const result = await runRetentionPolicy()
 
     expect(result.errors).toHaveLength(0)
     expect(result.durationMs).toBeGreaterThanOrEqual(0)
-    // Verify lock acquired first
-    expect(mockQuery.mock.calls[0][0]).toContain("pg_try_advisory_lock")
-    // Verify lock released last
-    const lastCall = mockQuery.mock.calls[mockQuery.mock.calls.length - 1]
-    expect(lastCall[0]).toContain("pg_advisory_unlock")
+    // Lock taken on a pinned connection, and released exactly once.
+    expect(mockTryAdvisoryLock).toHaveBeenCalledTimes(1)
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
+    // It must not be routed through the shared pool query path.
+    for (const call of mockQuery.mock.calls) {
+      expect(String(call[0])).not.toContain("advisory")
+    }
   })
 
   it("returns early if lock not acquired", async () => {
-    mockQuery.mockResolvedValueOnce({ rows: [{ acquired: false }], rowCount: 1 })
+    mockTryAdvisoryLock.mockResolvedValue(null)
 
     const result = await runRetentionPolicy()
 
     expect(result.errors).toHaveLength(1)
     expect(result.errors[0]).toContain("Lock not acquired")
-    expect(mockQuery).toHaveBeenCalledTimes(1)
+    // No phase ran, and there is no lock to release.
+    expect(mockQuery).not.toHaveBeenCalled()
+    expect(mockAdvisoryRelease).not.toHaveBeenCalled()
   })
 
   it("isolates phase errors — failure in one does not abort others", async () => {
-    // Lock acquired
-    mockQuery.mockResolvedValueOnce({ rows: [{ acquired: true }], rowCount: 1 })
-
     // Phase 1: stale cleanup FAILS
     mockQuery.mockRejectedValueOnce(new Error("DB timeout"))
 
@@ -224,16 +233,13 @@ describe("runRetentionPolicy", () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
-    // Lock release
-    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
-
     const result = await runRetentionPolicy()
 
     expect(result.errors).toHaveLength(1)
     expect(result.errors[0]).toContain("stale_transactions")
-    // All other phases still ran (lock released)
-    const lastCall = mockQuery.mock.calls[mockQuery.mock.calls.length - 1]
-    expect(lastCall[0]).toContain("pg_advisory_unlock")
+    // A failing phase must still release the lock — otherwise one bad run
+    // disables retention permanently.
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
   })
 })
 

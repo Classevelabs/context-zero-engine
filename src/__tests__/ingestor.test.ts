@@ -33,12 +33,16 @@ const mockTransaction = jest.fn().mockImplementation(async (cb: any) => {
   return cb(client)
 })
 
+const mockTryAdvisoryLock = jest.fn()
+const mockAdvisoryRelease = jest.fn().mockResolvedValue(undefined)
+
 jest.mock("../db-driver", () => ({
   db: {
     query: (...args: any[]) => mockQuery(...args),
     batchInsert: (...args: any[]) => mockBatchInsert(...args),
     queryWithClient: (...args: any[]) => mockQueryWithClient(...args),
     transaction: (...args: any[]) => mockTransaction(...args),
+    tryAdvisoryLock: (...args: any[]) => mockTryAdvisoryLock(...args),
   },
 }))
 
@@ -179,15 +183,23 @@ jest.mock("../analysis-engine/temporal-engine", () => ({
   },
 }))
 
-// Cache mocks
+// Cache mocks.
+// mockCacheClear counts clears across all five caches; mockCacheCleared records
+// WHICH cache was cleared, so a test can assert that an incremental pass drops
+// every layer and not just the profile cache.
 const mockCacheClear = jest.fn()
 const mockCacheInvalidate = jest.fn()
+const mockCacheCleared = jest.fn()
+const clearFor = (name: string) => () => {
+  mockCacheCleared(name)
+  mockCacheClear()
+}
 jest.mock("../cache", () => ({
-  symbolCache: { clear: () => mockCacheClear(), invalidate: (k: string) => mockCacheInvalidate(k) },
-  profileCache: { clear: () => mockCacheClear(), invalidate: (k: string) => mockCacheInvalidate(k) },
-  capsuleCache: { clear: () => mockCacheClear(), invalidate: (k: string) => mockCacheInvalidate(k) },
-  homologCache: { clear: () => mockCacheClear(), invalidate: (k: string) => mockCacheInvalidate(k) },
-  queryCache: { clear: () => mockCacheClear(), invalidate: (k: string) => mockCacheInvalidate(k) },
+  symbolCache: { clear: clearFor("symbol"), invalidate: (k: string) => mockCacheInvalidate(k) },
+  profileCache: { clear: clearFor("profile"), invalidate: (k: string) => mockCacheInvalidate(k) },
+  capsuleCache: { clear: clearFor("capsule"), invalidate: (k: string) => mockCacheInvalidate(k) },
+  homologCache: { clear: clearFor("homolog"), invalidate: (k: string) => mockCacheInvalidate(k) },
+  queryCache: { clear: clearFor("query"), invalidate: (k: string) => mockCacheInvalidate(k) },
 }))
 
 // Path security
@@ -264,27 +276,24 @@ function makeDirent(
   }
 }
 
-/** Helper to set up mock advisory lock as acquired */
+/**
+ * Helper to set up mock advisory lock as acquired.
+ *
+ * The lock is taken via db.tryAdvisoryLock (a dedicated pooled connection), not
+ * via db.query — advisory locks are session-scoped, so lock and unlock must land
+ * on the same backend. Driving it here keeps these tests pointed at that seam.
+ */
 function setupLockAcquired() {
-  mockQuery.mockImplementation(async (text: string, params?: any[]) => {
-    if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-      return { rows: [{ acquired: true }], rowCount: 1 }
-    }
-    if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-      return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-    }
+  mockTryAdvisoryLock.mockResolvedValue({ release: mockAdvisoryRelease })
+  mockQuery.mockImplementation(async (_text: string, _params?: any[]) => {
     return { rows: [], rowCount: 0 }
   })
 }
 
 /** Helper to set up mock advisory lock as NOT acquired (concurrent ingestion) */
 function setupLockNotAcquired() {
-  mockQuery.mockImplementation(async (text: string) => {
-    if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-      return { rows: [{ acquired: false }], rowCount: 1 }
-    }
-    return { rows: [], rowCount: 0 }
-  })
+  mockTryAdvisoryLock.mockResolvedValue(null)
+  mockQuery.mockImplementation(async () => ({ rows: [], rowCount: 0 }))
 }
 
 function resetAllMocks() {
@@ -296,6 +305,8 @@ function resetAllMocks() {
     mockBatchInsert,
     mockQueryWithClient,
     mockTransaction,
+    mockTryAdvisoryLock,
+    mockAdvisoryRelease,
     mockCreateRepository,
     mockCreateSnapshot,
     mockUpdateSnapshotStatus,
@@ -320,6 +331,7 @@ function resetAllMocks() {
     mockComputeTemporalIntelligence,
     mockCacheClear,
     mockCacheInvalidate,
+    mockCacheCleared,
     mockReaddir,
     mockStat,
     mockLstat,
@@ -333,6 +345,8 @@ function resetAllMocks() {
   mockQuery.mockResolvedValue({ rows: [], rowCount: 0 })
   mockBatchInsert.mockResolvedValue(undefined)
   mockQueryWithClient.mockResolvedValue({ rows: [], rowCount: 0 })
+  mockAdvisoryRelease.mockResolvedValue(undefined)
+  mockTryAdvisoryLock.mockResolvedValue({ release: mockAdvisoryRelease })
   mockTransaction.mockImplementation(async (cb: any) => {
     const client = { query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }) }
     return cb(client)
@@ -685,10 +699,12 @@ describe("Ingestor — Advisory lock", () => {
     await ingestor.ingestRepo("/repo", "test-repo", "abc123")
 
     // pg_advisory_unlock should be called
-    const unlockCalls = mockQuery.mock.calls.filter(
-      (c: any[]) => typeof c[0] === "string" && c[0].includes("pg_advisory_unlock"),
+    // Released through the pinned lock handle, never through the shared pool.
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
+    const pooledLockCalls = mockQuery.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("advisory"),
     )
-    expect(unlockCalls.length).toBe(1)
+    expect(pooledLockCalls.length).toBe(0)
   })
 
   test("releases advisory lock even when ingestion fails", async () => {
@@ -702,10 +718,12 @@ describe("Ingestor — Advisory lock", () => {
     await expect(ingestor.ingestRepo("/repo", "test-repo", "abc123")).rejects.toThrow("DB error")
 
     // Lock should still be released
-    const unlockCalls = mockQuery.mock.calls.filter(
-      (c: any[]) => typeof c[0] === "string" && c[0].includes("pg_advisory_unlock"),
+    // Released through the pinned lock handle, never through the shared pool.
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
+    const pooledLockCalls = mockQuery.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("advisory"),
     )
-    expect(unlockCalls.length).toBe(1)
+    expect(pooledLockCalls.length).toBe(0)
   })
 })
 
@@ -761,12 +779,6 @@ describe("Ingestor — Stale snapshot cleanup", () => {
     let queryCallCount = 0
     mockQuery.mockImplementation(async (text: string, params?: any[]) => {
       queryCallCount++
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("index_status IN")) {
         return { rows: [{ snapshot_id: "stale-snap-001" }], rowCount: 1 }
       }
@@ -785,12 +797,6 @@ describe("Ingestor — Stale snapshot cleanup", () => {
     mockReaddir.mockResolvedValueOnce([])
 
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("index_status IN")) {
         throw new Error("Cleanup query failed")
       }
@@ -921,12 +927,6 @@ describe("Ingestor — Delta detection", () => {
 
     // Parent snapshot files query
     mockQuery.mockImplementation(async (text: string, params?: any[]) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("FROM files WHERE snapshot_id")) {
         return {
           rows: [{ path: "unchanged.ts", content_hash: "abc123hash" }],
@@ -963,12 +963,6 @@ describe("Ingestor — Delta detection", () => {
 
     // Parent snapshot has the same hash for unchanged.ts
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("content_hash FROM files")) {
         return { rows: [{ path: "unchanged.ts", content_hash: expectedHash }], rowCount: 1 }
       }
@@ -993,12 +987,6 @@ describe("Ingestor — Delta detection", () => {
     mockReadFile.mockResolvedValue(Buffer.from("const x = 1;"))
 
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("content_hash FROM files")) {
         throw new Error("DB error loading parent files")
       }
@@ -1334,12 +1322,6 @@ describe("Ingestor — V2 engines", () => {
 
     // Need base_path for temporal to run
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1404,12 +1386,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("deletes old symbol data for changed files", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1426,12 +1402,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("invalidates profile cache for deleted symbol versions", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1454,16 +1424,19 @@ describe("Ingestor — ingestIncremental", () => {
     // Should have called cache invalidate for the deleted symbol versions
     expect(mockCacheInvalidate).toHaveBeenCalledWith("bp:sv1")
     expect(mockCacheInvalidate).toHaveBeenCalledWith("cp:sv1")
+
+    // …and must ALSO drop every other cache layer. An incremental pass DELETEs
+    // and re-creates symbol_versions, so the old ids are gone from the DB —
+    // but queryCache's `resolve:` entries kept handing them out for 60s and
+    // symbolCache's `sv:<id>` entries kept answering with the pre-edit
+    // body_source for 5 minutes, with no row behind them. Invalidating only
+    // the two profile entries per symbol left that stale code reachable.
+    const clearedCaches = mockCacheCleared.mock.calls.map((c: unknown[]) => c[0])
+    expect(clearedCaches).toEqual(expect.arrayContaining(["symbol", "profile", "capsule", "homolog", "query"]))
   })
 
   test("re-extracts TypeScript files", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1488,12 +1461,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("a path NEW since the snapshot gets a file row created and is counted in new_files_indexed", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1531,12 +1498,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("a KNOWN path refreshes through the same upsert without counting as new", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1571,12 +1532,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("releases advisory lock on success", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1586,20 +1541,16 @@ describe("Ingestor — ingestIncremental", () => {
 
     await ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts"])
 
-    const unlockCalls = mockQuery.mock.calls.filter(
-      (c: any[]) => typeof c[0] === "string" && c[0].includes("pg_advisory_unlock"),
+    // Released through the pinned lock handle, never through the shared pool.
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
+    const pooledLockCalls = mockQuery.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("advisory"),
     )
-    expect(unlockCalls.length).toBe(1)
+    expect(pooledLockCalls.length).toBe(0)
   })
 
   test("releases advisory lock on failure", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         throw new Error("DB connection error")
       }
@@ -1608,20 +1559,16 @@ describe("Ingestor — ingestIncremental", () => {
 
     await expect(ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts"])).rejects.toThrow()
 
-    const unlockCalls = mockQuery.mock.calls.filter(
-      (c: any[]) => typeof c[0] === "string" && c[0].includes("pg_advisory_unlock"),
+    // Released through the pinned lock handle, never through the shared pool.
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
+    const pooledLockCalls = mockQuery.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("advisory"),
     )
-    expect(unlockCalls.length).toBe(1)
+    expect(pooledLockCalls.length).toBe(0)
   })
 
   test("skips files that no longer exist on disk", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1637,14 +1584,62 @@ describe("Ingestor — ingestIncremental", () => {
     expect(result.symbolsUpdated).toBe(0)
   })
 
+  test("removes the index entry for a file deleted from disk", async () => {
+    // A tracked file that has since been deleted. Its symbol versions are
+    // cleaned up in phase 1, but the `files` row used to survive forever —
+    // leaving a path that scg_search_code kept trying to read and that
+    // scg_codebase_overview kept counting.
+    mockQuery.mockImplementation(async (text: string) => {
+      if (typeof text === "string" && text.includes("base_path FROM repositories")) {
+        return { rows: [{ base_path: "/repo" }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    mockTransaction.mockImplementation(async (cb: any) => {
+      const client = { query: jest.fn() }
+      mockQueryWithClient
+        .mockResolvedValueOnce({ rows: [{ file_id: "f1" }], rowCount: 1 }) // file row exists
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 }) // no symbol versions
+        .mockResolvedValue({ rows: [], rowCount: 0 })
+      return cb(client)
+    })
+    mockAccess.mockRejectedValue(new Error("ENOENT"))
+
+    await ingestor.ingestIncremental("repo-001", "snap-001", ["deleted.ts"])
+
+    const deleteCalls = mockQuery.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("DELETE FROM files"),
+    )
+    expect(deleteCalls).toHaveLength(1)
+    expect(deleteCalls[0][1]).toEqual(["snap-001", "deleted.ts"])
+  })
+
+  test("does not delete an index entry for a path that was never tracked", async () => {
+    // A changed path with no `files` row (never ingested) that also does not
+    // exist on disk — nothing to clean up, and no stray DELETE.
+    mockQuery.mockImplementation(async (text: string) => {
+      if (typeof text === "string" && text.includes("base_path FROM repositories")) {
+        return { rows: [{ base_path: "/repo" }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    mockTransaction.mockImplementation(async (cb: any) => {
+      const client = { query: jest.fn() }
+      mockQueryWithClient.mockResolvedValue({ rows: [], rowCount: 0 }) // no file row
+      return cb(client)
+    })
+    mockAccess.mockRejectedValue(new Error("ENOENT"))
+
+    await ingestor.ingestIncremental("repo-001", "snap-001", ["never-existed.ts"])
+
+    const deleteCalls = mockQuery.mock.calls.filter(
+      (c: any[]) => typeof c[0] === "string" && c[0].includes("DELETE FROM files"),
+    )
+    expect(deleteCalls).toHaveLength(0)
+  })
+
   test("skips files with unknown extensions", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1660,12 +1655,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("runs V2 engines during incremental ingestion", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }
@@ -1683,12 +1672,6 @@ describe("Ingestor — ingestIncremental", () => {
 
   test("returns correct result shape", async () => {
     mockQuery.mockImplementation(async (text: string) => {
-      if (typeof text === "string" && text.includes("pg_try_advisory_lock")) {
-        return { rows: [{ acquired: true }], rowCount: 1 }
-      }
-      if (typeof text === "string" && text.includes("pg_advisory_unlock")) {
-        return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 }
-      }
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
         return { rows: [{ base_path: "/repo" }], rowCount: 1 }
       }

@@ -31,7 +31,7 @@ import { deepContractSynthesizer } from "../analysis-engine/deep-contracts"
 import { conceptFamilyEngine } from "../analysis-engine/concept-families"
 import { temporalEngine } from "../analysis-engine/temporal-engine"
 import { db } from "../db-driver"
-import { booleanField, firstRow, optionalStringField } from "../db-driver/result"
+import { firstRow, optionalStringField } from "../db-driver/result"
 import { ingestion as ingestionConfig } from "../config"
 import { symbolCache, profileCache, capsuleCache, homologCache, queryCache } from "../cache"
 import { resolveExistingPath, resolvePathWithinBase } from "../path-security"
@@ -202,11 +202,12 @@ export class Ingestor {
 
     // Acquire an advisory lock keyed on a hash of (repoPath, commitSha) to prevent
     // concurrent ingestion of the same repo/commit from corrupting snapshot data.
-    // Uses pg_try_advisory_lock to fail fast instead of blocking.
+    // Uses tryAdvisoryLock (pinned connection) to fail fast instead of blocking —
+    // taking it through db.query() would leak the lock, because the unlock can
+    // land on a different pooled session and silently no-op.
     const lockKey = crypto.createHash("md5").update(`ingest:${canonicalRepoPath}:${commitSha}`).digest().readInt32BE(0)
-    const lockResult = await db.query("SELECT pg_try_advisory_lock($1) AS acquired", [lockKey])
-    const lockAcquired = booleanField(firstRow(lockResult), "acquired") === true
-    if (!lockAcquired) {
+    const ingestLock = await db.tryAdvisoryLock(lockKey)
+    if (!ingestLock) {
       log.warn("Ingestion already in progress for this repo/commit, skipping", {
         repoPath: canonicalRepoPath,
         commitSha,
@@ -816,11 +817,7 @@ export class Ingestor {
       return result
     } finally {
       // Release the ingestion advisory lock regardless of success/failure
-      await db.query("SELECT pg_advisory_unlock($1)", [lockKey]).catch((err: unknown) => {
-        log.error("Failed to release ingestion advisory lock", err instanceof Error ? err : new Error(String(err)), {
-          lockKey,
-        })
-      })
+      await ingestLock.release()
       // Invalidate caches after ingestion — stale profiles/capsules can cause wrong analysis
       symbolCache.clear()
       profileCache.clear()
@@ -1518,9 +1515,8 @@ export class Ingestor {
     // Acquire an advisory lock keyed on (repoId, snapshotId) to prevent
     // concurrent incremental ingestion from corrupting snapshot data.
     const lockKey = crypto.createHash("md5").update(`ingest-incr:${repoId}:${snapshotId}`).digest().readInt32BE(0)
-    const lockResult = await db.query("SELECT pg_try_advisory_lock($1) AS acquired", [lockKey])
-    const lockAcquired = booleanField(firstRow(lockResult), "acquired") === true
-    if (!lockAcquired) {
+    const incrementalLock = await db.tryAdvisoryLock(lockKey)
+    if (!incrementalLock) {
       log.warn("Incremental ingestion already in progress for this repo/snapshot, skipping", { repoId, snapshotId })
       return {
         symbolsUpdated: 0,
@@ -1667,9 +1663,30 @@ export class Ingestor {
 
       for (const changedPath of changedPaths) {
         const fullPath = this.resolveSafePath(basePath, changedPath)
+        let fileExists = true
         try {
           await fsp.access(fullPath)
         } catch {
+          fileExists = false
+        }
+
+        if (!fileExists) {
+          // Deleted on disk. Step 1 already removed its symbol versions and
+          // everything hanging off them, but the `files` row itself survived —
+          // so the path stayed in the index forever, kept being handed to
+          // scg_search_code (which then failed to read it) and kept inflating
+          // the file counts in scg_codebase_overview. Drop the row too.
+          if (knownPaths.has(changedPath)) {
+            try {
+              await db.query(`DELETE FROM files WHERE snapshot_id = $1 AND path = $2`, [snapshotId, changedPath])
+              log.info("Incremental: removed index entry for deleted file", { path: changedPath })
+            } catch (err) {
+              log.warn("Incremental: failed to remove index entry for deleted file", {
+                path: changedPath,
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+          }
           continue
         }
 
@@ -1910,13 +1927,24 @@ export class Ingestor {
       return result
     } finally {
       // Release the incremental ingestion advisory lock regardless of success/failure
-      await db.query("SELECT pg_advisory_unlock($1)", [lockKey]).catch((err: unknown) => {
-        log.error(
-          "Failed to release incremental ingestion advisory lock",
-          err instanceof Error ? err : new Error(String(err)),
-          { lockKey },
-        )
-      })
+      await incrementalLock.release()
+
+      // Invalidate every cache, exactly as the full ingest does. An incremental
+      // pass DELETEs and re-creates symbol_versions for each changed file, so the
+      // old symbol_version_ids no longer exist — but they stayed reachable here:
+      //   • queryCache  `resolve:…` kept handing out the deleted ids for 60s, so
+      //     the next scg_get_symbol_details / capsule / blast_radius on them died
+      //     with "Symbol version not found";
+      //   • symbolCache `sv:<id>` answered those lookups from memory instead,
+      //     serving the PRE-EDIT body_source for up to 5 minutes with no DB row
+      //     behind it — stale code returned as if current;
+      //   • capsuleCache / homologCache held derived analysis of the same.
+      // Only the two profileCache entries per symbol were being invalidated.
+      symbolCache.clear()
+      profileCache.clear()
+      capsuleCache.clear()
+      homologCache.clear()
+      queryCache.clear()
     }
   }
 

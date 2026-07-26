@@ -158,6 +158,16 @@ async function withRetry<T>(
   throw lastError
 }
 
+// ─── Advisory Locks ──────────────────────────────────────────────────────────
+
+/**
+ * A held session-scoped advisory lock. `release()` is idempotent and always
+ * returns the underlying connection to the pool, even if the unlock fails.
+ */
+export interface AdvisoryLock {
+  release(): Promise<void>
+}
+
 // ─── Database Driver ─────────────────────────────────────────────────────────
 
 class DatabaseDriver {
@@ -314,6 +324,69 @@ class DatabaseDriver {
     } catch (error) {
       log.error("Client query failed", error, { query: text.substring(0, 200) })
       throw error
+    }
+  }
+
+  /**
+   * Try to take a session-scoped advisory lock, pinned to one connection.
+   *
+   * PostgreSQL advisory locks taken with pg_try_advisory_lock belong to the
+   * *session* that took them. `query()` runs on an arbitrary pooled client and
+   * hands it straight back, so a lock taken through `query()` can only be
+   * released by luck — `pg_advisory_unlock` on a different pooled connection
+   * returns false (a WARNING, not an error), and the lock stays held until that
+   * original backend closes. The observable symptom is a subsystem that
+   * silently stops working: every later run sees the lock held and no-ops.
+   *
+   * This checks out one client for the whole critical section so lock and
+   * unlock provably land on the same session. `runPendingMigrations()` already
+   * does this by hand; this is the reusable form.
+   *
+   * @returns a handle whose `release()` unlocks and returns the client to the
+   *          pool, or `null` if the lock is already held elsewhere.
+   */
+  public async tryAdvisoryLock(lockKey: number): Promise<AdvisoryLock | null> {
+    this.ensureOpen()
+    this.circuit.check()
+
+    const client = await this.pool.connect()
+    let acquired = false
+    try {
+      const result = await client.query("SELECT pg_try_advisory_lock($1) AS acquired", [lockKey])
+      acquired = (result.rows[0] as { acquired?: boolean } | undefined)?.acquired === true
+      this.circuit.recordSuccess()
+    } catch (error) {
+      if (isTransientError(error)) {
+        this.circuit.recordFailure()
+      }
+      client.release()
+      log.error("Failed to acquire advisory lock", error, { lockKey })
+      throw error
+    }
+
+    if (!acquired) {
+      client.release()
+      return null
+    }
+
+    let released = false
+    return {
+      release: async (): Promise<void> => {
+        if (released) return
+        released = true
+        try {
+          const unlockResult = await client.query("SELECT pg_advisory_unlock($1) AS released", [lockKey])
+          // pg_advisory_unlock returns false (with a server WARNING) when this
+          // session does not hold the lock — surface it instead of ignoring it.
+          if ((unlockResult.rows[0] as { released?: boolean } | undefined)?.released !== true) {
+            log.error("Advisory unlock reported the lock was not held by this session", undefined, { lockKey })
+          }
+        } catch (error) {
+          log.error("Failed to release advisory lock", error, { lockKey })
+        } finally {
+          client.release()
+        }
+      },
     }
   }
 
