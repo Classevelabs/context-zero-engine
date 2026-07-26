@@ -5,6 +5,25 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.2] — First-run fix
+
+### Fixed
+
+- **The documented install failed on the first command.** `.env.example`
+  shipped `NODE_ENV=production`, and the README says to copy it and fill in
+  your database credentials. `production` enables the deployment guards —
+  including a refusal to start against a weak database password — so pointing
+  it at an ordinary local Postgres died with *"Refusing to start with an
+  insecure database password in production"* before the first migration ran.
+  The guard is correct; the default was wrong for a tool whose documented
+  install is one developer on one machine. `.env.example` now defaults to
+  `development` and spells out exactly what switching to `production` enforces
+  and when to do it.
+
+  Verified by migrating a virgin database from zero following the README
+  verbatim: 18/18 migrations applied, doctor 15/15 with no warnings, and an
+  ingest → resolve → capsule round trip on the fresh database.
+
 ## [2.5.1] — Correctness and availability fixes
 
 Ten defects found in a line-level audit of the shipped 2.5.0 tree, plus two
