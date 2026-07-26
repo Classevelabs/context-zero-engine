@@ -78,10 +78,20 @@ remotely reachable hang. Nothing here changes an API shape.
 
 ### Testing
 
-1,477 tests (up from 1,445), including a new `advisory-lock` suite that pins
-lock and unlock to one connection, and a `search-redos` suite that asserts the
-previously-allowed catastrophic patterns now degrade to literal search while
-ordinary regexes still compile.
+1,486 tests (up from 1,445), in three new suites:
+
+- `advisory-lock` — pins lock and unlock to one connection, and covers the
+  contended, throwing and double-release paths.
+- `search-redos` — asserts the previously-allowed catastrophic patterns now
+  degrade to literal search while ordinary regexes still compile.
+- `search-scan` — runs against a real temporary directory (no fs mocks) for
+  path containment, deadline and unreadable-file handling, plus three
+  worker-containment tests proving a runaway match is killed and the main
+  thread stays responsive.
+
+CI now builds before running tests: worker threads load JavaScript only, so
+without a compiled `dist/` the containment tests skip and the execution bound
+goes unexercised.
 
 ## [2.5.0] — Type-resolved effect analysis
 
