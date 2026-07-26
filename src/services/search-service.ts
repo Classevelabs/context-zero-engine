@@ -7,20 +7,19 @@
  * Used by both the REST API and MCP bridge handlers.
  */
 
-import * as fsp from "fs/promises"
+import * as fs from "fs"
+import * as path from "path"
+import { Worker } from "worker_threads"
 import { db } from "../db-driver"
 import { coreDataService } from "../db-driver/core_data"
-import { resolveExistingPath, resolvePathWithinBase } from "../path-security"
+import { resolveExistingPath } from "../path-security"
 import { UserFacingError } from "../types"
+import { scanFiles, type ScanParams, type ScanResult, type SearchMatch } from "./search-scan"
+import type { WorkerMessage } from "./search-worker"
 
 // ────────── Result Types ──────────
 
-export interface SearchMatch {
-  file: string
-  line: number
-  match: string
-  context: string
-}
+export type { SearchMatch }
 
 export interface SearchCodeResult {
   pattern: string
@@ -33,12 +32,17 @@ export interface SearchCodeResult {
 }
 
 /**
- * Wall-clock budget for a whole search. Bounds the aggregate cost of a slow
- * (but not provably catastrophic) pattern over thousands of files, so the
- * single-threaded process stays responsive. Checked between files, so it cannot
- * interrupt one pathological line — that is what buildSafeRegex guards.
+ * Wall-clock budget for a whole search.
+ *
+ * In the worker path this is enforced by terminating the thread, so it is a
+ * hard bound even mid-match. In the inline fallback it is checked between
+ * batches, which bounds aggregate cost but cannot interrupt one pathological
+ * line — there, buildSafeRegex is the load-bearing guard.
  */
 const SEARCH_DEADLINE_MS = 10_000
+
+/** Grace period for the worker to exit on its own before it is terminated. */
+const WORKER_KILL_GRACE_MS = 250
 
 export interface SearchCodeOptions {
   filePattern?: string
@@ -157,6 +161,103 @@ function buildSafeRegex(pattern: string, log?: MinimalLogger): { regex: RegExp; 
   }
 }
 
+// ────────── Bounded Execution ──────────
+
+/**
+ * A pattern with no quantifier, alternation or backreference cannot backtrack,
+ * so it runs in time linear in the input and needs no containment. Skipping the
+ * worker for these keeps plain substring searches — the common case — free of
+ * thread-startup cost.
+ */
+function canBacktrack(patternSource: string): boolean {
+  return /[+*?{}|()]|\\\d/.test(patternSource)
+}
+
+/**
+ * Absolute path to the compiled worker, or null when it is not present.
+ *
+ * Worker threads can only load JavaScript. Under ts-node and jest the sibling
+ * file is `search-worker.ts`, so there is nothing to spawn and the caller falls
+ * back to the inline scan. In a built install (`dist/`) the `.js` is there and
+ * the hard bound is active — which is the configuration that actually ships.
+ */
+function resolveWorkerPath(): string | null {
+  const candidate = path.join(__dirname, "search-worker.js")
+  return fs.existsSync(candidate) ? candidate : null
+}
+
+/**
+ * Run a scan in a worker thread and kill it if it overruns the budget.
+ *
+ * Returns null when no worker could be started, so the caller can fall back.
+ */
+async function scanInWorker(params: ScanParams, log?: MinimalLogger): Promise<ScanResult | null> {
+  const workerPath = resolveWorkerPath()
+  if (!workerPath) return null
+
+  let worker: Worker
+  try {
+    worker = new Worker(workerPath, { workerData: params })
+  } catch (error) {
+    if (log) {
+      log.warn("Could not start the search worker — falling back to an inline scan", {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    return null
+  }
+
+  return new Promise<ScanResult | null>((resolve) => {
+    let settled = false
+    const finish = (value: ScanResult | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(killTimer)
+      void worker.terminate()
+      resolve(value)
+    }
+
+    // The hard bound. A regex that backtracks catastrophically never yields to
+    // the event loop, so nothing inside the worker can stop it — terminating
+    // the thread is the only guaranteed way out.
+    const killTimer = setTimeout(() => {
+      if (settled) return
+      if (log) {
+        log.warn("Search worker exceeded its budget — terminating", {
+          budget_ms: params.deadlineMs,
+          files_total: params.files.length,
+        })
+      }
+      settled = true
+      void worker.terminate()
+      resolve({ matches: [], timedOut: true, filesScanned: 0 })
+    }, params.deadlineMs + WORKER_KILL_GRACE_MS)
+    if (typeof killTimer.unref === "function") killTimer.unref()
+
+    worker.on("message", (msg: WorkerMessage) => {
+      if (msg.type === "error") {
+        if (log) log.warn("Search worker reported an error", { error: msg.message })
+        finish(null)
+        return
+      }
+      finish({ matches: msg.matches, timedOut: msg.timedOut, filesScanned: msg.filesScanned })
+    })
+
+    worker.on("error", (error: Error) => {
+      if (log) {
+        log.warn("Search worker failed — falling back to an inline scan", { error: error.message })
+      }
+      finish(null)
+    })
+
+    worker.on("exit", () => {
+      // Exited without a message and without an error: treat as no result so
+      // the caller retries inline rather than silently reporting zero matches.
+      finish(null)
+    })
+  })
+}
+
 // ────────── Service Function ──────────
 
 /**
@@ -191,8 +292,6 @@ export async function searchCode(
 
   const { regex, mode: searchMode } = buildSafeRegex(pattern, log)
 
-  const matches: SearchMatch[] = []
-
   // Resolve base symlinks once before the loop
   let realBase: string
   try {
@@ -220,81 +319,48 @@ export async function searchCode(
     })
   }
 
-  // Process files in parallel batches for better throughput
-  const BATCH_SIZE = 50
-  const deadline = Date.now() + SEARCH_DEADLINE_MS
-  let timedOut = false
-  for (let batchStart = 0; batchStart < files.length && matches.length < maxResults; batchStart += BATCH_SIZE) {
-    if (Date.now() > deadline) {
-      timedOut = true
+  const scanParams: ScanParams = {
+    realBase,
+    files,
+    patternSource: regex.source,
+    patternFlags: regex.flags,
+    maxResults,
+    contextLines,
+    deadlineMs: SEARCH_DEADLINE_MS,
+  }
+
+  // Only a pattern that can backtrack needs containment; anything else is
+  // linear and not worth a thread. When the worker is unavailable (ts-node,
+  // jest, or a spawn failure) fall back to scanning inline — buildSafeRegex
+  // has already rejected the known catastrophic shapes.
+  let result: ScanResult | null = null
+  if (canBacktrack(regex.source)) {
+    result = await scanInWorker(scanParams, log)
+  }
+  if (!result) {
+    result = await scanFiles(scanParams, (filePath, error) => {
       if (log) {
-        log.warn("Search exceeded its time budget — returning partial results", {
+        log.debug("Skipping unreadable indexed file during search", {
           repo_id: repoId,
-          pattern,
-          mode: searchMode,
-          budget_ms: SEARCH_DEADLINE_MS,
-          files_scanned: batchStart,
-          files_total: files.length,
-          matches: matches.length,
+          file_path: filePath,
+          error,
         })
       }
-      break
-    }
-    const batchEnd = Math.min(batchStart + BATCH_SIZE, files.length)
-    const batch = files.slice(batchStart, batchEnd)
+    })
+  }
 
-    const batchResults = await Promise.allSettled(
-      batch.map(async (filePath) => {
-        const fileMatches: SearchMatch[] = []
-        try {
-          const safePath = resolvePathWithinBase(realBase, filePath)
-          const content = await fsp.readFile(safePath.realPath, "utf-8")
-          const lines = content.split("\n")
-
-          for (let i = 0; i < lines.length; i++) {
-            regex.lastIndex = 0
-            if (regex.test(lines[i]!)) {
-              const ctxStart = Math.max(0, i - contextLines)
-              const ctxEnd = Math.min(lines.length - 1, i + contextLines)
-              const contextArr: string[] = []
-              for (let c = ctxStart; c <= ctxEnd; c++) {
-                const prefix = c === i ? ">" : " "
-                contextArr.push(`${prefix} ${c + 1}: ${lines[c]}`)
-              }
-              fileMatches.push({
-                file: filePath,
-                line: i + 1,
-                match: (lines[i] ?? "").trim(),
-                context: contextArr.join("\n"),
-              })
-            }
-          }
-        } catch (error) {
-          if (log) {
-            log.debug("Skipping unreadable indexed file during search", {
-              repo_id: repoId,
-              file_path: filePath,
-              error: error instanceof Error ? error.message : String(error),
-            })
-          }
-        }
-        return fileMatches
-      }),
-    )
-
-    // Collect results from this batch, respecting remaining quota
-    for (const result of batchResults) {
-      if (matches.length >= maxResults) break
-      if (result.status === "fulfilled") {
-        for (const m of result.value) {
-          if (matches.length >= maxResults) break
-          matches.push(m)
-        }
-      }
-    }
-
-    // Early termination: if we've hit maxResults, skip remaining batches
-    if (matches.length >= maxResults) break
+  const matches = result.matches
+  const timedOut = result.timedOut
+  if (timedOut && log) {
+    log.warn("Search exceeded its time budget — returning partial results", {
+      repo_id: repoId,
+      pattern,
+      mode: searchMode,
+      budget_ms: SEARCH_DEADLINE_MS,
+      files_scanned: result.filesScanned,
+      files_total: files.length,
+      matches: matches.length,
+    })
   }
 
   return {
