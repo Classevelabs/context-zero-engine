@@ -7,10 +7,10 @@
 
 import * as fs from "fs"
 import * as path from "path"
-import * as crypto from "crypto"
 import { Pool, PoolClient } from "pg"
 import { db } from "./index"
 import { getConnectionConfig, getMigrationTimeoutConfig } from "./config"
+import { migrationChecksum, legacyMigrationChecksum } from "./migration-checksum"
 import { Logger } from "../logger"
 
 const log = new Logger("migrations")
@@ -96,21 +96,30 @@ export async function runPendingMigrations(): Promise<number> {
       if (!appliedSet.has(file)) continue
       const filePath = path.join(migrationsDir, file)
       const sql = fs.readFileSync(filePath, "utf-8")
-      const currentChecksum = crypto.createHash("sha256").update(sql).digest("hex")
+      const currentChecksum = migrationChecksum(sql)
       const storedChecksum = appliedChecksums.get(file)
-      if (storedChecksum && storedChecksum !== currentChecksum) {
-        if (process.env.NODE_ENV === "production") {
-          throw new Error(
-            `Checksum mismatch for already-applied migration ${file}: ` +
-              `stored=${storedChecksum}, current=${currentChecksum}. ` +
-              `Refusing to continue — applied migrations must not be modified in production.`,
-          )
-        }
-        log.warn(`Checksum mismatch for ${file}`, {
-          stored: storedChecksum,
-          current: currentChecksum,
-        })
+      if (!storedChecksum || storedChecksum === currentChecksum) continue
+
+      // A value recorded under the pre-normalisation scheme is the same SQL,
+      // not a modified migration. Upgrade it in place so the next run is clean
+      // instead of failing a production boot over line endings.
+      if (storedChecksum === legacyMigrationChecksum(sql)) {
+        await db.query(`UPDATE _migrations SET checksum = $1 WHERE filename = $2`, [currentChecksum, file])
+        log.info(`Migration checksum upgraded to the line-ending-independent scheme: ${file}`)
+        continue
       }
+
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(
+          `Checksum mismatch for already-applied migration ${file}: ` +
+            `stored=${storedChecksum}, current=${currentChecksum}. ` +
+            `Refusing to continue — applied migrations must not be modified in production.`,
+        )
+      }
+      log.warn(`Checksum mismatch for ${file}`, {
+        stored: storedChecksum,
+        current: currentChecksum,
+      })
     }
 
     let appliedCount = 0
@@ -119,7 +128,7 @@ export async function runPendingMigrations(): Promise<number> {
 
       const filePath = path.join(migrationsDir, file)
       const sql = fs.readFileSync(filePath, "utf-8")
-      const checksum = crypto.createHash("sha256").update(sql).digest("hex")
+      const checksum = migrationChecksum(sql)
 
       log.info(`Applying migration: ${file}`)
 
