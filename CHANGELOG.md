@@ -5,11 +5,13 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — Correctness and availability fixes
+## [2.5.1] — Correctness and availability fixes
 
-Eight defects found in a line-level audit of the shipped 2.5.0 tree. Two of
-them silently disabled whole subsystems in long-running deployments; one is a
-remotely reachable hang. Nothing here changes an API shape.
+Ten defects found in a line-level audit of the shipped 2.5.0 tree, plus two
+more caught by standing up a fresh install and running it. Two silently
+disabled whole subsystems in long-running deployments, one is a reachable hang,
+and one could stop a clean checkout from booting in Docker. Nothing here
+changes an API shape.
 
 ### Fixed
 
@@ -75,10 +77,31 @@ remotely reachable hang. Nothing here changes an API shape.
   OR rule while the code implemented AND, plus a second condition that was a
   strict subset of the first. Behaviour is unchanged; the rule is now stated
   once and correctly.
+- **Migration checksums depended on the checkout's line endings.**
+  `.gitattributes` pinned `eol=lf` for the source and config file types but not
+  for `.sql`, so `* text=auto` handed Windows clones CRLF migrations and
+  Linux/Docker clones LF ones — and hashing raw bytes made the same migration
+  fingerprint two different ways. On a development box that was a startup
+  warning; under `NODE_ENV=production`, which is what `docker-compose.yml`
+  sets, the runner throws "Refusing to continue", so a clean checkout could
+  fail to boot against its own database purely because of the operating system
+  it was cloned on. Line endings and a leading BOM are now normalised before
+  hashing; databases holding the old raw-bytes value are recognised as the same
+  SQL and upgraded in place rather than reported as drift, so existing installs
+  converge instead of breaking. `*.sql` is pinned to `eol=lf` to stop the
+  divergence at the source.
+- **`npm run doctor` validated a configuration the engine never loads.** It
+  always read `<repoRoot>/.env`, ignoring `CONTEXTZERO_ENV_FILE` — which is how
+  every MCP client launches the bridge — and merged with the opposite
+  precedence to `config.ts` (`{...fileEnv, ...process.env}`, where the engine
+  uses dotenv `override: true` and lets the file win). A stray shell variable
+  was enough to make doctor report one allowed base path while the engine used
+  two. It now resolves the same file with the same precedence, and names any
+  key where a shell variable and the env file disagree.
 
 ### Testing
 
-1,486 tests (up from 1,445), in three new suites:
+1,493 tests (up from 1,445), in four new suites:
 
 - `advisory-lock` — pins lock and unlock to one connection, and covers the
   contended, throwing and double-release paths.
@@ -88,6 +111,9 @@ remotely reachable hang. Nothing here changes an API shape.
   path containment, deadline and unreadable-file handling, plus three
   worker-containment tests proving a runaway match is killed and the main
   thread stays responsive.
+- `migration-checksum` — LF/CRLF/CR and BOM equivalence, real SQL changes still
+  detected, and a sweep asserting every shipped migration hashes the same
+  however it was checked out.
 
 CI now builds before running tests: worker threads load JavaScript only, so
 without a compiled `dist/` the containment tests skip and the execution bound
