@@ -7,4 +7,8 @@
 *.md text eol=lf
 *.json text eol=lf
 *.yml text eol=lf
+# Migrations are fingerprinted by content. Without this, `text=auto` gives
+# Windows clones CRLF and Linux/Docker clones LF, so the same migration hashes
+# two different ways and a production boot refuses to continue.
+*.sql text eol=lf
 Dockerfile text eol=lf

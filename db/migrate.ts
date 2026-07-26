@@ -13,6 +13,7 @@ import * as fs from "fs"
 import * as path from "path"
 import { Pool, PoolClient } from "pg"
 import { getConnectionConfig, getMigrationTimeoutConfig } from "../src/db-driver/config"
+import { migrationChecksum, legacyMigrationChecksum } from "../src/db-driver/migration-checksum"
 
 const MIGRATIONS_DIR = path.join(__dirname, "migrations")
 const MIGRATION_LOCK_KEY = 73297
@@ -89,22 +90,30 @@ async function main(): Promise<void> {
       if (!appliedSet.has(file)) continue
       const filePath = path.join(MIGRATIONS_DIR, file)
       const sql = fs.readFileSync(filePath, "utf-8")
-      const currentChecksum = cryptoMod.createHash("sha256").update(sql).digest("hex")
+      const currentChecksum = migrationChecksum(sql)
       const storedChecksum = appliedChecksums.get(file)
-      if (storedChecksum && storedChecksum !== currentChecksum) {
-        if (process.env.NODE_ENV === "production") {
-          throw new Error(
-            `Checksum mismatch for already-applied migration ${file}: ` +
-              `stored=${storedChecksum}, current=${currentChecksum}. ` +
-              `Refusing to continue — applied migrations must not be modified in production.`,
-          )
-        }
-        console.warn(
-          `  \x1b[33mWARNING\x1b[0m Checksum mismatch for ${file}:\n` +
-            `    stored:  ${storedChecksum}\n` +
-            `    current: ${currentChecksum}`,
+      if (!storedChecksum || storedChecksum === currentChecksum) continue
+
+      // Recorded under the pre-normalisation scheme: same SQL, older
+      // fingerprint. Upgrade it rather than reporting phantom drift.
+      if (storedChecksum === legacyMigrationChecksum(sql)) {
+        await pool.query(`UPDATE _migrations SET checksum = $1 WHERE filename = $2`, [currentChecksum, file])
+        console.log(`  Checksum upgraded to the line-ending-independent scheme: ${file}`)
+        continue
+      }
+
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(
+          `Checksum mismatch for already-applied migration ${file}: ` +
+            `stored=${storedChecksum}, current=${currentChecksum}. ` +
+            `Refusing to continue — applied migrations must not be modified in production.`,
         )
       }
+      console.warn(
+        `  \x1b[33mWARNING\x1b[0m Checksum mismatch for ${file}:\n` +
+          `    stored:  ${storedChecksum}\n` +
+          `    current: ${currentChecksum}`,
+      )
     }
 
     // Apply pending migrations
@@ -116,7 +125,7 @@ async function main(): Promise<void> {
 
       const filePath = path.join(MIGRATIONS_DIR, file)
       const sql = fs.readFileSync(filePath, "utf-8")
-      const checksum = cryptoMod.createHash("sha256").update(sql).digest("hex")
+      const checksum = migrationChecksum(sql)
 
       console.log(`  Applying: ${file}...`)
 

@@ -7,7 +7,13 @@ import { fileURLToPath } from "url"
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(scriptDir, "..")
-const envPath = path.join(repoRoot, ".env")
+
+// Resolve the env file exactly as src/config.ts does. MCP clients launch the
+// bridge with CONTEXTZERO_ENV_FILE pointing at an install-specific .env, so a
+// doctor that always read <repoRoot>/.env was validating a file the engine
+// never loads — reporting a healthy setup for the wrong configuration.
+const explicitEnvFile = (process.env.CONTEXTZERO_ENV_FILE || "").trim()
+const envPath = explicitEnvFile ? path.resolve(explicitEnvFile) : path.join(repoRoot, ".env")
 const migrationDir = path.join(repoRoot, "db", "migrations")
 const cliArgs = new Set(process.argv.slice(2))
 const insecurePasswords = new Set([
@@ -75,7 +81,19 @@ if (cliArgs.has("--fix") && !fs.existsSync(envPath)) {
 }
 
 const fileEnv = parseEnvFile(envPath)
-const env = { ...fileEnv, ...process.env }
+
+// Match the engine's precedence, or the report describes a configuration that
+// is not the one running. src/config.ts calls dotenv with override:true when
+// CONTEXTZERO_ENV_FILE is set — the file wins over the ambient environment —
+// and without it otherwise, where the ambient environment wins.
+// Getting this backwards is not cosmetic: a stray shell variable made doctor
+// report one allowed base path while the engine was using two.
+const env = explicitEnvFile ? { ...process.env, ...fileEnv } : { ...fileEnv, ...process.env }
+
+/** Env names where a shell variable and the env file disagree. */
+const shadowedKeys = Object.keys(fileEnv).filter(
+  (key) => process.env[key] !== undefined && process.env[key] !== fileEnv[key],
+)
 
 function pass(name, detail = "") {
   results.push({ status: "PASS", name, detail })
@@ -114,9 +132,23 @@ function checkNode() {
 
 function checkFiles() {
   if (fs.existsSync(envPath)) {
-    pass(".env file", envPath)
+    pass(".env file", explicitEnvFile ? `${envPath} (via CONTEXTZERO_ENV_FILE)` : envPath)
+  } else if (explicitEnvFile) {
+    fail(".env file", `CONTEXTZERO_ENV_FILE points at ${envPath}, which does not exist`)
   } else {
     warn(".env file", "missing; run npm run setup or copy .env.example to .env")
+  }
+
+  // A shell variable that disagrees with the env file is the single most
+  // confusing setup failure there is: every value you read looks right in the
+  // file while the process uses something else. Name the keys rather than
+  // letting the mismatch stay invisible.
+  if (shadowedKeys.length > 0) {
+    const winner = explicitEnvFile ? "the env file wins" : "the shell value wins"
+    warn(
+      "Environment shadowing",
+      `${shadowedKeys.join(", ")} set both in the shell and in ${path.basename(envPath)} with different values — ${winner}`,
+    )
   }
 
   const packageLock = path.join(repoRoot, "package-lock.json")
