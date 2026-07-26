@@ -1,6 +1,6 @@
 # Context Zero Engine
 
-[![Latest release](https://img.shields.io/github/v/release/classeve-public/context-zero-engine)](https://github.com/classeve-public/context-zero-engine/releases/latest) [![License](https://img.shields.io/github/license/classeve-public/context-zero-engine)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Classevelabs/context-zero-engine)](https://github.com/Classevelabs/context-zero-engine/releases/latest) [![License](https://img.shields.io/github/license/Classevelabs/context-zero-engine)](LICENSE)
 
 **A local code-intelligence engine for AI agents.** ContextZero indexes a
 repository into a PostgreSQL-backed code graph and serves structured,
@@ -108,7 +108,7 @@ algorithms, engine internals).
 ### Bootstrap (recommended)
 
 ```bash
-git clone https://github.com/classeve-public/context-zero-engine.git context-zero-engine
+git clone https://github.com/Classevelabs/context-zero-engine.git context-zero-engine
 cd context-zero-engine
 ```
 
