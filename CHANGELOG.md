@@ -41,10 +41,18 @@ remotely reachable hang. Nothing here changes an API shape.
   group, so the overlapping-alternation family passed straight through:
   `(a|aa)+$` took ~900 ms against a 30-character line and `(a|a?)+$` never
   returned at all. The pattern is caller-supplied, Node has no regex timeout
-  and the engine is single-threaded, so one such search stalls everything. The
-  detector now flags any quantified group containing an alternation or a nested
-  quantifier, and the scan carries a 10s wall-clock budget that returns partial
-  results with `timed_out: true` rather than running unbounded.
+  and the engine is single-threaded, so one such search stalls everything.
+  Fixed in two tiers. The static detector now flags any quantified group
+  containing an alternation or a nested quantifier, and those fall back to
+  escaped-literal search. Because a static check can never be complete — a
+  group-free pattern like `a*a*a*…$` backtracks exponentially and no detector
+  of this kind will see it — the scan now also runs in a **worker thread with
+  a hard `terminate()`** when the pattern is capable of backtracking at all.
+  That is the only bound Node actually offers: a runaway `RegExp.test` never
+  yields, so in-process timers can never fire. Patterns with no quantifier,
+  alternation or backreference are provably linear and skip the thread
+  entirely, so ordinary substring searches pay nothing. A scan that overruns
+  returns `timed_out: true` instead of hanging.
 - **Two patches for the same file left a half-applied change set.** Both staged
   at the same `<path>.scg-tmp`; the first rename consumed it and the second
   failed `ENOENT`, aborting the batch *after* earlier files had already been

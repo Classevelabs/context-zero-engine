@@ -51,6 +51,13 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Build before the tests, not after. Worker threads can only load
+      # JavaScript, so the search worker's containment test needs the compiled
+      # dist/ to exist — without this it skips and the hard timeout on
+      # caller-supplied regexes goes unexercised in CI.
+      - name: Build
+        run: npm run build
+
       - name: Run tests
         run: npm run test:ci
         env:
@@ -62,9 +69,6 @@ jobs:
           NODE_ENV: test
           SCG_API_KEYS: ""
           SCG_ALLOWED_BASE_PATHS: /tmp
-
-      - name: Build
-        run: npm run build
 
       - name: Upload coverage
         if: always()
