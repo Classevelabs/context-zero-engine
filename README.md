@@ -10,6 +10,10 @@ nothing leaves it.
 
 Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
 
+> **Official repository.** This is the only official repository for Context Zero Engine.
+> ClassEve's complete list of official accounts is at [classeve.com/official](https://classeve.com/official).
+> The GitHub account `github.com/ClassEve` is an unrelated third party, not affiliated with ClassEve.
+
 ---
 
 ## The Problem
