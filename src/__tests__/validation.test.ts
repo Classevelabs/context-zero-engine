@@ -1130,3 +1130,51 @@ describe("unicode and edge-case attack vectors", () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// requirePatchArray — duplicate file paths
+//
+// applyPatch stages every patch at `<fullPath>.scg-tmp` and then renames each
+// temp file into place. Two patches for one file share that temp path: the
+// first rename consumes it and the second fails ENOENT, aborting the batch
+// AFTER earlier files have already been renamed into their final locations.
+// Reject the ambiguity at the edge instead of half-applying it.
+// ---------------------------------------------------------------------------
+
+describe("requirePatchArray — duplicate paths", () => {
+  it("rejects two patches targeting the same file", () => {
+    const result = requirePatchArray([
+      { file_path: "src/index.ts", new_content: "a" },
+      { file_path: "src/index.ts", new_content: "b" },
+    ])
+    expect(result).toMatch(/patches\[1\]\.file_path: duplicate path/)
+  })
+
+  it("rejects duplicates that differ only by path spelling", () => {
+    // Both normalize to src/index.ts and resolve to the same file on disk.
+    const result = requirePatchArray([
+      { file_path: "src/index.ts", new_content: "a" },
+      { file_path: "src/./index.ts", new_content: "b" },
+    ])
+    expect(result).toMatch(/duplicate path/)
+  })
+
+  it("rejects duplicates that differ only by separator style", () => {
+    // Windows engines hand out backslash paths; both spellings name one file.
+    const result = requirePatchArray([
+      { file_path: "src/lib/index.ts", new_content: "a" },
+      { file_path: String.raw`src\lib\index.ts`, new_content: "b" },
+    ])
+    expect(result).toMatch(/duplicate path/)
+  })
+
+  it("still accepts distinct paths that share a prefix", () => {
+    expect(
+      requirePatchArray([
+        { file_path: "src/index.ts", new_content: "a" },
+        { file_path: "src/index.test.ts", new_content: "b" },
+        { file_path: "src/nested/index.ts", new_content: "c" },
+      ]),
+    ).toBeNull()
+  })
+})

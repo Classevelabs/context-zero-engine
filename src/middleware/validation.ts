@@ -176,6 +176,7 @@ export const requirePatchArray = (value: unknown): string | null => {
   if (value === undefined || value === null) return "required"
   if (!Array.isArray(value) || value.length === 0) return "must be a non-empty array"
   if (value.length > MAX_PATCH_COUNT) return `must have at most ${MAX_PATCH_COUNT} patches`
+  const seenPaths = new Set<string>()
   for (let i = 0; i < value.length; i++) {
     const p = value[i] as Record<string, unknown> | null
     if (!p || typeof p !== "object") return `patches[${i}]: must be an object`
@@ -207,6 +208,16 @@ export const requirePatchArray = (value: unknown): string | null => {
     if (normalized.startsWith("..") || path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
       return `patches[${i}].file_path: path traversal or absolute path not allowed`
     }
+    // Two patches for one file break applyPatch's write-then-rename: both write
+    // the same `<path>.scg-tmp`, the first rename consumes it, and the second
+    // fails ENOENT — aborting the batch *after* earlier files already landed at
+    // their final paths. Reject the ambiguity here rather than half-apply it.
+    const dedupeKey = path.normalize(slashNormalized)
+    if (seenPaths.has(dedupeKey)) {
+      return `patches[${i}].file_path: duplicate path '${slashNormalized}' — each file may appear at most once`
+    }
+    seenPaths.add(dedupeKey)
+
     const patchRecord = value[i] as Record<string, unknown>
     patchRecord.file_path = slashNormalized
   }

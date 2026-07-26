@@ -270,8 +270,26 @@ export class BatchLoader {
     const hasMore = queryResult.rows.length > pageSize
     const rawRows = hasMore ? queryResult.rows.slice(0, pageSize) : queryResult.rows
     const rows = validateRows(rawRows, validateSymbolVersionRow, "batchLoader.loadSymbolVersionsPaginated")
-    const lastRow = rows[rows.length - 1]
-    const nextCursor = hasMore && lastRow ? lastRow.symbol_version_id : null
+    // Advance the cursor from the last RAW row, not the last validated one.
+    // validateRows drops rows it cannot parse; deriving the cursor from the
+    // survivors would rewind to an already-seen id (re-reading the same page) —
+    // and if a whole page failed validation it would return null here and end
+    // the scan early, silently skipping the rest of the snapshot.
+    const lastRawRow = rawRows[rawRows.length - 1] as { symbol_version_id?: unknown } | undefined
+    const lastRawId = typeof lastRawRow?.symbol_version_id === "string" ? lastRawRow.symbol_version_id : null
+    const nextCursor = hasMore ? lastRawId : null
+
+    if (hasMore && nextCursor === null) {
+      // symbol_version_id is the primary key and the ORDER BY column, so this
+      // should be unreachable. If it ever happens there is no id to advance to:
+      // stopping is the only safe option (any fallback id would re-serve rows
+      // already returned, or loop), so say so loudly rather than looking done.
+      log.error("Paginated load cannot advance: last row has no usable symbol_version_id — scan stopped early", undefined, {
+        snapshotId,
+        pageSize,
+        returned: rows.length,
+      })
+    }
 
     log.debug("Paginated load symbol versions for snapshot", {
       snapshotId,

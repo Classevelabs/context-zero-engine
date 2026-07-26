@@ -18,6 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
 import * as path from "path"
+import * as crypto from "crypto"
 import { db } from "../db-driver"
 import { destroyAllCaches } from "../cache"
 import { runPendingMigrations } from "../db-driver/migrate"
@@ -151,6 +152,24 @@ const log = createMcpLogger("mcp-bridge")
 
 const MCP_SECRET = features.mcpSecret
 const MCP_ADMIN_SECRET = features.mcpAdminSecret
+
+/**
+ * Constant-time secret comparison, matching the HTTP surface's guarantee.
+ * The tool gate used `!==`, whose early exit leaks a prefix-length oracle —
+ * inconsistent with SECURITY.md's "timing-safe comparison" claim, and material
+ * for embedders that feed a per-session secret through this path.
+ * Both sides are padded so the compare time does not depend on either length.
+ */
+function secretsMatch(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented, "utf-8")
+  const b = Buffer.from(expected, "utf-8")
+  const maxLen = Math.max(a.length, b.length, 1)
+  const paddedA = Buffer.alloc(maxLen, 0)
+  const paddedB = Buffer.alloc(maxLen, 0)
+  a.copy(paddedA)
+  b.copy(paddedB)
+  return crypto.timingSafeEqual(paddedA, paddedB) && a.length === b.length
+}
 
 // ────────── Per-Tool Rate Limiting ──────────
 
@@ -295,7 +314,7 @@ function registerTool(name: string, config: McpToolConfig, handler: McpToolHandl
       const token = args["_auth_token"]
       const cleanArgs = { ...args }
       delete cleanArgs["_auth_token"]
-      if (token !== requiredSecret) {
+      if (typeof token !== "string" || !secretsMatch(token, requiredSecret)) {
         log.warn("Authentication failed for tool call", {
           tool: name,
           admin_gate: isAdminTool && Boolean(MCP_ADMIN_SECRET),

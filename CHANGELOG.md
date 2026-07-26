@@ -5,6 +5,76 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — Correctness and availability fixes
+
+Eight defects found in a line-level audit of the shipped 2.5.0 tree. Two of
+them silently disabled whole subsystems in long-running deployments; one is a
+remotely reachable hang. Nothing here changes an API shape.
+
+### Fixed
+
+- **Advisory locks leaked, silently disabling ingestion and retention.**
+  `pg_try_advisory_lock` / `pg_advisory_unlock` were issued through
+  `db.query()`, which runs each statement on an arbitrary pooled client.
+  Advisory locks are *session*-scoped, so the unlock could land on a different
+  backend, return `false` (a server WARNING, not an error — the existing
+  `.catch()` never fired) and leave the lock held for the life of the
+  connection that took it. From then on every `scg_ingest_repo`,
+  `scg_incremental_index` and retention run for that key short-circuited with
+  "already in progress" and returned zeroes. On the long-running HTTP server
+  that meant retention stopped permanently — unbounded snapshot growth, the
+  exact failure retention exists to prevent. Added `db.tryAdvisoryLock()`,
+  which pins one connection for the critical section and reports a failed
+  unlock, and moved all three call sites onto it. (`runPendingMigrations()`
+  already did this correctly by hand and was unaffected.)
+- **Incremental indexing served pre-edit code from cache.**
+  `ingestIncremental` deletes and re-creates the `symbol_versions` for every
+  changed file, but invalidated only the two `profileCache` entries per symbol.
+  `queryCache` kept handing out the deleted `symbol_version_id`s from its
+  `resolve:` entries for 60s, and `symbolCache` then answered lookups for those
+  dead ids out of memory — returning the **pre-edit `body_source` for up to
+  five minutes with no database row behind it**. Capsule and homolog caches
+  held derived analysis of the same. All five caches are now cleared after an
+  incremental pass, matching full ingestion.
+- **Catastrophic backtracking in `scg_search_code` could hang the process.**
+  The ReDoS filter only recognised a quantifier written directly inside a flat
+  group, so the overlapping-alternation family passed straight through:
+  `(a|aa)+$` took ~900 ms against a 30-character line and `(a|a?)+$` never
+  returned at all. The pattern is caller-supplied, Node has no regex timeout
+  and the engine is single-threaded, so one such search stalls everything. The
+  detector now flags any quantified group containing an alternation or a nested
+  quantifier, and the scan carries a 10s wall-clock budget that returns partial
+  results with `timed_out: true` rather than running unbounded.
+- **Two patches for the same file left a half-applied change set.** Both staged
+  at the same `<path>.scg-tmp`; the first rename consumed it and the second
+  failed `ENOENT`, aborting the batch *after* earlier files had already been
+  renamed into place. Duplicate paths are now rejected up front on both the
+  HTTP and MCP surfaces (separator- and `.`-segment-insensitive).
+- **Deleted files were never removed from the index.** An incremental pass
+  cleaned up a deleted file's symbol versions but left its `files` row, so the
+  path stayed in the index permanently — repeatedly re-read and skipped by
+  `scg_search_code`, and still counted by `scg_codebase_overview`.
+- **Paginated symbol loading could end a scan early.**
+  `loadSymbolVersionsBySnapshotPaginated` derived its cursor from the rows that
+  survived validation, so a dropped trailing row rewound onto already-returned
+  ids, and a page where every row was dropped returned a `null` cursor —
+  silently ending the scan mid-snapshot. The cursor now tracks the last raw row.
+- **MCP tool auth used a non-constant-time comparison.** The `_auth_token` gate
+  compared with `!==`, whose early exit leaks a prefix-length oracle — at odds
+  with the timing-safe guarantee the HTTP surface implements and SECURITY.md
+  advertises. Now uses a padded `crypto.timingSafeEqual`.
+- **Dead branch in the auth failure-map cleanup**, whose comment described an
+  OR rule while the code implemented AND, plus a second condition that was a
+  strict subset of the first. Behaviour is unchanged; the rule is now stated
+  once and correctly.
+
+### Testing
+
+1,477 tests (up from 1,445), including a new `advisory-lock` suite that pins
+lock and unlock to one connection, and a `search-redos` suite that asserts the
+previously-allowed catastrophic patterns now degrade to literal search while
+ordinary regexes still compile.
+
 ## [2.5.0] — Type-resolved effect analysis
 
 The effect/behavioral layer stops guessing. Measured on the ground-truth
