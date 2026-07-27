@@ -5,6 +5,44 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — Ingestion architecture
+
+### Changed
+
+- **LSH bands moved onto `semantic_vectors` as an array; the `lsh_bands` table
+  is gone.** Profiling a real 235-file ingest showed `batchEmbedSnapshot` was
+  **130.8s of 244s — 53.4% of total ingestion time**. Breaking that phase down
+  further put the cost squarely on writes, not maths: TF-IDF 938ms, MinHash
+  4,211ms, band computation 104ms, **database flush 136,182ms (94.5%)**.
+
+  The cause was volume and index size. `lsh_bands` held one row per
+  (symbol_version, view, band) — 64 rows per symbol — and had reached
+  **21,246,299 rows / 2,919 MB with a 1,234 MB primary key**. Every inserted
+  band row carried an `ON CONFLICT` probe into that B-tree, so ingestion got
+  slower as the database grew. The same repository ingested into an empty
+  database spent 13.5s on flush versus 136.2s on the loaded one: identical
+  work, **10.1x slower purely from accumulated index size**.
+
+  `semantic_vectors` already holds exactly one row per (symbol_version, view),
+  which is the grain a band array needs. Folding the band index into the band
+  hash (`computeBandKeys`) makes "shares band i at band i" expressible as an
+  array overlap, which GIN answers directly — so the separate table became
+  redundant and 64 rows per symbol became 0.
+
+  Measured back-to-back on the same snapshot in the same database, under the
+  same load — old architecture **261,809ms**, new architecture **19,213ms**,
+  a **13.6x speedup** on the phase that dominated ingestion.
+
+  Equivalence is proven rather than assumed: across 780 MinHash signature
+  pairs, array overlap returns exactly the same candidate decision as the
+  retired `(band_index, band_hash)` tuple match. False negatives — an LSH
+  correctness failure — cannot occur, because identical bands always encode to
+  identical keys. Collisions can only add a candidate, which exact cosine
+  re-scoring then discards.
+
+  The GIN index was kept on evidence, not instinct: at snapshot scale the
+  planner does use it (16-21ms lookups), and it costs ~17% on writes.
+
 ## [2.5.2] — First-run fix
 
 ### Fixed

@@ -314,15 +314,10 @@ DROP TABLE IF EXISTS semantic_profiles;
 -- rows. Each band produces one hash. Two symbols sharing any (view_type, band_index, band_hash)
 -- are LSH candidates, enabling O(matches) retrieval instead of O(N) full scan.
 
-CREATE TABLE IF NOT EXISTS lsh_bands (
-    symbol_version_id UUID NOT NULL REFERENCES symbol_versions(symbol_version_id) ON DELETE CASCADE,
-    view_type TEXT NOT NULL,
-    band_index SMALLINT NOT NULL,
-    band_hash INTEGER NOT NULL,
-    PRIMARY KEY (symbol_version_id, view_type, band_index)
-);
-
-CREATE INDEX idx_lsh_bands_lookup ON lsh_bands (view_type, band_index, band_hash);
+-- lsh_bands was removed in migration 019. LSH bands now live as an
+-- INTEGER[] column `band_keys` on semantic_vectors, with a GIN index,
+-- because the table reached 21M rows and its ON CONFLICT probes made
+-- ingestion slow down as the database grew.
 
 -- >>> 005_body_source.sql
 
