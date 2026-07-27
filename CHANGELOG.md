@@ -43,6 +43,52 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   The GIN index was kept on evidence, not instinct: at snapshot scale the
   planner does use it (16-21ms lookups), and it costs ~17% on writes.
 
+### Fixed
+
+- **Kotlin extracted a fifth of the symbols it should have.** Measured across
+  1,126 real Kotlin files: 2.1 symbols per file against TypeScript's 10.8.
+
+  The generic CST walker looked for a declaration's member container by field
+  name only — `childForFieldName("body")`, `("class_body")`, `("members")` —
+  and returned if none matched. tree-sitter-kotlin exposes `class_body` as a
+  plain named child, not a field, so every lookup returned null and entire
+  class bodies were discarded with no warning, no error, and no confidence
+  penalty. One 66KB service yielded a single symbol standing in for 1,500
+  lines; its parse tree held 59 `function_declaration`, 126
+  `property_declaration` and 3 `class_declaration` nodes, all reachable, none
+  extracted. That file now yields 124 symbols.
+
+  Containers are now matched by node type as well, and a declaration whose body
+  cannot be identified falls through to a child walk instead of returning —
+  losing a class body is worse than attributing a member to the wrong parent.
+
+  `getNodeName` also now looks one level into declarator-style wrappers.
+  Kotlin's `internal val iconInfo: ImageVector by lazy { … }` parses as
+  `property_declaration > [modifiers, binding_pattern_kind,
+  variable_declaration, property_delegate]`, with the identifier nested inside
+  `variable_declaration`, so a depth-1 scan found no name and dropped the
+  symbol. Top-level properties are ordinary Kotlin.
+
+  Measured A/B on identical file sets — **kotlin 2.11 → 12.27 per file
+  (+481%)**, with swift, rust, cpp, csharp and bash all unchanged. The other
+  languages reach their symbols through dedicated handlers or grammars that do
+  expose the body as a field.
+
+### Measured but rejected
+
+Two optimisations were tested against the real database and abandoned on the
+evidence, recorded here so they are not attempted again:
+
+- **`minhash_signature` as `INTEGER[]` instead of `BIGINT[]`** would halve the
+  largest column, but MinHash values are unsigned 32-bit: `LARGE_PRIME` is
+  4294967291 and the observed maximum across 170,763,520 stored values is
+  4294967295, well past signed `INTEGER`. The conversion would silently corrupt
+  signatures.
+- **`jsonb_to_recordset` bulk insert** in place of chunked multi-row `VALUES`
+  measured **1.4x slower** (2002ms vs 1407ms for 8,000 rows) — JSON
+  serialisation costs more than the round-trips it saves. The existing
+  multi-row insert is already the right shape.
+
 ## [2.5.2] — First-run fix
 
 ### Fixed
