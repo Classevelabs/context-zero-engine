@@ -34,8 +34,11 @@ export class StructuralGraphEngine {
       return 0
     }
 
-    // Load symbol versions for this snapshot, indexed by stable_key and canonical_name
-    const svRows = await coreDataService.getSymbolVersionsForSnapshot(snapshotId)
+    // Identity columns only. This runs once per ingested file, and the full
+    // row set carries body_source for every symbol in the snapshot — 21 MB
+    // against 2.4 MB on a real snapshot, all of it discarded right after the
+    // two maps below are built.
+    const svRows = await coreDataService.getSymbolIdentitiesForSnapshot(snapshotId)
     const svByKey = new Map<string, string>()
     const svByCanonical = new Map<string, string>()
 

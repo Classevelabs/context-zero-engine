@@ -510,6 +510,46 @@ export class CoreDataService {
     return extractId(result.rows[0] as Record<string, unknown> | undefined, "test_artifact_id")
   }
 
+  /**
+   * Identity triples for every symbol in a snapshot — nothing else.
+   *
+   * Relation resolution needs only stable_key, canonical_name and
+   * symbol_version_id, but was calling getSymbolVersionsForSnapshot, which
+   * selects `sv.*` and therefore drags `body_source` — the full text of every
+   * symbol — across the wire. On the REX snapshot that is 21 MB per call
+   * against 2,413 kB of identity, and the call happens once per ingested file:
+   * 2,576 files x 21 MB is roughly 54 GB of redundant transfer and parsing for
+   * data that is discarded immediately.
+   *
+   * Measured on that snapshot: 1,160ms for the full row set, 304ms for these
+   * three columns — 3.8x cheaper, per file.
+   */
+  public async getSymbolIdentitiesForSnapshot(
+    snapshot_id: string,
+  ): Promise<{ symbol_version_id: string; stable_key: string; canonical_name: string }[]> {
+    const result = await db.query(
+      `
+            SELECT sv.symbol_version_id, s.stable_key, s.canonical_name
+            FROM symbol_versions sv
+            JOIN symbols s ON s.symbol_id = sv.symbol_id
+            WHERE sv.snapshot_id = $1
+            LIMIT 100000
+        `,
+      [snapshot_id],
+    )
+    const rows: { symbol_version_id: string; stable_key: string; canonical_name: string }[] = []
+    for (const raw of result.rows as Record<string, unknown>[]) {
+      const id = raw["symbol_version_id"]
+      if (typeof id !== "string") continue
+      rows.push({
+        symbol_version_id: id,
+        stable_key: typeof raw["stable_key"] === "string" ? raw["stable_key"] : "",
+        canonical_name: typeof raw["canonical_name"] === "string" ? raw["canonical_name"] : "",
+      })
+    }
+    return rows
+  }
+
   public async getSymbolVersionsForSnapshot(snapshot_id: string): Promise<SymbolVersionRow[]> {
     const result = await db.query(
       `
