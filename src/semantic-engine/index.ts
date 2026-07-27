@@ -25,7 +25,7 @@ import {
   generateMinHash,
   estimateJaccardFromMinHash,
   multiViewSimilarity,
-  computeBandHashes,
+  computeBandKeys,
   LSH_ROWS_PER_BAND,
 } from "./similarity"
 
@@ -49,13 +49,12 @@ const MINHASH_PERMUTATIONS = 128
 
 /**
  * Max PostgreSQL parameters per query (~32K limit, stay well below).
- * semantic_vectors: 6 params per row, lsh_bands: 4 params per row.
+ * Band keys now ride on the vector row, so this is the only insert shape.
  */
 const MAX_PG_PARAMS = 30000
-const LSH_BAND_COLS = 4 // symbol_version_id, view_type, band_index, band_hash
-const SEMANTIC_VEC_COLS = 6 // vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count
-const MAX_LSH_ROWS_PER_INSERT = Math.floor(MAX_PG_PARAMS / LSH_BAND_COLS) // ~7500
-const MAX_VEC_ROWS_PER_INSERT = Math.floor(MAX_PG_PARAMS / SEMANTIC_VEC_COLS) // ~5000
+/** vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys */
+const SEMANTIC_VEC_COLS = 7
+const MAX_VEC_ROWS_PER_INSERT = Math.floor(MAX_PG_PARAMS / SEMANTIC_VEC_COLS) // ~4285
 
 /**
  * Build a multi-row INSERT ... ON CONFLICT for semantic_vectors.
@@ -69,6 +68,7 @@ function buildMultiRowVectorInsert(
     sparseJson: string
     minhash: number[]
     tokenCount: number
+    bandKeys: number[]
   }[],
 ): { text: string; params: unknown[] }[] {
   const statements: { text: string; params: unknown[] }[] = []
@@ -78,48 +78,20 @@ function buildMultiRowVectorInsert(
     const params: unknown[] = []
     let idx = 1
     for (const r of chunk) {
-      valuesClauses.push(`($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5})`)
-      params.push(r.vectorId, r.symbolVersionId, r.viewType, r.sparseJson, r.minhash, r.tokenCount)
+      valuesClauses.push(`($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}, $${idx + 6})`)
+      params.push(r.vectorId, r.symbolVersionId, r.viewType, r.sparseJson, r.minhash, r.tokenCount, r.bandKeys)
       idx += SEMANTIC_VEC_COLS
     }
     statements.push({
       text: `INSERT INTO semantic_vectors
-                   (vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count)
+                   (vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys)
                    VALUES ${valuesClauses.join(", ")}
                    ON CONFLICT (symbol_version_id, view_type)
                    DO UPDATE SET sparse_vector = EXCLUDED.sparse_vector,
                                  minhash_signature = EXCLUDED.minhash_signature,
                                  token_count = EXCLUDED.token_count,
+                                 band_keys = EXCLUDED.band_keys,
                                  created_at = NOW()`,
-      params,
-    })
-  }
-  return statements
-}
-
-/**
- * Build a multi-row INSERT ... ON CONFLICT for lsh_bands.
- * Returns one or more statements (chunked if row count exceeds PG param limit).
- */
-function buildMultiRowBandInsert(
-  rows: { symbolVersionId: string; viewType: string; bandIndex: number; bandHash: number }[],
-): { text: string; params: unknown[] }[] {
-  const statements: { text: string; params: unknown[] }[] = []
-  for (let offset = 0; offset < rows.length; offset += MAX_LSH_ROWS_PER_INSERT) {
-    const chunk = rows.slice(offset, offset + MAX_LSH_ROWS_PER_INSERT)
-    const valuesClauses: string[] = []
-    const params: unknown[] = []
-    let idx = 1
-    for (const r of chunk) {
-      valuesClauses.push(`($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3})`)
-      params.push(r.symbolVersionId, r.viewType, r.bandIndex, r.bandHash)
-      idx += LSH_BAND_COLS
-    }
-    statements.push({
-      text: `INSERT INTO lsh_bands (symbol_version_id, view_type, band_index, band_hash)
-                   VALUES ${valuesClauses.join(", ")}
-                   ON CONFLICT (symbol_version_id, view_type, band_index)
-                   DO UPDATE SET band_hash = EXCLUDED.band_hash`,
       params,
     })
   }
@@ -401,8 +373,8 @@ class SemanticEngine {
         sparseJson: string
         minhash: number[]
         tokenCount: number
+        bandKeys: number[]
       }[] = []
-      const bandRows: { symbolVersionId: string; viewType: string; bandIndex: number; bandHash: number }[] = []
 
       for (const viewType of VIEW_TYPES) {
         const tokens = viewTokens[viewType]
@@ -420,18 +392,13 @@ class SemanticEngine {
           sparseJson: JSON.stringify(tfidf),
           minhash,
           tokenCount: tokens.length,
+          // Band keys ride on the vector row — see migration 019.
+          bandKeys: computeBandKeys(minhash, LSH_ROWS_PER_BAND),
         })
-
-        // Compute LSH band hashes for sub-linear retrieval
-        const bandHashes = computeBandHashes(minhash, LSH_ROWS_PER_BAND)
-        for (let b = 0; b < bandHashes.length; b++) {
-          bandRows.push({ symbolVersionId, viewType, bandIndex: b, bandHash: bandHashes[b] ?? 0 })
-        }
       }
 
-      // Step 4: Multi-row INSERT — ~2 statements instead of ~85
-      const statements = [...buildMultiRowVectorInsert(vectorRows), ...buildMultiRowBandInsert(bandRows)]
-      await db.batchInsert(statements)
+      // Step 4: one statement for all five views
+      await db.batchInsert(buildMultiRowVectorInsert(vectorRows))
 
       done({ views: VIEW_TYPES.length, totalTokens: Object.values(viewTokens).reduce((s, t) => s + t.length, 0) })
     } catch (error) {
@@ -443,7 +410,7 @@ class SemanticEngine {
   /**
    * Find semantic candidates for a symbol using LSH banding.
    * Computes band hashes from the target's MinHash signatures, queries the
-   * lsh_bands table for symbols sharing at least one band, then re-scores
+   * band-key arrays for symbols sharing at least one band, then re-scores
    * matches with weighted Jaccard for accurate ranking.
    *
    * Falls back to linear scan if no LSH bands exist (graceful degradation).
@@ -475,58 +442,51 @@ class SemanticEngine {
         targetMinHashes[row.view_type as string] = row.minhash_signature as number[]
       }
 
-      // Step 2: Compute band hashes for the target's MinHash signatures
-      const targetBandHashes: Record<string, number[]> = {}
+      // Step 2: Compute band keys for the target's MinHash signatures
+      const targetBandKeys: Record<string, number[]> = {}
       for (const [viewType, minhash] of Object.entries(targetMinHashes)) {
-        targetBandHashes[viewType] = computeBandHashes(minhash, LSH_ROWS_PER_BAND)
+        targetBandKeys[viewType] = computeBandKeys(minhash, LSH_ROWS_PER_BAND)
       }
 
-      // Step 3: Check if LSH bands have been built; if not, fall back to linear scan
+      // Step 3: Snapshots embedded before migration 019 have no band keys.
+      // They still resolve, via the linear scan that already covers un-embedded
+      // snapshots — slower, but correct, and re-ingesting repopulates them.
       const lshCheck = await db.query(
-        `SELECT 1 FROM lsh_bands lb
-                 JOIN symbol_versions sv ON sv.symbol_version_id = lb.symbol_version_id
-                 WHERE sv.snapshot_id = $1
+        `SELECT 1 FROM semantic_vectors sem
+                 JOIN symbol_versions sv ON sv.symbol_version_id = sem.symbol_version_id
+                 WHERE sv.snapshot_id = $1 AND sem.band_keys IS NOT NULL
                  LIMIT 1`,
         [snapshotId],
       )
 
       if (lshCheck.rows.length === 0) {
-        log.info("No LSH bands found for snapshot, falling back to linear scan", { snapshotId })
+        log.info("No LSH band keys for snapshot, falling back to linear scan", { snapshotId })
         const result = await this._findSemanticCandidatesLinear(symbolVersionId, snapshotId, topK, targetMinHashes)
         done({ candidates: result.length, mode: "linear-fallback" })
         return result
       }
 
-      // Step 4: For each view type, query lsh_bands for candidate matches
-      const viewTypes = Object.keys(targetBandHashes)
+      // Step 4: candidates are rows whose band-key array overlaps the target's.
+      // Because the band index is folded into each key, a plain array overlap
+      // expresses "shares band i at band i" exactly, and GIN answers it without
+      // the tuple-list join the separate band table required.
+      const viewTypes = Object.keys(targetBandKeys)
       const candidateSvIds = new Set<string>()
 
       const bandQueries = viewTypes.map(async (viewType) => {
-        const bands = targetBandHashes[viewType]!
-        if (bands.length === 0) return
+        const keys = targetBandKeys[viewType]!
+        if (keys.length === 0) return
 
-        // Build VALUES list for (band_index, band_hash) tuples
-        const valueEntries: string[] = []
-        const queryParams: unknown[] = [snapshotId, symbolVersionId, viewType]
-        let paramIdx = 4 // $1=snapshotId, $2=symbolVersionId, $3=viewType
-
-        for (let b = 0; b < bands.length; b++) {
-          valueEntries.push(`($${paramIdx}::smallint, $${paramIdx + 1}::int)`)
-          queryParams.push(b, bands[b])
-          paramIdx += 2
-        }
-
-        const query = `
-                    SELECT DISTINCT lb.symbol_version_id
-                    FROM lsh_bands lb
-                    JOIN symbol_versions sv ON sv.symbol_version_id = lb.symbol_version_id
-                    WHERE sv.snapshot_id = $1
-                    AND lb.symbol_version_id != $2
-                    AND lb.view_type = $3
-                    AND (lb.band_index, lb.band_hash) IN (VALUES ${valueEntries.join(", ")})
-                `
-
-        const result = await db.query(query, queryParams)
+        const result = await db.query(
+          `SELECT sem.symbol_version_id
+                     FROM semantic_vectors sem
+                     JOIN symbol_versions sv ON sv.symbol_version_id = sem.symbol_version_id
+                     WHERE sv.snapshot_id = $1
+                       AND sem.symbol_version_id != $2
+                       AND sem.view_type = $3
+                       AND sem.band_keys && $4::int[]`,
+          [snapshotId, symbolVersionId, viewType, keys],
+        )
         for (const row of result.rows) {
           candidateSvIds.add(row.symbol_version_id as string)
         }
@@ -837,19 +797,22 @@ class SemanticEngine {
         sparseJson: string
         minhash: number[]
         tokenCount: number
+        bandKeys: number[]
       }[] = []
-      let pendingBandRows: { symbolVersionId: string; viewType: string; bandIndex: number; bandHash: number }[] = []
 
       const flushPending = async () => {
-        if (pendingVectorRows.length === 0 && pendingBandRows.length === 0) return
-        const statements = [
-          ...buildMultiRowVectorInsert(pendingVectorRows),
-          ...buildMultiRowBandInsert(pendingBandRows),
-        ]
-        await db.batchInsert(statements)
+        if (pendingVectorRows.length === 0) return
+        await db.batchInsert(buildMultiRowVectorInsert(pendingVectorRows))
         pendingVectorRows = []
-        pendingBandRows = []
       }
+
+      // Phase 3 is the slowest part of ingestion by a wide margin, so its cost
+      // is broken down rather than reported as one number — without this split
+      // there is no way to tell CPU (tf-idf, minhash) from I/O (flush).
+      let tfidfMs = 0
+      let minhashMs = 0
+      let bandMs = 0
+      let flushMs = 0
 
       for (const sym of symbols) {
         const svId = sym.symbol_version_id as string
@@ -857,12 +820,20 @@ class SemanticEngine {
 
         for (const viewType of VIEW_TYPES) {
           const tokens = viewTokens[viewType]
+          let mark = Date.now()
           const tf = computeTF(tokens)
           const idf = idfByView[viewType] || {}
           const tfidf = computeTFIDF(tf, idf)
+          tfidfMs += Date.now() - mark
 
+          mark = Date.now()
           const tokenSet = new Set(tokens)
           const minhash = generateMinHash(tokenSet, MINHASH_PERMUTATIONS)
+          minhashMs += Date.now() - mark
+
+          mark = Date.now()
+          const bandKeys = computeBandKeys(minhash, LSH_ROWS_PER_BAND)
+          bandMs += Date.now() - mark
 
           pendingVectorRows.push({
             vectorId: uuidv4(),
@@ -871,30 +842,33 @@ class SemanticEngine {
             sparseJson: JSON.stringify(tfidf),
             minhash,
             tokenCount: tokens.length,
+            bandKeys,
           })
-
-          // Compute LSH band hashes for sub-linear retrieval
-          const bandHashes = computeBandHashes(minhash, LSH_ROWS_PER_BAND)
-          for (let b = 0; b < bandHashes.length; b++) {
-            pendingBandRows.push({ symbolVersionId: svId, viewType, bandIndex: b, bandHash: bandHashes[b] ?? 0 })
-          }
         }
 
         embedded++
 
         // Flush periodically to stay within PG parameter limits
         if (embedded % FLUSH_SYMBOL_BATCH === 0) {
+          const mark = Date.now()
           await flushPending()
+          flushMs += Date.now() - mark
           log.info("Batch embedding progress", { snapshotId, embedded, total: symbols.length })
         }
       }
 
       // Final flush for remaining symbols
+      const finalMark = Date.now()
       await flushPending()
+      flushMs += Date.now() - finalMark
 
       log.info("Phase 3 complete: all vectors persisted with real IDF", {
         snapshotId,
         embedded,
+        tfidf_ms: tfidfMs,
+        minhash_ms: minhashMs,
+        band_ms: bandMs,
+        db_flush_ms: flushMs,
       })
 
       done({ embedded })
@@ -964,41 +938,22 @@ class SemanticEngine {
       // Step 5: Compute MinHash for query tokens and look up LSH candidates
       const queryTokenSet = new Set(queryTokens)
       const queryMinHash = generateMinHash(queryTokenSet, MINHASH_PERMUTATIONS)
-      const queryBandHashes = computeBandHashes(queryMinHash, LSH_ROWS_PER_BAND)
-
-      // Check if LSH bands exist for this snapshot
-      const lshCheck = await db.query(
-        `SELECT 1 FROM lsh_bands lb
-                 JOIN symbol_versions sv ON sv.symbol_version_id = lb.symbol_version_id
-                 WHERE sv.snapshot_id = $1
-                 LIMIT 1`,
-        [snapshotId],
-      )
+      const queryBandKeys = computeBandKeys(queryMinHash, LSH_ROWS_PER_BAND)
 
       let candidateSvIds: string[] = []
 
-      if (lshCheck.rows.length > 0 && queryBandHashes.length > 0) {
-        // LSH candidate retrieval: find symbols sharing at least one band hash
-        const valueEntries: string[] = []
-        const queryParams: unknown[] = [snapshotId]
-        let paramIdx = 2
-
-        for (let b = 0; b < queryBandHashes.length; b++) {
-          valueEntries.push(`($${paramIdx}::smallint, $${paramIdx + 1}::int)`)
-          queryParams.push(b, queryBandHashes[b])
-          paramIdx += 2
-        }
-
+      if (queryBandKeys.length > 0) {
+        // One GIN-answered overlap replaces the band-tuple join. Snapshots
+        // embedded before migration 019 have band_keys NULL, match nothing, and
+        // fall through to the batched scan below.
         const lshResult = await db.query(
-          `
-                    SELECT DISTINCT lb.symbol_version_id
-                    FROM lsh_bands lb
-                    JOIN symbol_versions sv ON sv.symbol_version_id = lb.symbol_version_id
-                    WHERE sv.snapshot_id = $1
-                    AND lb.view_type = 'body'
-                    AND (lb.band_index, lb.band_hash) IN (VALUES ${valueEntries.join(", ")})
-                `,
-          queryParams,
+          `SELECT sem.symbol_version_id
+                     FROM semantic_vectors sem
+                     JOIN symbol_versions sv ON sv.symbol_version_id = sem.symbol_version_id
+                     WHERE sv.snapshot_id = $1
+                       AND sem.view_type = 'body'
+                       AND sem.band_keys && $2::int[]`,
+          [snapshotId, queryBandKeys],
         )
 
         candidateSvIds = lshResult.rows.map((r) => r.symbol_version_id as string)
