@@ -41,6 +41,9 @@ jest.mock("../db-driver/core_data", () => ({
     upsertBehavioralProfile: jest.fn().mockResolvedValue("bp-id"),
     upsertContractProfile: jest.fn().mockResolvedValue("cp-id"),
     getSymbolVersionsForSnapshot: jest.fn().mockResolvedValue([]),
+    // Relation resolution loads identity columns only — the full row set
+    // carries body_source for every symbol and is discarded immediately.
+    getSymbolIdentitiesForSnapshot: jest.fn().mockResolvedValue([]),
   },
 }))
 
@@ -1615,7 +1618,7 @@ describe("StructuralGraphEngine", () => {
 
     test("resolves source keys via symbol version map", async () => {
       const { coreDataService } = require("../db-driver/core_data")
-      coreDataService.getSymbolVersionsForSnapshot.mockResolvedValue([
+      coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
         { stable_key: "src/a.ts::funcA", canonical_name: "funcA", symbol_version_id: "sv-a" },
         { stable_key: "src/b.ts::funcB", canonical_name: "funcB", symbol_version_id: "sv-b" },
       ])
@@ -1629,7 +1632,7 @@ describe("StructuralGraphEngine", () => {
 
     test("skips relations with unresolved source", async () => {
       const { coreDataService } = require("../db-driver/core_data")
-      coreDataService.getSymbolVersionsForSnapshot.mockResolvedValue([
+      coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
         { stable_key: "src/a.ts::funcA", canonical_name: "funcA", symbol_version_id: "sv-a" },
       ])
 
