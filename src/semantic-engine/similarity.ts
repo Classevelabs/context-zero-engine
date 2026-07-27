@@ -303,6 +303,39 @@ export function computeBandHashes(signature: number[], rowsPerBand: number = LSH
   return bandHashes
 }
 
+/**
+ * Fold a band's position into its hash, yielding one self-describing key.
+ *
+ * LSH requires band *i* of one signature to match band *i* of another — band 3
+ * matching band 7 means nothing. That positional pairing used to be expressed
+ * as a row per band, `(symbol_version_id, view_type, band_index, band_hash)`,
+ * which cost 16 rows per symbol-view and turned candidate lookup into a join
+ * against a table that grew to tens of millions of rows.
+ *
+ * Mixing the index into the hash carries the same information in a single
+ * value, so a signature becomes one array and "shares a band" becomes an array
+ * overlap that GIN answers directly.
+ *
+ * The mix multiplies the index by the 32-bit golden-ratio constant before
+ * xoring, which decorrelates adjacent indices instead of merely offsetting
+ * them. Two properties matter, and only one of them has to be exact:
+ *
+ *   - Determinism (required): identical (index, hash) pairs always produce
+ *     identical keys, so LSH never loses a true candidate.
+ *   - Distinctness (best-effort): distinct pairs collide with probability
+ *     ~2^-32. A collision admits one extra candidate, which the exact cosine
+ *     re-scoring downstream then discards. False positives cost a little work;
+ *     false negatives would cost correctness, and cannot occur.
+ */
+export function computeBandKeys(signature: number[], rowsPerBand: number = LSH_ROWS_PER_BAND): number[] {
+  const bandHashes = computeBandHashes(signature, rowsPerBand)
+  const keys: number[] = new Array(bandHashes.length)
+  for (let i = 0; i < bandHashes.length; i++) {
+    keys[i] = (bandHashes[i]! ^ Math.imul(i + 1, 0x9e3779b1)) | 0
+  }
+  return keys
+}
+
 // --------------------------------------------------------------------------
 // Multi-view similarity
 // --------------------------------------------------------------------------
