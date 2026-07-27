@@ -582,11 +582,45 @@ function getNodeName(node: SyntaxNode, language: SupportedLanguage): string | nu
 
   // Kotlin/Swift: some grammars don't use 'name' field — look for identifier children
   // Kotlin uses simple_identifier, Swift uses identifier, etc.
+  const IDENTIFIER_TYPES = new Set(["simple_identifier", "type_identifier", "word", "identifier"])
   for (let i = 0; i < Math.min(node.namedChildCount, 5); i++) {
     const child = node.namedChild(i)
     if (!child) continue
-    if (child.type === "simple_identifier" || child.type === "type_identifier" || child.type === "word") {
+    if (IDENTIFIER_TYPES.has(child.type)) {
       return child.text
+    }
+  }
+
+  // Some declarations wrap their name one level down, so a depth-1 scan finds
+  // nothing and the symbol is dropped without a trace.
+  //
+  // Kotlin's `internal val iconInfo: ImageVector by lazy { … }` parses as
+  // property_declaration > [modifiers, binding_pattern_kind,
+  // variable_declaration, property_delegate] — every direct child is a wrapper
+  // and the identifier lives inside variable_declaration. Top-level properties
+  // are ordinary Kotlin (constants, Compose values, DI singletons), so losing
+  // them cost real coverage: Kotlin extracted 1.9 symbols per file across 1,126
+  // real files against TypeScript's 10.8.
+  //
+  // One extra level is enough for that shape and stays conservative — the first
+  // identifier under a declarator-like wrapper is the declared name, and the
+  // scan stops before descending into bodies or argument lists.
+  const NAME_WRAPPERS = new Set([
+    "variable_declaration",
+    "multi_variable_declaration",
+    "pattern_binding_clause",
+    "init_declarator",
+    "declarator",
+    "variable_declarator",
+  ])
+  for (let i = 0; i < Math.min(node.namedChildCount, 5); i++) {
+    const child = node.namedChild(i)
+    if (!child || !NAME_WRAPPERS.has(child.type)) continue
+    for (let j = 0; j < Math.min(child.namedChildCount, 3); j++) {
+      const inner = child.namedChild(j)
+      if (inner && IDENTIFIER_TYPES.has(inner.type)) {
+        return inner.text
+      }
     }
   }
 
@@ -3872,12 +3906,20 @@ function walkNode(
       extractInheritanceRelations(node, stableKey, lang, ctx.relations)
       // Try to find body/member container and recurse into it
       const body =
-        node.childForFieldName("body") || node.childForFieldName("class_body") || node.childForFieldName("members")
+        node.childForFieldName("body") ||
+        node.childForFieldName("class_body") ||
+        node.childForFieldName("members") ||
+        findMemberContainer(node)
       if (body) {
         for (let i = 0; i < body.namedChildCount; i++) {
           const member = body.namedChild(i)
           if (member) walkNode(member, ctx, name, node)
         }
+      } else {
+        // No recognisable container. Descend anyway rather than returning with
+        // only the outer symbol — losing an entire class body is far worse than
+        // attributing a member to the wrong parent.
+        recurseChildren(node, ctx, name, node)
       }
     }
     return
@@ -3885,6 +3927,40 @@ function walkNode(
 
   // Fallback: recurse into children for unknown node types
   recurseChildren(node, ctx, parentName, parentClassNode)
+}
+
+/**
+ * Find the node holding a declaration's members when the grammar exposes it as
+ * a named child rather than a field.
+ *
+ * The generic handler looked the body up only by field name — "body",
+ * "class_body", "members". tree-sitter-kotlin exposes `class_body` as a plain
+ * named child, so every lookup returned null, the handler emitted the class and
+ * returned, and the entire body was dropped. On one 66KB file that discarded 59
+ * functions, 126 properties and 3 nested classes, leaving a single symbol
+ * standing for the whole 1,500-line service.
+ *
+ * The container names below cover the grammars behind the generic path (Kotlin,
+ * Swift, PHP, Bash) and the common shapes used by tree-sitter grammars broadly.
+ */
+function findMemberContainer(node: SyntaxNode): SyntaxNode | null {
+  const CONTAINER_TYPES = new Set([
+    "class_body",
+    "enum_class_body",
+    "object_body",
+    "interface_body",
+    "protocol_body",
+    "declaration_list",
+    "field_declaration_list",
+    "block",
+    "body",
+    "statements",
+  ])
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i)
+    if (child && CONTAINER_TYPES.has(child.type)) return child
+  }
+  return null
 }
 
 function recurseChildren(
