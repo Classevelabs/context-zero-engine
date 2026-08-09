@@ -41,7 +41,7 @@
     "semantic-search",
     "impact-analysis"
   ],
-  "author": "Ranjit Barnala",
+  "author": "ClassEve",
   "license": "Apache-2.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
