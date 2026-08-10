@@ -85,6 +85,71 @@ jobs:
           DB_USER: postgres
           DB_PASSWORD: postgres
           NODE_ENV: test
+
+      # Nothing proved the thing users actually install could start. The unit
+      # suites exercise modules; this boots the real stdio bridge against a
+      # real database and speaks MCP to it. Because the bridge runs pending
+      # migrations, recovers stale transactions and health-checks the DB
+      # before it will serve, a passing handshake also proves the migration
+      # path applies cleanly to a fresh database — the two things a new
+      # install depends on and neither of which had a test.
+      - name: MCP bridge cold-start smoke (real DB, fresh migrations)
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | timeout 120 node dist/mcp-bridge/index.js > /tmp/cz-mcp.json 2>/tmp/cz-mcp.err || true
+
+          echo "--- stderr (startup log) ---"; tail -20 /tmp/cz-mcp.err || true
+          echo "--- stdout (JSON-RPC) ---";    head -c 600 /tmp/cz-mcp.json || true; echo
+
+          grep -q '"result"' /tmp/cz-mcp.json \
+            || { echo "::error::MCP bridge produced no JSON-RPC result — it did not start or did not answer"; exit 1; }
+          grep -q '"protocolVersion"' /tmp/cz-mcp.json \
+            || { echo "::error::initialize did not return a protocolVersion"; exit 1; }
+          grep -q '"tools"' /tmp/cz-mcp.json \
+            || { echo "::error::tools/list returned no tool surface"; exit 1; }
+          grep -q 'DB health check passed' /tmp/cz-mcp.err \
+            || { echo "::error::bridge did not report a passing DB health check at startup"; exit 1; }
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: scg_v2_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          NODE_ENV: test
+          SCG_API_KEYS: ""
+
+  # The engine installs into Claude Desktop/Code, which people run on Windows
+  # and macOS far more than on Linux — and CI only ever built it on Linux.
+  # Postgres service containers are Linux-only on GitHub runners, so the full
+  # suite cannot move; what can move is proof that the code compiles and its
+  # DB-independent behaviour holds on the platforms users are actually on.
+  portability:
+    name: Portability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
           SCG_ALLOWED_BASE_PATHS: /tmp
 
       - name: Upload coverage
