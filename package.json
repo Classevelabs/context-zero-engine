@@ -49,18 +49,6 @@
     "express": "^5.2.1",
     "pg": "^8.20.0",
     "tree-sitter": "^0.22.4",
-    "tree-sitter-bash": "^0.23.3",
-    "tree-sitter-c-sharp": "^0.23.1",
-    "tree-sitter-cpp": "^0.23.4",
-    "tree-sitter-go": "^0.23.4",
-    "tree-sitter-java": "^0.23.5",
-    "tree-sitter-kotlin": "^0.3.8",
-    "tree-sitter-php": "^0.23.11",
-    "tree-sitter-python": "^0.23.6",
-    "tree-sitter-ruby": "^0.23.1",
-    "tree-sitter-rust": "^0.24.0",
-    "tree-sitter-swift": "^0.7.1",
-    "tree-sitter-typescript": "^0.23.2",
     "typescript": "^5.9.3",
     "uuid": "^13.0.0",
     "zod": "^3.25.76"
@@ -78,5 +66,19 @@
     "picomatch": "^4.0.4",
     "ts-jest": "^29.3.4",
     "ts-node": "^10.9.2"
+  },
+  "optionalDependencies": {
+    "tree-sitter-bash": "^0.23.3",
+    "tree-sitter-c-sharp": "^0.23.1",
+    "tree-sitter-cpp": "^0.23.4",
+    "tree-sitter-go": "^0.23.4",
+    "tree-sitter-java": "^0.23.5",
+    "tree-sitter-kotlin": "^0.3.8",
+    "tree-sitter-php": "^0.23.11",
+    "tree-sitter-python": "^0.23.6",
+    "tree-sitter-ruby": "^0.23.1",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-swift": "^0.7.1",
+    "tree-sitter-typescript": "^0.23.2"
   }
 }
