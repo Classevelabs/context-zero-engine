@@ -68,6 +68,23 @@ jobs:
           DB_PASSWORD: postgres
           NODE_ENV: test
           SCG_API_KEYS: ""
+
+      # README, INSTALL.md and OPERATIONS.md all name `npm run test:db` as the
+      # gate that proves this engine works against a real PostgreSQL — and
+      # nothing ran it. A Postgres service was already running here for the
+      # jest suite, so the only thing separating a documented gate from an
+      # enforced one was this step. Documentation that claims a check exists,
+      # while the check never executes, is worse than no claim: it reads as
+      # coverage.
+      - name: Real-PostgreSQL integration test
+        run: npm run test:db
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_NAME: scg_v2_test
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          NODE_ENV: test
           SCG_ALLOWED_BASE_PATHS: /tmp
 
       - name: Upload coverage
