@@ -45,6 +45,13 @@ jobs:
         env:
           PGPASSWORD: postgres
 
+      # The grammars are optionalDependencies so a platform without prebuilt
+      # native binaries can still install the engine. That must not become a
+      # silent way to ship without the languages we claim to parse, so on the
+      # platform we build and verify on, every one of them has to load.
+      - name: Verify all tree-sitter grammars loaded
+        run: node scripts/verify-grammars.mjs
+
       - name: Type check
         run: npm run typecheck
 
@@ -150,6 +157,10 @@ jobs:
           node-version: "20"
           cache: "npm"
 
+      # No --omit=optional here on purpose: this job exists to prove a normal
+      # `npm ci` succeeds on these platforms. Grammars that cannot build are
+      # skipped by npm rather than failing the install, which is the behaviour
+      # a Windows user gets.
       - name: Install dependencies
         run: npm ci
 
