@@ -68,6 +68,7 @@ jobs:
           DB_PASSWORD: postgres
           NODE_ENV: test
           SCG_API_KEYS: ""
+          SCG_ALLOWED_BASE_PATHS: /tmp
 
       # README, INSTALL.md and OPERATIONS.md all name `npm run test:db` as the
       # gate that proves this engine works against a real PostgreSQL — and
@@ -120,6 +121,13 @@ jobs:
           NODE_ENV: test
           SCG_API_KEYS: ""
 
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+
   # The engine installs into Claude Desktop/Code, which people run on Windows
   # and macOS far more than on Linux — and CI only ever built it on Linux.
   # Postgres service containers are Linux-only on GitHub runners, so the full
@@ -150,11 +158,3 @@ jobs:
 
       - name: Build
         run: npm run build
-          SCG_ALLOWED_BASE_PATHS: /tmp
-
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: coverage/
