@@ -31,6 +31,7 @@ interface RateConfig {
 /** Per-route rate configurations */
 const RATE_WINDOW_1_MIN = 60_000
 const RATE_WINDOW_5_MIN = 300_000
+const MAX_BUCKETS = 25_000
 
 const ROUTE_LIMITS: Record<string, RateConfig> = {
   // Expensive computation endpoints
@@ -44,6 +45,13 @@ const ROUTE_LIMITS: Record<string, RateConfig> = {
   "/scg_validate_change": { maxRequests: 20, windowMs: RATE_WINDOW_1_MIN },
   "/scg_commit_change": { maxRequests: 10, windowMs: RATE_WINDOW_1_MIN },
   "/scg_rollback_change": { maxRequests: 10, windowMs: RATE_WINDOW_1_MIN },
+  // Administrative diagnostics and cleanup must not inherit the permissive
+  // default. Mutation endpoints are especially easy to amplify.
+  "/scg_admin_run_retention": { maxRequests: 5, windowMs: RATE_WINDOW_5_MIN },
+  "/scg_admin_cleanup_stale": { maxRequests: 5, windowMs: RATE_WINDOW_5_MIN },
+  "/scg_admin_retention_stats": { maxRequests: 30, windowMs: RATE_WINDOW_1_MIN },
+  "/scg_admin_db_stats": { maxRequests: 20, windowMs: RATE_WINDOW_1_MIN },
+  "/scg_admin_system_info": { maxRequests: 20, windowMs: RATE_WINDOW_1_MIN },
   // Default for all other endpoints
   __default__: { maxRequests: 60, windowMs: RATE_WINDOW_1_MIN },
 }
@@ -65,6 +73,12 @@ class TokenBucketLimiter {
     let entry = this.buckets.get(key)
 
     if (!entry) {
+      // An authenticated client can still vary paths, proxy-derived IPs, and
+      // user agents. Bound memory even under a compromised API key.
+      if (this.buckets.size >= MAX_BUCKETS) {
+        const oldestKey = this.buckets.keys().next().value
+        if (oldestKey !== undefined) this.buckets.delete(oldestKey)
+      }
       entry = {
         tokens: config.maxRequests,
         lastRefillAt: now,
@@ -116,6 +130,10 @@ class TokenBucketLimiter {
     clearInterval(this.cleanupInterval)
     this.buckets.clear()
   }
+
+  public size(): number {
+    return this.buckets.size
+  }
 }
 
 const limiter = new TokenBucketLimiter()
@@ -130,20 +148,21 @@ function getCompositeKey(req: Request): string {
   const clientIp = req.ip || req.socket.remoteAddress || "unknown"
   const headers = req.headers || {}
 
-  // Extract partial API key (first 8 chars) for fingerprinting
-  let keyPrefix = "nokey"
+  // Hash the complete presented API key. Prefix-only fingerprints let distinct
+  // credentials with a shared prefix collide into one bucket.
+  let presentedKey = "nokey"
   const authHeader = headers["authorization"]
   if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
-    keyPrefix = authHeader.slice(7, 15)
+    presentedKey = authHeader.slice(7)
   } else {
     const xApiKey = headers["x-api-key"]
     if (typeof xApiKey === "string" && xApiKey.length > 0) {
-      keyPrefix = xApiKey.substring(0, 8)
+      presentedKey = xApiKey
     }
   }
 
   const ua = (typeof headers["user-agent"] === "string" ? headers["user-agent"] : "none").substring(0, 256)
-  const fpHash = crypto.createHash("sha256").update(`${keyPrefix}:${ua}`).digest("hex").substring(0, 12)
+  const fpHash = crypto.createHash("sha256").update(`${presentedKey}:${ua}`).digest("hex").substring(0, 16)
 
   return `${clientIp}:${fpHash}`
 }

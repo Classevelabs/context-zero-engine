@@ -997,6 +997,70 @@ describe("Ingestor — Delta detection", () => {
     const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123", "main", "parent-snap")
     expect(result).toBeDefined()
   })
+
+  test("re-extracts unchanged files when a delta profile copy fails", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([makeDirent("unchanged.ts", { isFile: true })])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValueOnce({ size: 100 })
+    const content = Buffer.from("export const unchanged = 1;")
+    mockReadFile.mockResolvedValue(content)
+    const expectedHash = require("crypto").createHash("sha256").update(content).digest("hex")
+    let failedBehaviorCopy = false
+
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes("SELECT index_status FROM snapshots")) return { rows: [{ index_status: "complete" }], rowCount: 1 }
+      if (text.includes("SELECT path, content_hash FROM files")) {
+        return { rows: [{ path: "unchanged.ts", content_hash: expectedHash }], rowCount: 1 }
+      }
+      if (text.includes("INSERT INTO symbol_versions") && text.includes("f_old")) return { rows: [], rowCount: 1 }
+      if (text.includes("INSERT INTO behavioral_profiles") && !failedBehaviorCopy) {
+        failedBehaviorCopy = true
+        throw new Error("profile copy failed")
+      }
+      return { rows: [], rowCount: 0 }
+    })
+
+    const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123", "main", "parent-snap")
+
+    expect(mockExtractFromTypeScript).toHaveBeenCalledWith([path.join("/repo", "unchanged.ts")], expect.anything())
+    expect(result.files_processed).toBe(1)
+    expect(result.symbols_extracted).toBe(0)
+  })
+
+  test("rebinds and copies outgoing relations from unchanged source files", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([makeDirent("unchanged.ts", { isFile: true })])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValueOnce({ size: 100 })
+    const content = Buffer.from("export const unchanged = 1;")
+    mockReadFile.mockResolvedValue(content)
+    const expectedHash = require("crypto").createHash("sha256").update(content).digest("hex")
+
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes("SELECT index_status FROM snapshots")) return { rows: [{ index_status: "complete" }], rowCount: 1 }
+      if (text.includes("SELECT path, content_hash FROM files")) {
+        return { rows: [{ path: "unchanged.ts", content_hash: expectedHash }], rowCount: 1 }
+      }
+      if (text.includes("INSERT INTO symbol_versions") && text.includes("f_old")) return { rows: [], rowCount: 1 }
+      if (text.includes("INSERT INTO structural_relations") && text.includes("src_file_new")) {
+        return { rows: [], rowCount: 2 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+
+    const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123", "main", "parent-snap")
+
+    const relationCopy = mockQuery.mock.calls.find(
+      (call: any[]) => String(call[0]).includes("INSERT INTO structural_relations") && String(call[0]).includes("src_file_new"),
+    )
+    expect(relationCopy?.[1]).toEqual(["parent-snap", "snap-001"])
+    expect(String(relationCopy?.[0])).toContain("src_file_new.content_hash = src_file_old.content_hash")
+    expect(result.relations_extracted).toBe(2)
+    expect(mockExtractFromTypeScript).not.toHaveBeenCalled()
+  })
 })
 
 describe("Ingestor — TypeScript extraction", () => {
@@ -1384,6 +1448,26 @@ describe("Ingestor — ingestIncremental", () => {
     )
   })
 
+  test("rejects traversal before deleting any indexed data", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ base_path: "/repo" }], rowCount: 1 })
+
+    await expect(ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts", "../escape.ts"])).rejects.toThrow(
+      /unsafe|outside/,
+    )
+
+    expect(mockTransaction).not.toHaveBeenCalled()
+    expect(mockQueryWithClient).not.toHaveBeenCalled()
+  })
+
+  test("rejects oversized change sets before deleting any indexed data", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ base_path: "/repo" }], rowCount: 1 })
+    const paths = Array.from({ length: 501 }, (_, index) => `src/file-${index}.ts`)
+
+    await expect(ingestor.ingestIncremental("repo-001", "snap-001", paths)).rejects.toThrow(/at most 500/)
+
+    expect(mockTransaction).not.toHaveBeenCalled()
+  })
+
   test("deletes old symbol data for changed files", async () => {
     mockQuery.mockImplementation(async (text: string) => {
       if (typeof text === "string" && text.includes("base_path FROM repositories")) {
@@ -1668,6 +1752,20 @@ describe("Ingestor — ingestIncremental", () => {
     expect(mockBuildClassHierarchy).toHaveBeenCalled()
     expect(mockResolveDispatches).toHaveBeenCalled()
     expect(mockComputeEffectSignatures).toHaveBeenCalled()
+  })
+
+  test("rebuilds semantic vectors and IDF after incremental invalidation", async () => {
+    mockQuery.mockImplementation(async (text: string) => {
+      if (typeof text === "string" && text.includes("base_path FROM repositories")) {
+        return { rows: [{ base_path: "/repo" }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    mockAccess.mockRejectedValue(new Error("ENOENT"))
+
+    await ingestor.ingestIncremental("repo-001", "snap-001", ["src/deleted.ts"])
+
+    expect(mockBatchEmbedSnapshot).toHaveBeenCalledWith("snap-001")
   })
 
   test("returns correct result shape", async () => {

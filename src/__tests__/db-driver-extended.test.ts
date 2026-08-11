@@ -143,6 +143,16 @@ describe("DatabaseDriver.query", () => {
     expect(mockQuery).toHaveBeenCalledTimes(1)
   })
 
+  it("does not replay a write after an ambiguous transient connection error", async () => {
+    const transientErr = Object.assign(new Error("Connection terminated after send"), { code: "08006" })
+    mockQuery.mockRejectedValueOnce(transientErr)
+
+    await expect(db.query("INSERT INTO events (id) VALUES ($1)", ["event-1"])).rejects.toThrow(
+      "Connection terminated",
+    )
+    expect(mockQuery).toHaveBeenCalledTimes(1)
+  })
+
   it("gives up after max retries", async () => {
     const transientErr = Object.assign(new Error("ECONNREFUSED"), { code: "08000" })
     mockQuery
@@ -282,6 +292,45 @@ describe("DatabaseDriver.batchInsert", () => {
     // BEGIN + COMMIT only
     expect(mockClient.query).toHaveBeenCalledWith("BEGIN")
     expect(mockClient.query).toHaveBeenCalledWith("COMMIT")
+  })
+})
+
+describe("DatabaseDriver.bulkInsert conflict safety", () => {
+  let mockClient: { query: jest.Mock; release: jest.Mock }
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    mockClient = {
+      query: jest.fn().mockResolvedValue({ rows: [], rowCount: 1 }),
+      release: jest.fn(),
+    }
+    mockConnect.mockResolvedValue(mockClient)
+    mockPool.waitingCount = 0
+  })
+
+  it("allows a narrow ON CONFLICT DO NOTHING clause", async () => {
+    await expect(
+      db.bulkInsert("events", ["id", "value"], [["event-1", "ok"]], {
+        conflict: "ON CONFLICT (id) DO NOTHING",
+      }),
+    ).resolves.toEqual({ rowsInserted: 1 })
+
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining("ON CONFLICT (id) DO NOTHING"),
+      ["event-1", "ok"],
+    )
+  })
+
+  it.each([
+    "ON CONFLICT (id) DO NOTHING; DROP TABLE events",
+    "ON CONFLICT (id) DO NOTHING --",
+    "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+    "ON CONFLICT (id /* injected */) DO NOTHING",
+  ])("rejects unstructured conflict SQL: %s", async (conflict) => {
+    await expect(db.bulkInsert("events", ["id"], [["event-1"]], { conflict })).rejects.toThrow(
+      "conflict must be",
+    )
+    expect(mockConnect).not.toHaveBeenCalled()
   })
 })
 

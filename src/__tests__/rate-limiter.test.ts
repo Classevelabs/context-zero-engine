@@ -6,7 +6,7 @@ import { Request, Response, NextFunction } from "express"
 
 describe("Rate Limiter", () => {
   let rateLimitMiddleware: (req: Request, res: Response, next: NextFunction) => void
-  let limiter: { check: Function; destroy: Function }
+  let limiter: { check: Function; destroy: Function; size: () => number }
 
   beforeEach(async () => {
     jest.resetModules()
@@ -120,6 +120,26 @@ describe("Rate Limiter", () => {
     rateLimitMiddleware(mock.req, mock.res, mock.next)
     expect(mock.next).not.toHaveBeenCalled()
     expect(mock.getStatus()).toBe(429)
+  })
+
+  test("admin mutation endpoints have a five-per-five-minute limit", () => {
+    for (let i = 0; i < 5; i++) {
+      const { req, res, next } = createMock("/scg_admin_cleanup_stale")
+      rateLimitMiddleware(req, res, next)
+      expect(next).toHaveBeenCalled()
+    }
+
+    const blocked = createMock("/scg_admin_cleanup_stale")
+    rateLimitMiddleware(blocked.req, blocked.res, blocked.next)
+    expect(blocked.getStatus()).toBe(429)
+  })
+
+  test("bounds token-bucket memory under attacker-controlled keys", () => {
+    const config = { maxRequests: 1, windowMs: 60_000 }
+    for (let i = 0; i < 25_100; i++) {
+      limiter.check(`attacker-${i}`, config)
+    }
+    expect(limiter.size()).toBe(25_000)
   })
 
   test("refills capacity over time", () => {

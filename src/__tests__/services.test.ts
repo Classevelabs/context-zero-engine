@@ -52,9 +52,26 @@ jest.mock("../path-security", () => ({
   })),
 }))
 
-jest.mock("fs/promises", () => ({
-  readFile: jest.fn(),
-}))
+jest.mock("fs/promises", () => {
+  const readFile = jest.fn()
+  return {
+    readFile,
+    // search-scan intentionally reads through one fixed-size file handle to
+    // prevent post-index growth races. Adapt the service fixture to that API
+    // while retaining readFile as the simple content control used below.
+    open: jest.fn(async (filePath: string) => {
+      const value = await readFile(filePath, "utf-8")
+      const content = Buffer.isBuffer(value) ? value : Buffer.from(String(value ?? ""), "utf8")
+      return {
+        stat: jest.fn().mockResolvedValue({ isFile: () => true, size: content.length }),
+        read: jest.fn(async (target: Buffer, offset: number, length: number, position: number) => ({
+          bytesRead: content.copy(target, offset, position, position + length),
+        })),
+        close: jest.fn().mockResolvedValue(undefined),
+      }
+    }),
+  }
+})
 
 import { resolveSymbol, getSymbolDetails } from "../services/symbol-service"
 import { getCodebaseOverview } from "../services/overview-service"
@@ -539,7 +556,9 @@ describe("searchCode", () => {
 
     ;(fsp.readFile as jest.Mock).mockResolvedValueOnce(fileContent)
 
-    const result = await searchCode("repo-1", "function\\s+\\w+")
+    // Anchoring exercises real regex semantics without backtracking, so it is
+    // safe to execute inline in Jest where the compiled worker is unavailable.
+    const result = await searchCode("repo-1", "^function")
 
     expect(result.total_matches).toBe(2)
     expect(result.matches[0]!.match).toContain("function")

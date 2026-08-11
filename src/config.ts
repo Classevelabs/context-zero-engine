@@ -80,7 +80,9 @@ export const PACKAGE_VERSION = readPackageVersion()
 
 export const server = Object.freeze({
   port: envInt("SCG_PORT", 3100),
-  host: envString("SCG_HOST", "0.0.0.0"),
+  // Local-first by default. Container/reverse-proxy deployments must opt into
+  // a network bind explicitly (the bundled Compose file sets 0.0.0.0).
+  host: envString("SCG_HOST", "127.0.0.1"),
   version: envString("SCG_VERSION", PACKAGE_VERSION),
   trustProxy: process.env["SCG_TRUST_PROXY"],
   hstsMaxAge: Math.max(0, envInt("SCG_HSTS_MAX_AGE_SECONDS", 31536000)),
@@ -140,6 +142,7 @@ export const logging = Object.freeze({
 
 export const features = Object.freeze({
   enableMcpAuth: envBool("SCG_MCP_AUTH_ENABLED", false),
+  enableMcpMutations: envBool("SCG_MCP_MUTATIONS_ENABLED", false),
   mcpSecret: envString("SCG_MCP_SECRET"),
   mcpAdminSecret: envString("SCG_MCP_ADMIN_SECRET"),
   enableMetrics: envBool("SCG_METRICS_ENABLED", true),

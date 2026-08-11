@@ -23,6 +23,7 @@ export class BlastRadiusEngine {
    */
   /** Hard ceiling on graph traversal depth — prevents runaway BFS regardless of caller */
   private static readonly MAX_INTERNAL_DEPTH = 5
+  private static readonly MAX_TARGETS = 20
 
   public async computeBlastRadius(
     snapshotId: string,
@@ -30,7 +31,14 @@ export class BlastRadiusEngine {
     depth: number = 2,
   ): Promise<BlastRadiusReport> {
     // Enforce internal depth cap — defense in depth against unbounded traversal
-    depth = Math.min(Math.max(1, depth), BlastRadiusEngine.MAX_INTERNAL_DEPTH)
+    if (!Array.isArray(targetSymbolVersionIds) || targetSymbolVersionIds.length > BlastRadiusEngine.MAX_TARGETS ||
+        targetSymbolVersionIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 128)) {
+      throw new Error(`Blast radius accepts at most ${BlastRadiusEngine.MAX_TARGETS} target identifiers`)
+    }
+    targetSymbolVersionIds = [...new Set(targetSymbolVersionIds)]
+    depth = Number.isFinite(depth)
+      ? Math.min(Math.max(1, Math.trunc(depth)), BlastRadiusEngine.MAX_INTERNAL_DEPTH)
+      : 2
 
     const timer = log.startTimer("computeBlastRadius", {
       snapshotId,

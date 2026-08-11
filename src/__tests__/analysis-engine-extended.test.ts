@@ -172,6 +172,13 @@ describe("BlastRadiusEngine", () => {
       expect(report).toBeDefined()
     })
 
+    test("normalizes non-finite depth and rejects oversized target sets", async () => {
+      await expect(engine.computeBlastRadius("snap-1", ["sv-1"], Number.NaN)).resolves.toBeDefined()
+      const tooMany = Array.from({ length: 21 }, (_, index) => `sv-${index}`)
+      await expect(engine.computeBlastRadius("snap-1", tooMany, Number.POSITIVE_INFINITY)).rejects.toThrow(/at most 20/)
+      expect(mockQuery).toHaveBeenCalled()
+    })
+
     test("returns quick scope when no impacts", async () => {
       const report = await engine.computeBlastRadius("snap-1", ["sv-1"], 1)
       expect(report.recommended_validation_scope).toBe("quick")
@@ -1253,6 +1260,20 @@ describe("TemporalEngine", () => {
       expect(commits[0].subject).toBe("feat: add | operator support")
     })
 
+    test("parses delimiter-safe git output with pipes in identity and paths", () => {
+      const hash = "a".repeat(40)
+      const raw = `\x1e${hash}\x00Author | Team\x00pipe@example.com\x002025-01-15T10:30:00+00:00\x00fix: support | syntax\x00src/a|b.ts\x00`
+      const commits = parseLog(raw)
+
+      expect(commits).toHaveLength(1)
+      expect(commits[0]).toMatchObject({
+        author_name: "Author | Team",
+        subject: "fix: support | syntax",
+        files: ["src/a|b.ts"],
+        is_bug_fix: true,
+      })
+    })
+
     test("skips binary files", () => {
       const hash = "a".repeat(40)
       const raw = `${hash}|A|a@b.com|2025-01-15 10:30:00 +0000|feat: add icons\nicon.png\nstyles.css\n`
@@ -1384,6 +1405,27 @@ describe("TemporalEngine", () => {
       const fileMap = new Map([["src/a.ts", ["sym-a"]]])
       const result = await temporalEngine.computeRiskScores("repo-1", "snap-1", commits, fileMap)
       expect(result).toBe(1)
+    })
+  })
+
+  describe("query bounds", () => {
+    test.each([
+      [Number.NaN, 20],
+      [-10, 1],
+      [Number.POSITIVE_INFINITY, 20],
+      [50_000, 500],
+    ])("normalizes top-risk limit %s", async (requested, expected) => {
+      await temporalEngine.getTopRisks("snap-1", requested)
+      expect(mockQuery.mock.calls.at(-1)?.[1]).toEqual(["snap-1", expected])
+    })
+
+    test.each([
+      [Number.NaN, 0.1],
+      [-1, 0],
+      [2, 1],
+    ])("normalizes co-change threshold %s", async (requested, expected) => {
+      await temporalEngine.getCoChangePartners("sym-1", "repo-1", requested)
+      expect(mockQuery.mock.calls.at(-1)?.[1]).toEqual(["sym-1", "repo-1", expected])
     })
   })
 })

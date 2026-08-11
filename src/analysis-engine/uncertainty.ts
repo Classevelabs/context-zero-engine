@@ -47,16 +47,20 @@ const SOURCE_IMPACT: Record<UncertaintySource, number> = {
 
 export class UncertaintyTracker {
   public createAnnotation(
-    source: UncertaintySource,
+    source: UncertaintySource | string,
     affectedSymbolId: string | null,
     description: string,
   ): UncertaintyAnnotation {
+    const knownSource = Object.prototype.hasOwnProperty.call(SOURCE_IMPACT, source)
+    const confidenceImpact = knownSource ? SOURCE_IMPACT[source as UncertaintySource] : 0.05
     return {
       source,
       affected_symbol_id: affectedSymbolId,
       description,
-      confidence_impact: SOURCE_IMPACT[source],
-      recommended_evidence: this.recommendEvidence(source),
+      confidence_impact: confidenceImpact,
+      recommended_evidence: knownSource
+        ? this.recommendEvidence(source as UncertaintySource)
+        : "Review the extraction warning and add targeted static or runtime evidence",
     }
   }
 
@@ -72,10 +76,12 @@ export class UncertaintyTracker {
     const uniqueSources = new Set<string>()
 
     for (const ann of annotations) {
+      const rawImpact = Number.isFinite(ann.confidence_impact) ? ann.confidence_impact : 0.05
+      const impact = Math.min(0.95, Math.max(0, rawImpact))
       if (uniqueSources.has(ann.source)) {
-        confidence *= 1 - ann.confidence_impact * 0.3
+        confidence *= 1 - impact * 0.3
       } else {
-        confidence *= 1 - ann.confidence_impact
+        confidence *= 1 - impact
         uniqueSources.add(ann.source)
       }
     }
@@ -136,7 +142,7 @@ export class UncertaintyTracker {
         bySource[flag] = (bySource[flag] || 0) + 1
         totalAnnotations++
         allAnnotations.push(
-          this.createAnnotation(flag as UncertaintySource, row.symbol_version_id, `Symbol has ${flag} uncertainty`),
+          this.createAnnotation(flag, row.symbol_version_id, `Symbol has ${flag} uncertainty`),
         )
       }
     }

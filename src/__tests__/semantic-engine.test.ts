@@ -84,6 +84,10 @@ describe("normalizeToken", () => {
     expect(normalizeToken("database")).toBe("database")
     expect(normalizeToken("query")).toBe("query")
   })
+
+  it("bounds pathological identifier length", () => {
+    expect(normalizeToken("A".repeat(10_000))).toHaveLength(256)
+  })
 })
 
 describe("tokenizeName", () => {
@@ -208,6 +212,10 @@ describe("tokenizeBody", () => {
     const userCount = tokens.filter((t) => t === "user").length
     expect(userCount).toBe(3)
   })
+
+  it("caps the emitted token stream", () => {
+    expect(tokenizeBody("aa ".repeat(100_000))).toHaveLength(25_000)
+  })
 })
 
 describe("tokenizeSignature", () => {
@@ -235,6 +243,10 @@ describe("tokenizeSignature", () => {
 
   it("handles empty signature", () => {
     expect(tokenizeSignature("")).toEqual([])
+  })
+
+  it("bounds oversized signatures", () => {
+    expect(tokenizeSignature("aa ".repeat(100_000))).toHaveLength(25_000)
   })
 })
 
@@ -360,6 +372,12 @@ describe("computeTF", () => {
     expect(tf["hello"]).toBeCloseTo(1)
   })
 
+  it("treats prototype-looking tokens as ordinary keys", () => {
+    const tf = computeTF(["__proto__", "__proto__", "constructor"])
+    expect(tf["__proto__"]).toBeCloseTo(1 + Math.log(2))
+    expect(tf["constructor"]).toBe(1)
+  })
+
   it("handles many duplicates", () => {
     const tokens = Array(100).fill("repeat")
     const tf = computeTF(tokens)
@@ -384,6 +402,11 @@ describe("computeIDF", () => {
 
   it("handles negative totalDocs", () => {
     expect(computeIDF([], -1)).toEqual({})
+  })
+
+  it("rejects non-finite document totals", () => {
+    expect(computeIDF([new Set(["token"])], Number.POSITIVE_INFINITY)).toEqual({})
+    expect(computeIDF([new Set(["token"])], Number.NaN)).toEqual({})
   })
 })
 
@@ -411,6 +434,11 @@ describe("computeTFIDF", () => {
   it("handles zero-magnitude vector", () => {
     const tfidf = computeTFIDF({}, {})
     expect(Object.keys(tfidf)).toHaveLength(0)
+  })
+
+  it("drops non-finite and negative weights", () => {
+    const vector = computeTFIDF({ good: 1, nan: Number.NaN, negative: -1 }, { good: 1, nan: 1, negative: 1 })
+    expect(vector).toEqual({ good: 1 })
   })
 })
 
@@ -444,6 +472,11 @@ describe("cosineSimilarity", () => {
     const b: SparseVector = { x: 0.7, z: 0.2 }
     expect(cosineSimilarity(a, b)).toBeCloseTo(cosineSimilarity(b, a))
   })
+
+  it("never returns NaN for corrupt persisted vector values", () => {
+    expect(cosineSimilarity({ x: Number.NaN }, { x: 1 })).toBe(0)
+    expect(cosineSimilarity({ x: Number.POSITIVE_INFINITY }, { x: 1 })).toBe(0)
+  })
 })
 
 describe("generateMinHash", () => {
@@ -460,6 +493,12 @@ describe("generateMinHash", () => {
   it("caps at 256 permutations", () => {
     const sig = generateMinHash(new Set(["hello"]), 500)
     expect(sig).toHaveLength(256)
+  })
+
+  it("normalizes negative, zero, and non-finite permutation counts", () => {
+    expect(generateMinHash(new Set(["hello"]), -10)).toHaveLength(1)
+    expect(generateMinHash(new Set(["hello"]), 0)).toHaveLength(1)
+    expect(generateMinHash(new Set(["hello"]), Number.NaN)).toHaveLength(128)
   })
 
   it("returns all 0xFFFFFFFF for empty set", () => {
@@ -590,6 +629,12 @@ describe("computeBandHashes", () => {
     const bands = computeBandHashes(sig, 2)
     expect(bands).toHaveLength(2) // floor(5/2) = 2
   })
+
+  it("handles empty signatures and invalid row counts without division loops", () => {
+    expect(computeBandHashes([], 0)).toEqual([])
+    expect(computeBandHashes([1, 2, 3], 0)).toHaveLength(3)
+    expect(computeBandHashes([1, 2, 3], Number.POSITIVE_INFINITY)).toHaveLength(1)
+  })
 })
 
 describe("multiViewSimilarity", () => {
@@ -635,6 +680,12 @@ describe("multiViewSimilarity", () => {
   it("handles zero weight", () => {
     const views = new Map<string, SparseVector>([["name", { a: 1 }]])
     expect(multiViewSimilarity(views, views, { name: 0 })).toBe(0)
+  })
+
+  it("ignores negative and non-finite weights", () => {
+    const views = new Map<string, SparseVector>([["name", { a: 1 }]])
+    expect(multiViewSimilarity(views, views, { name: -1 })).toBe(0)
+    expect(multiViewSimilarity(views, views, { name: Number.NaN })).toBe(0)
   })
 })
 

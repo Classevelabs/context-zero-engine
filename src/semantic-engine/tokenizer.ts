@@ -70,13 +70,18 @@ const SUFFIX_STEMS: [string, string][] = [
   ["utility", "util"],
 ]
 
+/** Per-view input/output bounds for attacker-controlled source metadata. */
+const MAX_TOKENIZE_LENGTH = 100_000
+const MAX_TOKEN_LENGTH = 256
+const MAX_TOKENS_PER_VIEW = 25_000
+
 /**
  * Normalize a single token: lowercase, remove trailing digits, apply stemming.
  * Returns empty string for tokens < 2 chars after processing.
  */
 export function normalizeToken(token: string): string {
-  // Lowercase
-  let normalized = token.toLowerCase()
+  // Bound pathological identifiers before allocating their lowercase copy.
+  let normalized = token.slice(0, MAX_TOKEN_LENGTH).toLowerCase()
 
   // Remove trailing digits
   normalized = normalized.replace(/\d+$/, "")
@@ -129,13 +134,14 @@ function splitCompoundName(name: string): string[] {
  * Tokenize a symbol name: split compound names, lowercase, stem suffixes.
  */
 export function tokenizeName(name: string): string[] {
-  const parts = splitCompoundName(name)
+  const parts = splitCompoundName(name.slice(0, MAX_TOKENIZE_LENGTH))
   const tokens: string[] = []
 
   for (const part of parts) {
     const normalized = normalizeToken(part)
     if (normalized !== "") {
       tokens.push(normalized)
+      if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
     }
   }
 
@@ -148,8 +154,6 @@ export function tokenizeName(name: string): string[] {
  * callers that need set semantics (e.g. MinHash) wrap the result in new Set().
  */
 /** Max code size for tokenization — beyond this, truncate to prevent CPU spike */
-const MAX_TOKENIZE_LENGTH = 100_000 // ~2500 lines
-
 export function tokenizeBody(code: string): string[] {
   // Truncate extremely large bodies to prevent regex backtracking / CPU spike.
   // 100K chars covers ~2500 lines — sufficient for TF-IDF token extraction.
@@ -188,6 +192,7 @@ export function tokenizeBody(code: string): string[] {
       const normalized = normalizeToken(part)
       if (normalized !== "" && !NOISE_WORDS.has(normalized)) {
         tokens.push(normalized)
+        if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
       }
     }
   }
@@ -200,12 +205,13 @@ export function tokenizeBody(code: string): string[] {
  * return type. Split compounds, remove noise. Duplicates preserved for TF-IDF.
  */
 export function tokenizeSignature(signature: string): string[] {
+  const input = signature.slice(0, MAX_TOKENIZE_LENGTH)
   // Extract all identifiers from the signature
   const identifierRegex = /[a-zA-Z_$][a-zA-Z0-9_$]*/g
   const rawIdentifiers: string[] = []
   let match: RegExpExecArray | null
 
-  while ((match = identifierRegex.exec(signature)) !== null) {
+  while ((match = identifierRegex.exec(input)) !== null) {
     rawIdentifiers.push(match[0])
   }
 
@@ -218,6 +224,7 @@ export function tokenizeSignature(signature: string): string[] {
       const normalized = normalizeToken(part)
       if (normalized !== "" && !NOISE_WORDS.has(normalized)) {
         tokens.push(normalized)
+        if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
       }
     }
   }
@@ -232,13 +239,14 @@ export function tokenizeSignature(signature: string): string[] {
 export function tokenizeBehavior(hints: { hint_type: string; detail: string }[]): string[] {
   const tokens: string[] = []
 
-  for (const hint of hints) {
+  for (const hint of hints.slice(0, 1_000)) {
     // Tokenize the hint_type (e.g., "db_read" -> ["db", "read"])
-    const typeParts = splitCompoundName(hint.hint_type)
+    const typeParts = splitCompoundName(hint.hint_type.slice(0, MAX_TOKENIZE_LENGTH))
     for (const part of typeParts) {
       const normalized = normalizeToken(part)
       if (normalized !== "") {
         tokens.push(normalized)
+        if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
       }
     }
 
@@ -246,12 +254,14 @@ export function tokenizeBehavior(hints: { hint_type: string; detail: string }[])
     const identifierRegex = /[a-zA-Z_$][a-zA-Z0-9_$]*/g
     let match: RegExpExecArray | null
 
-    while ((match = identifierRegex.exec(hint.detail)) !== null) {
+    const detail = hint.detail.slice(0, MAX_TOKENIZE_LENGTH)
+    while ((match = identifierRegex.exec(detail)) !== null) {
       const detailParts = splitCompoundName(match[0])
       for (const part of detailParts) {
         const normalized = normalizeToken(part)
         if (normalized !== "" && !NOISE_WORDS.has(normalized)) {
           tokens.push(normalized)
+          if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
         }
       }
     }
@@ -272,19 +282,26 @@ export function tokenizeContract(hint: {
 }): string[] {
   const tokens: string[] = []
 
-  const allTypeStrings = [...hint.input_types, hint.output_type, ...hint.thrown_types, ...hint.decorators]
+  const allTypeStrings = [
+    ...hint.input_types.slice(0, 1_000),
+    hint.output_type,
+    ...hint.thrown_types.slice(0, 1_000),
+    ...hint.decorators.slice(0, 1_000),
+  ]
 
   for (const typeStr of allTypeStrings) {
     // Extract identifiers from type expressions (handles generics like Promise<User[]>)
     const identifierRegex = /[a-zA-Z_$][a-zA-Z0-9_$]*/g
     let match: RegExpExecArray | null
 
-    while ((match = identifierRegex.exec(typeStr)) !== null) {
+    const input = typeStr.slice(0, MAX_TOKENIZE_LENGTH)
+    while ((match = identifierRegex.exec(input)) !== null) {
       const parts = splitCompoundName(match[0])
       for (const part of parts) {
         const normalized = normalizeToken(part)
         if (normalized !== "" && !NOISE_WORDS.has(normalized)) {
           tokens.push(normalized)
+          if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
         }
       }
     }

@@ -181,6 +181,97 @@ describe("Auth Middleware", () => {
     expect(next).toHaveBeenCalled()
   })
 
+  test("requires distinct strong admin keys for production HTTP deployments", async () => {
+    const { validateAdminApiKeyConfiguration } = await import("../middleware/auth")
+    const regular = "r".repeat(32)
+    const admin = "a".repeat(32)
+
+    expect(validateAdminApiKeyConfiguration([regular], [], true)).toEqual([
+      "SCG_ADMIN_API_KEYS must define a separate admin allowlist in production.",
+    ])
+    expect(validateAdminApiKeyConfiguration([regular], ["short", regular], true)).toEqual(
+      expect.arrayContaining([
+        "Every SCG_ADMIN_API_KEYS entry must be at least 32 characters.",
+        "SCG_ADMIN_API_KEYS must not reuse a regular SCG_API_KEYS credential in production.",
+      ]),
+    )
+    expect(validateAdminApiKeyConfiguration([regular], [admin], true)).toEqual([])
+    expect(validateAdminApiKeyConfiguration([regular], [], false)).toEqual([])
+  })
+
+  test("requires an admin key for repository mutation and command-execution routes", async () => {
+    const regular = "r".repeat(32)
+    const admin = "a".repeat(32)
+    process.env["SCG_API_KEYS"] = regular
+    process.env["SCG_ADMIN_API_KEYS"] = admin
+    const { authMiddleware, requirePrivilegedHttpRoute } = await import("../middleware/auth")
+
+    for (const path of [
+      "/scg_register_repo",
+      "/scg_apply_patch",
+      "/scg_validate_change",
+      "/scg_commit_change",
+      "/scg_rollback_change",
+      "/scg_admin_cleanup_stale",
+    ]) {
+      const regularCall = createMockReqRes({ path, authorization: `Bearer ${regular}` })
+      authMiddleware(regularCall.req as Request, regularCall.res as Response, regularCall.next as NextFunction)
+      expect(regularCall.next).toHaveBeenCalledTimes(1)
+      requirePrivilegedHttpRoute(
+        regularCall.req as Request,
+        regularCall.res as Response,
+        regularCall.next as NextFunction,
+      )
+      expect(regularCall.res.statusCode).toBe(403)
+
+      const adminCall = createMockReqRes({ path, authorization: `Bearer ${admin}` })
+      authMiddleware(adminCall.req as Request, adminCall.res as Response, adminCall.next as NextFunction)
+      requirePrivilegedHttpRoute(adminCall.req as Request, adminCall.res as Response, adminCall.next as NextFunction)
+      expect(adminCall.res.statusCode).toBeUndefined()
+      expect(adminCall.next).toHaveBeenCalledTimes(2)
+    }
+  })
+
+  test("does not elevate read routes to the admin role", async () => {
+    const regular = "r".repeat(32)
+    process.env["SCG_API_KEYS"] = regular
+    process.env["SCG_ADMIN_API_KEYS"] = "a".repeat(32)
+    const { authMiddleware, requirePrivilegedHttpRoute } = await import("../middleware/auth")
+    const call = createMockReqRes({ path: "/scg_resolve_symbol", authorization: `Bearer ${regular}` })
+
+    authMiddleware(call.req as Request, call.res as Response, call.next as NextFunction)
+    requirePrivilegedHttpRoute(call.req as Request, call.res as Response, call.next as NextFunction)
+
+    expect(call.res.statusCode).toBeUndefined()
+    expect(call.next).toHaveBeenCalledTimes(2)
+  })
+
+  test("rejects invalid production SIGHUP role reloads atomically", async () => {
+    const oldRegular = "r".repeat(32)
+    const oldAdmin = "a".repeat(32)
+    process.env["NODE_ENV"] = "production"
+    process.env["SCG_API_KEYS"] = oldRegular
+    process.env["SCG_ADMIN_API_KEYS"] = oldAdmin
+    const { hotReloadApiKeys, isRequestAuthenticated, isPresentedKeyAdmin } = await import("../middleware/auth")
+
+    for (const candidate of [
+      { regular: "n".repeat(32), admin: "" },
+      { regular: "n".repeat(32), admin: "n".repeat(32) },
+      { regular: "n".repeat(32), admin: "weak" },
+      { regular: "weak", admin: "z".repeat(32) },
+    ]) {
+      process.env["SCG_API_KEYS"] = candidate.regular
+      process.env["SCG_ADMIN_API_KEYS"] = candidate.admin
+      expect(hotReloadApiKeys()).toBe(false)
+
+      const oldRequest = createMockReqRes({ authorization: `Bearer ${oldRegular}` })
+      expect(isRequestAuthenticated(oldRequest.req as Request)).toBe(true)
+      expect(isPresentedKeyAdmin(oldAdmin)).toBe(true)
+      const candidateRequest = createMockReqRes({ authorization: `Bearer ${candidate.regular}` })
+      expect(isRequestAuthenticated(candidateRequest.req as Request)).toBe(false)
+    }
+  })
+
   test("escalates brute-force lockouts exponentially", async () => {
     jest.useFakeTimers()
     process.env["SCG_API_KEYS"] = "correct-key"

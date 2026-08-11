@@ -22,9 +22,10 @@ localhost, harden it:
 
 - **Never expose the HTTP server directly to the internet.** Put it behind
   a TLS-terminating reverse proxy and restrict access by firewall or VPN.
-- **Set strong secrets.** `SCG_API_KEYS` requires 32+ character keys in
-  production (generate with `openssl rand -hex 32`); replace the
-  placeholder `DB_PASSWORD` before starting anything.
+- **Set strong, separated secrets.** `SCG_API_KEYS` and
+  `SCG_ADMIN_API_KEYS` require 32+ character keys in production (generate
+  with `openssl rand -hex 32`). Admin keys must not reuse regular API keys.
+  Replace the placeholder `DB_PASSWORD` before starting anything.
 - **Scope the path allowlist.** `SCG_ALLOWED_BASE_PATHS` should contain
   only the repository roots you intend to index — registration fails
   closed when it is empty.
@@ -35,14 +36,27 @@ localhost, harden it:
   `.env` via `CONTEXTZERO_ENV_FILE` instead of duplicating database
   credentials into client config files (the bundled installer does this
   automatically).
+- **Treat MCP stdio as a trusted-local boundary.** `SCG_MCP_SECRET` is
+  optional per-call defense in depth, not a remote transport security layer;
+  its `_auth_token` is a tool argument visible to the MCP client. Do not relay
+  this stdio server over an untrusted network transport.
+- **Keep mutation and command execution off unless needed.** MCP mutation
+  tools require `SCG_MCP_MUTATIONS_ENABLED=true`. Repository validation
+  commands additionally require `SCG_ALLOW_UNSANDBOXED_EXECUTION=true`.
+  Enable them only for trusted repositories under a restricted OS identity.
 
 ## Built-in Controls
 
 The engine ships with fail-closed API-key authentication (timing-safe
-comparison, per-IP lockout with exponential backoff), 100% parameterized
-SQL with allowlisted dynamic identifiers, 5-layer path traversal
-protection (null bytes, URL encoding, backslashes, symlink escapes,
-base-path boundaries), per-route rate and body-size limits, input
-validation on every route, sandboxed subprocess execution with environment
-sanitization, and sanitized error responses that never include stack
-traces, internal paths, or SQL text.
+comparison, bounded lockout tracking, and distinct production admin keys for
+privileged HTTP operations). Request-controlled SQL values use parameters and
+dynamic identifiers are validated or allowlisted; trusted internal SQL
+fragments remain, so this is not a universal “100% parameterized” guarantee.
+It also applies path-boundary checks, bounded rate/body controls, route input
+validation, and sanitized HTTP errors.
+
+Validation uses an opt-in constrained subprocess runner with environment
+sanitization, time/output/resource limits, process-group termination, and
+best-effort Linux PID namespacing. It does **not** restrict filesystem or
+network access, and Windows receives no OS-level isolation. Treat any enabled
+repository command as code execution with the service account's authority.

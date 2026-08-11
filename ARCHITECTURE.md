@@ -4,7 +4,7 @@
 
 ContextZero is a **code intelligence engine** — it indexes codebases into a structured graph and serves precise, token-budgeted context to AI agents via the Model Context Protocol (MCP).
 
-**52 production source files** | **37,800+ lines of TypeScript** | **13 analysis engines** | **61 MCP tools** | **60 HTTP routes** | **15 supported languages**
+**13 analysis engines** | **61 MCP tools** | **60 HTTP routes** | **15 supported languages**
 
 ## 2. Engine Boundaries & Responsibility Pattern
 
@@ -84,12 +84,12 @@ All adapters produce the same normalized output (`AdapterExtractionResult`), ens
 - **6-level progressive validation**: syntax → type check → contract delta → behavioral delta → invariant check → test execution.
 - **3 validation modes**: quick (parse + type + direct tests), standard (quick + impacted tests + contract checks), strict (standard + expanded blast radius + semantic diff gating).
 - Persistent file backups in PostgreSQL with advisory locks for concurrent access. 5MB file size limit per backup.
-- **Sandboxed subprocess execution** (`sandbox.ts`): environment sanitization, ulimit resource constraints, process group isolation, SIGTERM → SIGKILL escalation, output truncation. `unshare` namespace detection.
+- **Opt-in constrained subprocess execution** (`sandbox.ts`): fail-closed unless `SCG_ALLOW_UNSANDBOXED_EXECUTION=true`, with environment sanitization, ulimit resource constraints, process groups, SIGTERM → SIGKILL escalation, output truncation, and best-effort Linux PID namespacing. It does not isolate filesystem or network access; Windows has no OS-level isolation.
 - Stale transaction cleanup and transaction recovery.
 
 ### 3.9 API Layer
-- **REST API (`mcp-interface`)** — Express 5 HTTP server with **60 routes** (7 GET + 53 POST). Fail-closed API key auth, per-route rate limiting, per-route body size limits (ingestion: 10MB, patches: 5MB, queries: 100KB, default: 1MB), input validation on every route via `validateBody()`, Prometheus metrics, correlation IDs (X-Request-ID), HSTS enforcement, and sanitized error responses via `UserFacingError`. Includes admin endpoints for retention, cleanup, database stats, and system info.
-- **MCP Stdio Bridge (`mcp-bridge`)** — Native Model Context Protocol server over stdio transport. **61 tools** registered with Zod schema validation. `safeTool` wrapper for structured error handling with allowlisted error prefixes. All logging to stderr to preserve the JSON-RPC stream.
+- **REST API (`mcp-interface`)** — Express 5 HTTP server with **60 routes** (7 GET + 53 POST). Fail-closed API key auth, distinct production admin keys for mutation/command/admin routes, bounded per-route rate limiting, tiered body limits, input validation, Prometheus metrics, correlation IDs, HSTS enforcement, and a sanitized JSON error boundary.
+- **MCP Stdio Bridge (`mcp-bridge`)** — Native Model Context Protocol server over a trusted local stdio child-process channel. **61 tools** are registered with Zod schema validation; mutation tools require operator-level `SCG_MCP_MUTATIONS_ENABLED=true`. Optional per-call secrets are defense in depth, not remote transport authentication. All logging goes to stderr.
 - **Native Workspace Tools** — 3 DB-free tools (`scg_native_codebase_overview`, `scg_native_symbol_search`, `scg_native_search_code`) for direct filesystem analysis via `workspace-native.ts`. Available only through MCP bridge (no HTTP routes).
 
 ### 3.10 Caching Layer (`cache`)
@@ -121,7 +121,7 @@ Transport-agnostic business logic shared between REST API and MCP bridge:
 
 ### 3.13 Security (`path-security`, `middleware/auth`, `middleware/validation`, `middleware/rate-limiter`)
 - **Path security** — 5-layer defense: null byte rejection, URL-encoded traversal prevention, backslash rejection on POSIX, symlink escape detection via `fs.realpathSync()`, boundary enforcement to registered base paths.
-- **Authentication** — Fail-closed API key auth via `crypto.timingSafeEqual()`. Per-IP brute-force lockout with exponential backoff (up to 60-min lockout). 32-char minimum key in production. SIGHUP hot-reload. Max 10K tracked IPs.
+- **Authentication** — Fail-closed API key auth via `crypto.timingSafeEqual()`. IP and credential-fingerprint lockout with exponential backoff, bounded tracking maps, 32-character minimum credentials in production, distinct admin credentials for privileged routes, and SIGHUP hot-reload.
 - **Input validation** — `validateBody()` middleware on every route. UUID strict regex, bounded integers, string max length (2000 chars), patch size limits (5MB/patch, 100 patches/request), path traversal checks. `optionalBoundedInt` / `requireBoundedInt` distinction for optional vs required numeric fields.
 - **Rate limiting** — O(1) token bucket per client IP with per-route configuration (ingestion: 5/5min, expensive: 20-30/min, default: 60/min). Retry-After header. Integer arithmetic to prevent floating-point drift.
 - **Error sanitization** — `UserFacingError` class with static factories (notFound, forbidden, badRequest). No stack traces, internal paths, or SQL text in responses.

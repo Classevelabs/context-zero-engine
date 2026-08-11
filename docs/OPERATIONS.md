@@ -47,7 +47,7 @@ psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
 ## Windows Quick Start
 
 ```powershell
-git clone https://github.com/classeve-public/context-zero-engine.git context-zero-engine
+git clone https://github.com/Classevelabs/context-zero-engine.git context-zero-engine
 cd context-zero-engine
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -Client claude
 ```
@@ -55,7 +55,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -Cli
 macOS/Linux:
 
 ```bash
-git clone https://github.com/classeve-public/context-zero-engine.git context-zero-engine
+git clone https://github.com/Classevelabs/context-zero-engine.git context-zero-engine
 cd context-zero-engine
 scripts/bootstrap.sh --client claude
 ```
@@ -133,6 +133,16 @@ npm run mcp
 
 ## Index A Repository
 
+MCP mutation tools are disabled by default. A trusted local operator must set:
+
+```dotenv
+SCG_MCP_MUTATIONS_ENABLED=true
+```
+
+This grants the connected MCP client authority to ingest and change allowed
+repositories. It is an operator-level trust decision, not a model-supplied
+tool argument.
+
 In an MCP client, call:
 
 ```text
@@ -174,6 +184,7 @@ Server variables:
 SCG_HOST=0.0.0.0
 SCG_PORT=3100
 SCG_API_KEYS=replace-with-a-strong-32-plus-character-key
+SCG_ADMIN_API_KEYS=replace-with-a-distinct-strong-32-plus-character-admin-key
 SCG_ALLOWED_BASE_PATHS=D:\Repos
 ```
 
@@ -191,11 +202,12 @@ macOS/Linux:
 scripts/bootstrap.sh --mode docker
 ```
 
-## Benchmarks
+## Historical Benchmarks
 
 See [`BENCHMARKS.md`](../BENCHMARKS.md) for the consolidated methodology and numbers.
 
-Measured headline:
+Author-reported historical headline (raw original run artifacts are not
+committed; reproduce on your target corpus before relying on these values):
 
 - Multi-language benchmark (7 repositories): 92.2% exact-token savings, 12.86x exact token reduction, and 99.26% savings versus whole-source loading.
 - VS Code benchmark: 91.96% exact-token savings, 12.44x exact token reduction, and 1,618x reduction versus full-source loading.
@@ -222,4 +234,6 @@ Expected result:
 - `npm audit` reports no vulnerabilities.
 - `npm run doctor` has zero failures and zero warnings.
 - At least one real repository under `SCG_ALLOWED_BASE_PATHS` ingests successfully.
-- Claude Desktop, Codex, or another MCP client can call `scg_health_check` and `scg_ingest_repo`.
+- Claude Desktop, Codex, or another MCP client can call `scg_health_check`.
+- After a trusted local operator sets `SCG_MCP_MUTATIONS_ENABLED=true`, the
+  client can call `scg_ingest_repo` on an allowed test repository.

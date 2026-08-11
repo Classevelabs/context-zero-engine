@@ -108,7 +108,9 @@ export const optionalBoundedInt =
   (min: number, max: number) =>
   (value: unknown): string | null => {
     if (value === undefined || value === null) return null
-    if (!isBoundedNumber(value, min, max)) return `must be a number between ${min} and ${max}`
+    if (!isBoundedNumber(value, min, max) || !Number.isSafeInteger(value)) {
+      return `must be a number between ${min} and ${max}`
+    }
     return null
   }
 
@@ -117,7 +119,9 @@ export const requireBoundedInt =
   (min: number, max: number) =>
   (value: unknown): string | null => {
     if (value === undefined || value === null) return "required"
-    if (!isBoundedNumber(value, min, max)) return `must be a number between ${min} and ${max}`
+    if (!isBoundedNumber(value, min, max) || !Number.isSafeInteger(value)) {
+      return `must be a number between ${min} and ${max}`
+    }
     return null
   }
 
@@ -177,6 +181,7 @@ export const requirePatchArray = (value: unknown): string | null => {
   if (!Array.isArray(value) || value.length === 0) return "must be a non-empty array"
   if (value.length > MAX_PATCH_COUNT) return `must have at most ${MAX_PATCH_COUNT} patches`
   const seenPaths = new Set<string>()
+  let totalContentBytes = 0
   for (let i = 0; i < value.length; i++) {
     const p = value[i] as Record<string, unknown> | null
     if (!p || typeof p !== "object") return `patches[${i}]: must be an object`
@@ -187,8 +192,13 @@ export const requirePatchArray = (value: unknown): string | null => {
       return `patches[${i}].new_content: required string`
     }
     // Cap individual patch content at 5MB to prevent memory exhaustion
-    if ((p.new_content as string).length > 5 * 1024 * 1024) {
+    const contentBytes = Buffer.byteLength(p.new_content as string, "utf8")
+    if (contentBytes > 5 * 1024 * 1024) {
       return `patches[${i}].new_content: exceeds 5MB size limit`
+    }
+    totalContentBytes += contentBytes
+    if (totalContentBytes > 20 * 1024 * 1024) {
+      return "combined patch content exceeds 20MB size limit"
     }
     // Block path traversal at validation level
     const filePath = p.file_path as string

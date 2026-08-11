@@ -232,9 +232,13 @@ CREATE TABLE IF NOT EXISTS transaction_file_backups (
     txn_id UUID NOT NULL REFERENCES change_transactions(txn_id) ON DELETE CASCADE,
     file_path TEXT NOT NULL,
     original_content TEXT,  -- NULL means file didn't exist before
+    original_mode INTEGER CONSTRAINT chk_transaction_file_backup_mode
+        CHECK (original_mode IS NULL OR original_mode BETWEEN 0 AND 511),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_txn_file_backups_txn ON transaction_file_backups(txn_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_transaction_file_backups_txn_path
+    ON transaction_file_backups (txn_id, file_path);
 
 -- ============================================================
 -- 4. Add normalized_ast_hash to symbol_versions

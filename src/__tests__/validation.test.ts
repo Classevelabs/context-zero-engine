@@ -594,6 +594,10 @@ describe("requireBoundedInt", () => {
     expect(validator(Infinity)).toBe("must be a number between 1 and 100")
   })
 
+  it("rejects fractional values for an integer field", () => {
+    expect(validator(1.5)).toBe("must be a number between 1 and 100")
+  })
+
   it("returns error for a boolean", () => {
     expect(validator(true)).toBe("must be a number between 1 and 100")
   })
@@ -776,6 +780,22 @@ describe("requirePatchArray", () => {
     expect(requirePatchArray([{ file_path: "src/index.ts", new_content: bigContent }])).toMatch(
       /patches\[0\]\.new_content: exceeds 5MB size limit/,
     )
+  })
+
+  it("enforces the patch limit in UTF-8 bytes", () => {
+    const multiByteContent = "😀".repeat(1_310_721)
+    expect(requirePatchArray([{ file_path: "src/index.ts", new_content: multiByteContent }])).toMatch(
+      /patches\[0\]\.new_content: exceeds 5MB size limit/,
+    )
+  })
+
+  it("caps combined patch content to prevent request memory amplification", () => {
+    const content = "x".repeat(4 * 1024 * 1024 + 1)
+    const patches = Array.from({ length: 5 }, (_, index) => ({
+      file_path: `src/file-${index}.ts`,
+      new_content: content,
+    }))
+    expect(requirePatchArray(patches)).toBe("combined patch content exceeds 20MB size limit")
   })
 
   // -- Path traversal attack vectors --

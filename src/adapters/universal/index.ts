@@ -4038,12 +4038,19 @@ function emitSymbol(
 // Error counting
 // ---------------------------------------------------------------------------
 
+const MAX_ADAPTER_SOURCE_BYTES = 5 * 1024 * 1024
+const MAX_PARSE_NODES = 1_000_000
+
 function countErrors(node: SyntaxNode): number {
   let count = 0
-  if (node.isError || node.isMissing) count++
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i)
-    if (child) count += countErrors(child)
+  const stack: SyntaxNode[] = [node]
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (current.isError || current.isMissing) count++
+    for (let i = 0; i < current.childCount; i++) {
+      const child = current.child(i)
+      if (child) stack.push(child)
+    }
   }
   return count
 }
@@ -4077,7 +4084,31 @@ export class UniversalAdapter {
     const contractHints: ContractHint[] = []
     const uncertaintyFlags: string[] = []
 
-    // Handle empty source
+    if (typeof source !== "string") {
+      return {
+        symbols,
+        relations,
+        behavior_hints: behaviorHints,
+        contract_hints: contractHints,
+        parse_confidence: 0.0,
+        uncertainty_flags: ["invalid_source"],
+      }
+    }
+
+    if (Buffer.byteLength(source, "utf8") > MAX_ADAPTER_SOURCE_BYTES) {
+      this.log.warn("Source exceeds universal-adapter size limit", { filePath, language })
+      return {
+        symbols,
+        relations,
+        behavior_hints: behaviorHints,
+        contract_hints: contractHints,
+        parse_confidence: 0.0,
+        uncertainty_flags: ["source_too_large"],
+      }
+    }
+
+    // Handle empty source after enforcing the byte bound: trim() itself must
+    // never scan and allocate from an arbitrarily large whitespace payload.
     if (!source || source.trim().length === 0) {
       timer({ symbols: 0 })
       return {
@@ -4117,6 +4148,21 @@ export class UniversalAdapter {
         contract_hints: contractHints,
         parse_confidence: 0.0,
         uncertainty_flags: ["no_root_node"],
+      }
+    }
+    if (rootNode.descendantCount > MAX_PARSE_NODES) {
+      this.log.warn("Parse tree exceeds universal-adapter node limit", {
+        filePath,
+        language,
+        nodes: rootNode.descendantCount,
+      })
+      return {
+        symbols,
+        relations,
+        behavior_hints: behaviorHints,
+        contract_hints: contractHints,
+        parse_confidence: 0.0,
+        uncertainty_flags: ["parse_tree_too_large"],
       }
     }
 

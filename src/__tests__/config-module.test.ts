@@ -110,10 +110,10 @@ describe("server config", () => {
     expect(config.server.port).toBe(3100)
   })
 
-  test("server.host defaults to 0.0.0.0", async () => {
+  test("server.host defaults to loopback", async () => {
     delete process.env["SCG_HOST"]
     const config = await import("../config")
-    expect(config.server.host).toBe("0.0.0.0")
+    expect(config.server.host).toBe("127.0.0.1")
   })
 
   test("server.host reads from SCG_HOST", async () => {
@@ -288,6 +288,7 @@ describe("default values", () => {
       "DB_MAX_CONNECTIONS",
       "LOG_LEVEL",
       "SCG_MCP_AUTH_ENABLED",
+      "SCG_MCP_MUTATIONS_ENABLED",
       "SCG_MCP_SECRET",
       "SCG_METRICS_ENABLED",
     ]
@@ -299,7 +300,7 @@ describe("default values", () => {
     const config = await import("../config")
 
     expect(config.server.port).toBe(3100)
-    expect(config.server.host).toBe("0.0.0.0")
+    expect(config.server.host).toBe("127.0.0.1")
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     expect(config.server.version).toBe((require("../../package.json") as { version: string }).version)
     expect(config.database.host).toBe("localhost")
@@ -411,6 +412,17 @@ describe("features config", () => {
     process.env["SCG_MCP_AUTH_ENABLED"] = "true"
     const config = await import("../config")
     expect(config.features.enableMcpAuth).toBe(true)
+  })
+
+  test("enableMcpMutations is an explicit opt-in", async () => {
+    delete process.env["SCG_MCP_MUTATIONS_ENABLED"]
+    let config = await import("../config")
+    expect(config.features.enableMcpMutations).toBe(false)
+
+    jest.resetModules()
+    process.env["SCG_MCP_MUTATIONS_ENABLED"] = "true"
+    config = await import("../config")
+    expect(config.features.enableMcpMutations).toBe(true)
   })
 
   test("enableMetrics defaults to true", async () => {

@@ -77,6 +77,12 @@ describe("LRUCache", () => {
       expect(cache.get("short")).toBeUndefined()
     })
 
+    test("entry is expired at the exact TTL boundary", () => {
+      cache.set("boundary", "val", 2_000)
+      jest.advanceTimersByTime(2_000)
+      expect(cache.get("boundary")).toBeUndefined()
+    })
+
     test("evictExpired runs on cleanup interval and removes expired entries", () => {
       cache.set("expire-me", "val", 5_000)
 
@@ -167,23 +173,21 @@ describe("LRUCache", () => {
       expect(cache.get("f")).toBe("6")
     })
 
-    test("set on existing key does NOT change Map iteration order", () => {
+    test("set on existing key refreshes its LRU position", () => {
       cache.set("a", "1")
       cache.set("b", "2")
       cache.set("c", "3")
       cache.set("d", "4")
       cache.set("e", "5")
 
-      // Overwrite 'a' via set — Map.set on an existing key does NOT
-      // move the entry to the end of the iteration order (unlike get,
-      // which explicitly deletes + re-inserts). So 'a' remains LRU.
+      // Updating 'a' refreshes it to most-recently-used.
       cache.set("a", "refreshed")
 
-      // Adding a new key evicts the LRU entry, which is still 'a'
+      // Adding a new key now evicts 'b'.
       cache.set("f", "6")
 
-      expect(cache.get("a")).toBeUndefined() // evicted despite update
-      expect(cache.get("b")).toBe("2") // still present
+      expect(cache.get("a")).toBe("refreshed")
+      expect(cache.get("b")).toBeUndefined()
       expect(cache.get("f")).toBe("6")
     })
 
@@ -300,6 +304,21 @@ describe("LRUCache", () => {
 
       // Advancing timers should not cause errors (interval was cleared)
       expect(() => jest.advanceTimersByTime(120_000)).not.toThrow()
+      expect(() => cache.set("after", "destroy")).toThrow("destroyed")
+    })
+  })
+
+  describe("configuration validation", () => {
+    test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5])(
+      "rejects invalid maxSize %s",
+      (maxSize) => {
+        expect(() => new LRUCache(maxSize, 1_000)).toThrow("maxSize")
+      },
+    )
+
+    test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5])("rejects invalid TTL %s", (ttl) => {
+      expect(() => new LRUCache(5, ttl)).toThrow("defaultTTLMs")
+      expect(() => cache.set("key", "value", ttl)).toThrow("ttlMs")
     })
   })
 
@@ -370,15 +389,19 @@ describe("destroyAllCaches", () => {
 })
 
 describe("scopedKey", () => {
-  test('produces "snapshotId:key" format', () => {
-    expect(scopedKey("snap-123", "myKey")).toBe("snap-123:myKey")
+  test("uses a length-prefixed snapshot namespace", () => {
+    expect(scopedKey("snap-123", "myKey")).toBe("8:snap-123:myKey")
   })
 
   test("handles empty strings", () => {
-    expect(scopedKey("", "")).toBe(":")
+    expect(scopedKey("", "")).toBe("0::")
   })
 
   test("preserves special characters", () => {
-    expect(scopedKey("snap/1", "key:with:colons")).toBe("snap/1:key:with:colons")
+    expect(scopedKey("snap/1", "key:with:colons")).toBe("6:snap/1:key:with:colons")
+  })
+
+  test("cannot collide when both components contain separators", () => {
+    expect(scopedKey("a:b", "c")).not.toBe(scopedKey("a", "b:c"))
   })
 })

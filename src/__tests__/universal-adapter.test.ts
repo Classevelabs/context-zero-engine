@@ -20,6 +20,13 @@ describe("universal tree-sitter adapter", () => {
                     uncertaintyFlags: result.uncertainty_flags,
                 };
             }
+            const oversized = extractWithTreeSitter('oversized.go', 'x'.repeat(5 * 1024 * 1024 + 1), 'go');
+            output.oversized = {
+                symbols: oversized.symbols,
+                behaviorHints: oversized.behavior_hints,
+                uncertaintyFlags: oversized.uncertainty_flags,
+                parseConfidence: oversized.parse_confidence,
+            };
             process.stdout.write(JSON.stringify(output));
         `
 
@@ -30,7 +37,7 @@ describe("universal tree-sitter adapter", () => {
     })
     const output = JSON.parse(raw) as Record<
       string,
-      { symbols: string[]; behaviorHints: string[]; uncertaintyFlags: string[] }
+      { symbols: string[]; behaviorHints: string[]; uncertaintyFlags: string[]; parseConfidence?: number }
     >
 
     expect(output["bash"]?.symbols).toContain("deploy")
@@ -39,5 +46,10 @@ describe("universal tree-sitter adapter", () => {
     expect(output["swift"]?.symbols).toEqual(expect.arrayContaining(["Client", "fetch"]))
     expect(output["swift"]?.behaviorHints).toContain("swift_urlsession")
     expect(output["cpp"]?.symbols).toEqual(expect.arrayContaining(["saxpy", "host_add"]))
+    expect(output["oversized"]).toMatchObject({
+      symbols: [],
+      uncertaintyFlags: ["source_too_large"],
+      parseConfidence: 0,
+    })
   })
 })
