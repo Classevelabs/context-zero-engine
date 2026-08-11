@@ -12,7 +12,6 @@ dist/
 .env.local
 .env.*.local
 .contextzero/
-.claude/
 
 # IDE
 .vscode/
