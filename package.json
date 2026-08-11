@@ -3,6 +3,26 @@
   "version": "2.5.2",
   "description": "Local code intelligence engine for AI agents with MCP and HTTP interfaces",
   "main": "dist/mcp-interface/index.js",
+  "files": [
+    "dist/",
+    "db/migrations/",
+    "db/schema.sql",
+    "scripts/create-mcp-config.mjs",
+    "scripts/doctor.mjs",
+    "scripts/mcp-install.mjs",
+    "scripts/setup.mjs",
+    "docs/",
+    "ARCHITECTURE.md",
+    "BENCHMARKS.md",
+    "CHANGELOG.md",
+    "NOTICE",
+    "SECURITY.md",
+    "TECHNICAL_DESIGN.md",
+    ".env.example",
+    ".env.docker.example",
+    "Dockerfile",
+    "docker-compose.yml"
+  ],
   "engines": {
     "node": ">=20.0.0"
   },
@@ -85,5 +105,6 @@
     "tree-sitter-rust": "^0.24.0",
     "tree-sitter-swift": "^0.7.1",
     "tree-sitter-typescript": "^0.23.2"
-  }
+  },
+  "private": true
 }
