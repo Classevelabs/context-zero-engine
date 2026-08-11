@@ -24,6 +24,51 @@ const STALE_FAILURE_RETENTION_MS = 30 * 60 * 1000
 const MIN_API_KEY_LENGTH = 32
 const AUTH_SIGHUP_LISTENER_KEY = Symbol.for("scg.auth.sighupListenerRegistered")
 
+/**
+ * HTTP operations that create durable records, alter repositories, execute
+ * repository validation commands, or change operational state. These require
+ * the separately configured admin credential, not merely a read API key.
+ */
+export const PRIVILEGED_HTTP_PATHS = new Set([
+  "/scg_register_repo",
+  "/scg_ingest_repo",
+  "/scg_create_change_transaction",
+  "/scg_apply_patch",
+  "/scg_validate_change",
+  "/scg_commit_change",
+  "/scg_rollback_change",
+  "/scg_incremental_index",
+  "/scg_batch_embed",
+  "/scg_persist_homologs",
+  "/scg_ingest_runtime_trace",
+  "/scg_plan_change",
+  "/scg_prepare_change",
+  "/scg_apply_propagation",
+  "/scg_review_homolog",
+])
+
+/** Validate production HTTP admin-role separation without exposing key values. */
+export function validateAdminApiKeyConfiguration(
+  regularKeys: readonly string[],
+  adminKeys: readonly string[],
+  production: boolean,
+): string[] {
+  if (!production) return []
+  const errors: string[] = []
+  if (adminKeys.length === 0) {
+    errors.push("SCG_ADMIN_API_KEYS must define a separate admin allowlist in production.")
+    return errors
+  }
+  if (adminKeys.some((key) => key.length < MIN_API_KEY_LENGTH)) {
+    errors.push(`Every SCG_ADMIN_API_KEYS entry must be at least ${MIN_API_KEY_LENGTH} characters.`)
+  }
+  const regular = new Set(regularKeys)
+  if (adminKeys.some((key) => regular.has(key))) {
+    errors.push("SCG_ADMIN_API_KEYS must not reuse a regular SCG_API_KEYS credential in production.")
+  }
+  return errors
+}
+
 /** Load API keys from environment (comma-separated) */
 function loadApiKeys(): Buffer[] {
   const raw = process.env["SCG_API_KEYS"] || ""
@@ -150,21 +195,40 @@ function isPublicPath(pathname: string): boolean {
   return PUBLIC_PATHS.has(pathname)
 }
 
-function hotReloadApiKeys(): void {
+/** Atomically reload both role allowlists, retaining the old pair on failure. */
+export function hotReloadApiKeys(): boolean {
   const newKeys = loadApiKeys()
   if (newKeys.length === 0) {
     log.warn("SIGHUP: refusing to clear API keys — new set is empty")
-    return
+    return false
   }
-  validateApiKeyEntropy(newKeys)
-  apiKeys = newKeys
-  log.info("SIGHUP: API keys reloaded", { count: newKeys.length })
-
-  // Admin keys are optional — empty is a valid configuration (fall-through to apiKeys).
   const newAdminKeys = loadAdminApiKeys()
+  const production = (process.env["NODE_ENV"] || "").toLowerCase() === "production"
+  const errors: string[] = []
+  if (production && newKeys.some((key) => key.length < MIN_API_KEY_LENGTH)) {
+    errors.push(`Every SCG_API_KEYS entry must be at least ${MIN_API_KEY_LENGTH} characters.`)
+  }
+  errors.push(
+    ...validateAdminApiKeyConfiguration(
+      newKeys.map((key) => key.toString("utf8")),
+      newAdminKeys.map((key) => key.toString("utf8")),
+      production,
+    ),
+  )
+  if (errors.length > 0) {
+    log.warn("SIGHUP: refusing invalid API key reload; retaining existing role allowlists", { errors })
+    return false
+  }
+
+  validateApiKeyEntropy(newKeys)
   validateApiKeyEntropy(newAdminKeys)
+  apiKeys = newKeys
   adminApiKeys = newAdminKeys
-  log.info("SIGHUP: admin API keys reloaded", { count: newAdminKeys.length })
+  log.info("SIGHUP: API key role allowlists reloaded", {
+    regular_count: newKeys.length,
+    admin_count: newAdminKeys.length,
+  })
+  return true
 }
 
 export function currentLockoutMsForIp(ip: string): number {
@@ -330,9 +394,12 @@ function extractKey(req: Request): string | null {
 }
 
 function isPresentedKeyValid(presented: string): boolean {
-  if (apiKeys.length === 0) return false
+  if (apiKeys.length === 0 && adminApiKeys.length === 0) return false
   const presentedBuf = Buffer.from(presented, "utf-8")
-  return apiKeys.some((key) => safeCompare(presentedBuf, key))
+  return (
+    apiKeys.some((key) => safeCompare(presentedBuf, key)) ||
+    adminApiKeys.some((key) => safeCompare(presentedBuf, key))
+  )
 }
 
 /**
@@ -374,6 +441,15 @@ export function requireAdminKey(req: Request, res: Response, next: NextFunction)
     return
   }
   next()
+}
+
+/** Apply the admin role boundary to every privileged HTTP operation. */
+export function requirePrivilegedHttpRoute(req: Request, res: Response, next: NextFunction): void {
+  if (!req.path.startsWith("/scg_admin_") && !PRIVILEGED_HTTP_PATHS.has(req.path)) {
+    next()
+    return
+  }
+  requireAdminKey(req, res, next)
 }
 
 function withCorrelationId(req: Request, body: Record<string, unknown>): Record<string, unknown> {
@@ -425,7 +501,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     return
   }
 
-  if (apiKeys.length === 0) {
+  if (apiKeys.length === 0 && adminApiKeys.length === 0) {
     log.warn("Auth rejected: no API keys configured", { path: req.path })
     res.status(503).json(
       withCorrelationId(req, {

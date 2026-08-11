@@ -75,6 +75,16 @@ describe("scanFiles", () => {
     expect(unreadable).toEqual(["src/missing.ts"])
   })
 
+  test("refuses a post-index replacement larger than the scan read bound", async () => {
+    write("src/replaced.ts", "x".repeat(2 * 1024 * 1024 + 1) + "needle")
+    const errors: string[] = []
+
+    const result = await scanFiles(params({ files: ["src/replaced.ts"] }), (_file, error) => errors.push(error))
+
+    expect(result.matches).toHaveLength(0)
+    expect(errors).toEqual(["indexed file exceeds search size limit"])
+  })
+
   test("refuses to read outside the repository root", async () => {
     // A traversal path must be rejected by path containment, surfaced through
     // the unreadable callback rather than silently reading the file.

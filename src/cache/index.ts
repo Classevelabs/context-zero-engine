@@ -29,8 +29,15 @@ export class LRUCache<T = unknown> {
   private hits: number = 0
   private misses: number = 0
   private cleanupInterval: ReturnType<typeof setInterval>
+  private destroyed = false
 
   constructor(maxSize: number = 1000, defaultTTLMs: number = 300_000) {
+    if (!Number.isSafeInteger(maxSize) || maxSize <= 0) {
+      throw new RangeError("LRUCache maxSize must be a positive safe integer")
+    }
+    if (!Number.isSafeInteger(defaultTTLMs) || defaultTTLMs <= 0) {
+      throw new RangeError("LRUCache defaultTTLMs must be a positive safe integer")
+    }
     this.maxSize = maxSize
     this.defaultTTLMs = defaultTTLMs
     const CACHE_CLEANUP_INTERVAL_MS = 60_000 // 1 minute
@@ -39,12 +46,13 @@ export class LRUCache<T = unknown> {
   }
 
   public get(key: string): T | undefined {
+    this.ensureActive()
     const entry = this.store.get(key)
     if (!entry) {
       this.misses++
       return undefined
     }
-    if (Date.now() > entry.expiresAt) {
+    if (Date.now() >= entry.expiresAt) {
       this.store.delete(key)
       this.misses++
       return undefined
@@ -58,6 +66,11 @@ export class LRUCache<T = unknown> {
   }
 
   public set(key: string, value: T, ttlMs?: number): void {
+    this.ensureActive()
+    const effectiveTtl = ttlMs ?? this.defaultTTLMs
+    if (!Number.isSafeInteger(effectiveTtl) || effectiveTtl <= 0) {
+      throw new RangeError("LRUCache ttlMs must be a positive safe integer")
+    }
     // Evict if at capacity
     if (this.store.size >= this.maxSize && !this.store.has(key)) {
       // Delete the least recently used (first entry in Map)
@@ -66,7 +79,8 @@ export class LRUCache<T = unknown> {
         this.store.delete(firstKey)
       }
     }
-    const effectiveTtl = Math.max(1, ttlMs ?? this.defaultTTLMs)
+    // Updating an entry is an access for LRU purposes.
+    this.store.delete(key)
     this.store.set(key, {
       value,
       expiresAt: Date.now() + effectiveTtl,
@@ -75,10 +89,12 @@ export class LRUCache<T = unknown> {
   }
 
   public invalidate(key: string): boolean {
+    this.ensureActive()
     return this.store.delete(key)
   }
 
   public invalidateByPrefix(prefix: string): number {
+    this.ensureActive()
     const toDelete: string[] = []
     for (const key of this.store.keys()) {
       if (key.startsWith(prefix)) {
@@ -92,6 +108,7 @@ export class LRUCache<T = unknown> {
   }
 
   public clear(): void {
+    this.ensureActive()
     this.store.clear()
   }
 
@@ -109,7 +126,7 @@ export class LRUCache<T = unknown> {
     const now = Date.now()
     let evicted = 0
     for (const [key, entry] of this.store) {
-      if (now > entry.expiresAt) {
+      if (now >= entry.expiresAt) {
         this.store.delete(key)
         evicted++
       }
@@ -120,8 +137,14 @@ export class LRUCache<T = unknown> {
   }
 
   public destroy(): void {
+    if (this.destroyed) return
+    this.destroyed = true
     clearInterval(this.cleanupInterval)
     this.store.clear()
+  }
+
+  private ensureActive(): void {
+    if (this.destroyed) throw new Error("LRUCache has been destroyed")
   }
 }
 
@@ -145,5 +168,5 @@ export function destroyAllCaches(): void {
 }
 
 export function scopedKey(snapshotId: string, key: string): string {
-  return `${snapshotId}:${key}`
+  return `${snapshotId.length}:${snapshotId}:${key}`
 }

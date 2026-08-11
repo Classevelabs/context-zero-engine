@@ -221,6 +221,18 @@ describe("HomologInferenceEngine.findHomologs", () => {
     expect(result).toEqual([])
   })
 
+  test("binds target lookup to the requested snapshot", async () => {
+    mockDbQuery.mockResolvedValue(emptyResult())
+
+    const result = await engine.findHomologs("sv-from-other-snapshot", "snap-requested")
+
+    expect(result).toEqual([])
+    expect(mockDbQuery).toHaveBeenCalledTimes(1)
+    expect(mockDbQuery.mock.calls[0]![1]).toEqual(["sv-from-other-snapshot", "snap-requested"])
+    expect(String(mockDbQuery.mock.calls[0]![0])).toContain("sv.snapshot_id = $2")
+    expect(mockFindSemanticCandidates).not.toHaveBeenCalled()
+  })
+
   test("returns empty array when no candidates are generated", async () => {
     const target = makeTarget()
 
@@ -371,6 +383,32 @@ describe("HomologInferenceEngine.persistHomologs", () => {
   test("returns 0 and does not call transaction when homologs list is empty", async () => {
     const count = await engine.persistHomologs("sv-source", [], "snap-1")
     expect(count).toBe(0)
+    expect(mockDbTransaction).not.toHaveBeenCalled()
+  })
+
+  test("rejects oversized persistence batches before opening a transaction", async () => {
+    const homolog = {
+      symbol_id: "sym-1",
+      symbol_version_id: "sv-1",
+      symbol_name: "candidate",
+      relation_type: "near_duplicate_logic",
+      confidence: 0.8,
+      evidence: {
+        semantic_intent_similarity: 0.8,
+        normalized_logic_similarity: 0.8,
+        signature_type_similarity: 0.8,
+        behavioral_overlap: 0.8,
+        contract_overlap: 0.8,
+        test_overlap: 0,
+        history_co_change: 0,
+        weighted_total: 0.8,
+        evidence_family_count: 5,
+        rationale: "test",
+      },
+      contradiction_flags: [],
+    } as HomologCandidate
+
+    await expect(engine.persistHomologs("sv-source", Array(501).fill(homolog), "snap-1")).rejects.toThrow(/Too many/)
     expect(mockDbTransaction).not.toHaveBeenCalled()
   })
 

@@ -61,6 +61,25 @@ const DEFAULT_RECOVERY_BATCH_SIZE = readPositiveIntEnv("SCG_STALE_TRANSACTION_BA
 
 /** Maximum file size allowed for backup during applyPatch (5 MB) */
 const MAX_BACKUP_FILE_SIZE = 5 * 1024 * 1024
+const MAX_PATCH_TOTAL_BYTES = 20 * 1024 * 1024
+const FILE_TRANSACTION_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+const MAX_PATCH_COUNT = 100
+
+interface FileBackup {
+  file_path: string
+  original_content: string | null
+  original_mode: number | null
+}
+
+interface PreparedPatch {
+  filePath: string
+  fullPath: string
+  newContent: string
+  originalContent: string | null
+  originalMode: number
+}
+
+class PatchConflictError extends Error {}
 
 function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name]
@@ -152,108 +171,150 @@ export class TransactionalChangeEngine {
 
     // Resolve base path from DB if not provided
     const basePath = repoBasePath || (await this.getRepoBasePath(txnId))
+    const prepared = await this.preparePatches(basePath, patches)
+    const lockOrder = [...new Set(prepared.map((patch) => patch.fullPath))].sort()
 
     // Phase 1: Backup original files to database (planned → prepared)
     // Wrapped in a DB transaction with advisory locks for concurrent file isolation.
     // Advisory locks are automatically released on COMMIT/ROLLBACK.
     await db.transaction(async (client: PoolClient) => {
-      for (const patch of patches) {
-        const fullPath = this.resolveSafePath(basePath, patch.file_path)
+      const locked = await db.queryWithClient(
+        client,
+        `SELECT state FROM change_transactions WHERE txn_id = $1 FOR UPDATE`,
+        [txnId],
+      )
+      const row = firstRow(locked)
+      if (!row) throw UserFacingError.notFound(`Transaction ${txnId}`)
+      const state = requireStringField(row, "state", `Transaction ${txnId}`) as TransactionState
+      if (state !== "planned") {
+        throw UserFacingError.badRequest(`applyPatch requires transaction in 'planned' state, got '${state}'`)
+      }
 
-        // Acquire advisory lock: hash file path to int32 for pg_advisory_xact_lock
-        // This serializes concurrent access to the same file across transactions
-        const pathHash = crypto.createHash("md5").update(fullPath).digest()
-        const lockKey = pathHash.readInt32BE(0)
-        await db.queryWithClient(client, "SELECT pg_advisory_xact_lock($1)", [lockKey])
+      await this.acquireFileLocks(client, lockOrder)
+      await this.extendFilesystemTransactionTimeout(client)
 
-        // Guard: reject files that are too large to back up safely
-        try {
-          const fileStat = await fsp.stat(fullPath)
-          if (fileStat.size > MAX_BACKUP_FILE_SIZE) {
-            throw new Error(`File too large for backup: ${patch.file_path}`)
-          }
-        } catch (err) {
-          // If stat threw our size error, re-throw it
-          if (err instanceof Error && err.message.startsWith("File too large")) {
-            throw err
-          }
-          // Otherwise file doesn't exist — that's fine, we'll record null below
-        }
-
-        let originalContent: string | null = null
-        try {
-          originalContent = await fsp.readFile(fullPath, "utf-8")
-        } catch {
-          // File doesn't exist yet — null signals "created by this patch"
-        }
+      for (const patch of prepared) {
+        const original = await this.readFileSnapshot(patch.fullPath, patch.filePath)
         await db.queryWithClient(
           client,
           `
-                    INSERT INTO transaction_file_backups (backup_id, txn_id, file_path, original_content)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO transaction_file_backups
+                        (backup_id, txn_id, file_path, original_content, original_mode)
+                    VALUES ($1, $2, $3, $4, $5)
                 `,
-          [uuidv4(), txnId, patch.file_path, originalContent],
+          [uuidv4(), txnId, patch.filePath, original.content, original.mode],
         )
+        patch.originalContent = original.content
+        patch.originalMode = original.mode
       }
 
       // Transition state inside the transaction
-      await db.queryWithClient(
+      const preparedUpdate = await db.queryWithClient(
         client,
-        `UPDATE change_transactions SET state = $1, updated_at = NOW() WHERE txn_id = $2`,
-        ["prepared", txnId],
+        `UPDATE change_transactions SET state = $1, patches = $3, updated_at = NOW()
+         WHERE txn_id = $2 AND state = 'planned'`,
+        ["prepared", txnId, JSON.stringify(patches)],
       )
+      if (preparedUpdate.rowCount !== 1) throw new Error(`Transaction ${txnId} changed state during backup`)
     })
     log.info("Transaction state changed", { txnId, newState: "prepared" })
 
     // Phase 2: Write patched files (prepared → patched)
-    // Atomic write-all-or-nothing: write to temp files first, then rename.
-    // fs.rename is atomic on the same filesystem (Linux/macOS), so either
-    // all files land at their final paths or none do.
-    const tempFiles: string[] = []
+    // Stage every file first. Each rename is atomic, while a multi-file batch
+    // uses compensating restores because filesystems have no atomic rename-all.
+    let conflictError: PatchConflictError | null = null
     try {
-      // Step 1: Write all patches to temporary files
-      for (const patch of patches) {
-        const fullPath = this.resolveSafePath(basePath, patch.file_path)
-        const dir = path.dirname(fullPath)
-        try {
-          await fsp.access(dir)
-        } catch {
-          await fsp.mkdir(dir, { recursive: true })
+      await db.transaction(async (client: PoolClient) => {
+        const locked = await db.queryWithClient(
+          client,
+          `SELECT state FROM change_transactions WHERE txn_id = $1 FOR UPDATE`,
+          [txnId],
+        )
+        const row = firstRow(locked)
+        if (!row) throw UserFacingError.notFound(`Transaction ${txnId}`)
+        const state = requireStringField(row, "state", `Transaction ${txnId}`) as TransactionState
+        if (state !== "prepared") {
+          throw UserFacingError.badRequest(`applyPatch requires transaction in 'prepared' state, got '${state}'`)
         }
-        const tmpPath = `${fullPath}.scg-tmp`
-        await fsp.writeFile(tmpPath, patch.new_content, "utf-8")
-        tempFiles.push(tmpPath)
-      }
 
-      // Step 2: Atomically rename all temp files to their final paths
-      for (let i = 0; i < patches.length; i++) {
-        const fullPath = this.resolveSafePath(basePath, patches[i]!.file_path)
-        await fsp.rename(tempFiles[i]!, fullPath)
-      }
+        await this.acquireFileLocks(client, lockOrder)
+        await this.extendFilesystemTransactionTimeout(client)
+        for (const patch of prepared) {
+          const current = await this.readOriginalFile(patch.fullPath, patch.filePath)
+          if (current !== patch.originalContent) {
+            const abandoned = await db.queryWithClient(
+              client,
+              `UPDATE change_transactions SET state = 'rolled_back', updated_at = NOW()
+               WHERE txn_id = $1 AND state = 'prepared'`,
+              [txnId],
+            )
+            if (abandoned.rowCount !== 1) throw new Error(`Transaction ${txnId} changed state during conflict cleanup`)
+            await db.queryWithClient(client, `DELETE FROM transaction_file_backups WHERE txn_id = $1`, [txnId])
+            conflictError = new PatchConflictError(
+              `Patch conflict: ${patch.filePath} changed after it was backed up`,
+            )
+            return
+          }
+        }
+
+        const staged = new Map<string, string>()
+        const landed: PreparedPatch[] = []
+        try {
+          for (const patch of prepared) {
+            await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
+            staged.set(
+              patch.fullPath,
+              await this.stageFile(txnId, patch.fullPath, patch.newContent, patch.originalMode),
+            )
+          }
+
+          for (const patch of prepared) {
+            await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
+            const tmpPath = staged.get(patch.fullPath)
+            if (!tmpPath) throw new Error(`Missing staged file for ${patch.filePath}`)
+            await fsp.rename(tmpPath, patch.fullPath)
+            staged.delete(patch.fullPath)
+            landed.push(patch)
+          }
+
+          const updated = await db.queryWithClient(
+            client,
+            `UPDATE change_transactions
+             SET patches = $1, state = 'patched', updated_at = NOW()
+             WHERE txn_id = $2 AND state = 'prepared'`,
+            [JSON.stringify(patches), txnId],
+          )
+          if (updated.rowCount !== 1) {
+            throw new Error(`Transaction ${txnId} changed state while applying patches`)
+          }
+        } catch (writeErr) {
+          await this.cleanupTempFiles(staged.values())
+          const restorationErrors = await this.restoreLandedFiles(basePath, txnId, landed)
+          if (restorationErrors.length > 0) {
+            log.error("Patch compensation incomplete; durable backups were preserved", writeErr, {
+              txnId,
+              failedFiles: restorationErrors,
+            })
+          }
+          throw writeErr
+        }
+      })
+      if (conflictError) throw conflictError
     } catch (writeErr) {
       // Clean up any remaining temp files before failing
-      for (const tmp of tempFiles) {
-        try {
-          await fsp.unlink(tmp)
-        } catch {
-          /* already renamed or missing */
+      log.error("Phase 2 file write failed; preserving safe transaction state", writeErr, { txnId })
+      try {
+        if (!(writeErr instanceof PatchConflictError)) {
+          await this.transitionState(txnId, "failed")
         }
+      } catch (stateErr) {
+        log.error("Could not mark failed patch transaction; backups remain recoverable", stateErr, { txnId })
       }
-      log.error("Phase 2 file write failed — marking transaction as failed", writeErr, { txnId })
-      await this.transitionState(txnId, "failed")
       throw writeErr
     }
 
     // Store patches and advance to 'patched'
-    await db.query(
-      `
-            UPDATE change_transactions SET patches = $1, updated_at = NOW()
-            WHERE txn_id = $2
-        `,
-      [JSON.stringify(patches), txnId],
-    )
-
-    await this.transitionState(txnId, "patched")
+    log.info("Transaction state changed", { txnId, newState: "patched" })
     timer()
   }
 
@@ -463,64 +524,109 @@ export class TransactionalChangeEngine {
     }
 
     // Restore file backups from database
-    const backupResult = await db.query(
-      `SELECT file_path, original_content FROM transaction_file_backups WHERE txn_id = $1`,
-      [txnId],
-    )
-
-    const restoredFiles: string[] = []
-    const failedFiles: string[] = []
-
-    for (const backup of backupResult.rows as { file_path: string; original_content: string | null }[]) {
-      try {
-        const backupPath = path.isAbsolute(backup.file_path)
-          ? path.relative(realBase, backup.file_path)
-          : backup.file_path
-        const safePath = resolvePathWithinBase(realBase, backupPath, { allowMissing: true })
-        const resolvedBackupPath = safePath.existed ? safePath.realPath : safePath.resolvedPath
-
-        if (backup.original_content === null) {
-          // File was newly created — remove it
-          try {
-            await fsp.access(resolvedBackupPath)
-            await fsp.unlink(resolvedBackupPath)
-          } catch {
-            // File already absent — nothing to remove
-          }
-        } else {
-          const parentDir = path.dirname(resolvedBackupPath)
-          try {
-            await fsp.access(parentDir)
-          } catch {
-            await fsp.mkdir(parentDir, { recursive: true })
-          }
-          await fsp.writeFile(resolvedBackupPath, backup.original_content, "utf-8")
+    await db.transaction(async (client: PoolClient) => {
+      const locked = await db.queryWithClient(
+        client,
+        `SELECT state, patches FROM change_transactions WHERE txn_id = $1 FOR UPDATE`,
+        [txnId],
+      )
+      const lockedRow = firstRow(locked)
+      if (!lockedRow) throw UserFacingError.notFound(`Transaction ${txnId}`)
+      const lockedState = requireStringField(lockedRow, "state", `Transaction ${txnId}`) as TransactionState
+      const storedPatches = Array.isArray(lockedRow["patches"])
+        ? (lockedRow["patches"] as Array<{ file_path?: unknown; new_content?: unknown }>)
+        : []
+      const desiredContent = new Map<string, string>()
+      for (const patch of storedPatches) {
+        if (typeof patch.file_path === "string" && typeof patch.new_content === "string") {
+          desiredContent.set(patch.file_path, patch.new_content)
         }
-        restoredFiles.push(backup.file_path)
-      } catch (err) {
-        log.error("Failed to restore backup", err, { filePath: backup.file_path })
-        failedFiles.push(backup.file_path)
       }
-    }
+      const lockedTargets = VALID_TRANSITIONS[lockedState] ?? []
+      if (!lockedTargets.includes("rolled_back")) {
+        throw UserFacingError.badRequest(
+          `Cannot rollback transaction in state '${lockedState}' â€” only non-terminal states can be rolled back`,
+        )
+      }
 
-    // Only delete backups for successfully restored files; keep failed ones for manual recovery
-    if (restoredFiles.length > 0) {
-      await db.query(`DELETE FROM transaction_file_backups WHERE txn_id = $1 AND file_path = ANY($2)`, [
-        txnId,
-        restoredFiles,
-      ])
-    }
+      const backupResult = await db.queryWithClient(
+        client,
+        `SELECT file_path, original_content, original_mode
+         FROM transaction_file_backups WHERE txn_id = $1 ORDER BY file_path`,
+        [txnId],
+      )
+      const backups = backupResult.rows as FileBackup[]
+      const resolvedBackups = backups.map((backup) => ({
+        backup,
+        fullPath: this.resolveBackupPath(realBase, backup.file_path),
+      }))
+      await this.acquireFileLocks(
+        client,
+        [...new Set(resolvedBackups.map((entry) => entry.fullPath))].sort(),
+      )
+      await this.extendFilesystemTransactionTimeout(client)
 
-    if (failedFiles.length > 0) {
-      log.error("Rollback incomplete: failed to restore files", null, {
-        txnId,
-        failedCount: failedFiles.length,
-        failedFiles,
-      })
-      await this.transitionState(txnId, "failed")
-    } else {
-      await this.transitionState(txnId, "rolled_back")
-    }
+      const failedFiles: string[] = []
+
+      for (const { backup, fullPath: lockedBackupPath } of resolvedBackups) {
+        try {
+          const backupPath = path.isAbsolute(backup.file_path)
+            ? path.relative(realBase, backup.file_path)
+            : backup.file_path
+          const safePath = resolvePathWithinBase(realBase, backupPath, { allowMissing: true })
+          const resolvedBackupPath = safePath.existed ? safePath.realPath : safePath.resolvedPath
+          if (!this.pathsEqual(resolvedBackupPath, lockedBackupPath)) {
+            throw new Error(`Rollback path changed during validation: ${backup.file_path}`)
+          }
+          await this.cleanupTransactionTempFiles(txnId, resolvedBackupPath)
+          const desired = desiredContent.get(backup.file_path)
+          if (desired !== undefined) {
+            const current = await this.readOriginalFile(resolvedBackupPath, backup.file_path)
+            if (current !== backup.original_content && current !== desired) {
+              throw new Error(`Rollback conflict: ${backup.file_path} was modified outside this transaction`)
+            }
+          }
+
+          if (backup.original_content === null) {
+            await this.ensureResolvedPathUnchanged(realBase, backupPath, resolvedBackupPath)
+            // File was newly created — remove it
+            try {
+              await fsp.access(resolvedBackupPath)
+              await fsp.unlink(resolvedBackupPath)
+            } catch (err) {
+              if (!this.isMissingPathError(err)) throw err
+              // File already absent — nothing to remove
+            }
+          } else {
+            await this.ensureSafeParent(realBase, backupPath, resolvedBackupPath)
+            await this.atomicWriteFile(txnId, resolvedBackupPath, backup.original_content, backup.original_mode ?? 0o600)
+          }
+        } catch (err) {
+          log.error("Failed to restore backup", err, { filePath: backup.file_path })
+          failedFiles.push(backup.file_path)
+        }
+      }
+
+      // Any restoration failure aborts the DB transaction and retains every backup.
+      if (failedFiles.length > 0) {
+        log.error("Rollback incomplete: failed to restore files", null, {
+          txnId,
+          failedCount: failedFiles.length,
+          failedFiles,
+        })
+        throw new Error(`Rollback incomplete: failed to restore ${failedFiles.length} file(s)`)
+      }
+
+      const updated = await db.queryWithClient(
+        client,
+        `UPDATE change_transactions SET state = 'rolled_back', updated_at = NOW()
+         WHERE txn_id = $1 AND state = $2`,
+        [txnId, lockedState],
+      )
+      if (updated.rowCount !== 1) throw new Error(`Transaction ${txnId} changed state during rollback`)
+      await db.queryWithClient(client, `DELETE FROM transaction_file_backups WHERE txn_id = $1`, [txnId])
+    })
+    log.info("Transaction rolled back", { txnId })
     timer()
   }
 
@@ -533,6 +639,12 @@ export class TransactionalChangeEngine {
     olderThanMs: number = DEFAULT_STALE_TRANSACTION_MS,
     limit: number = DEFAULT_RECOVERY_BATCH_SIZE,
   ): Promise<TransactionRecoverySummary> {
+    if (!Number.isSafeInteger(olderThanMs) || olderThanMs <= 0) {
+      throw new RangeError("olderThanMs must be a positive safe integer")
+    }
+    if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 10_000) {
+      throw new RangeError("limit must be a positive safe integer no greater than 10000")
+    }
     const timer = log.startTimer("recoverStaleTransactions", { olderThanMs, limit })
     const cutoff = new Date(Date.now() - olderThanMs)
     const staleResult = await db.query(
@@ -564,6 +676,20 @@ export class TransactionalChangeEngine {
         }
         recovered++
       } catch (error) {
+        // Another recovery worker may have won the row lock and completed the
+        // same transaction. Treat that terminal state as recovered, not as an
+        // operational failure.
+        let completedElsewhere = false
+        try {
+          const current = await this.loadTransaction(row.txn_id)
+          completedElsewhere = current !== null && ["committed", "rolled_back"].includes(current.state)
+        } catch (reloadError) {
+          log.error("Failed to re-check transaction after recovery error", reloadError, { txnId: row.txn_id })
+        }
+        if (completedElsewhere) {
+          recovered++
+          continue
+        }
         recoveryFailed++
         log.error("Failed to recover stale transaction", error, {
           txnId: row.txn_id,
@@ -1040,6 +1166,257 @@ export class TransactionalChangeEngine {
     }
   }
 
+  private async preparePatches(basePath: string, patches: PatchSet): Promise<PreparedPatch[]> {
+    if (!Array.isArray(patches) || patches.length === 0) {
+      throw UserFacingError.badRequest("patches must be a non-empty array")
+    }
+    if (patches.length > MAX_PATCH_COUNT) {
+      throw UserFacingError.badRequest(`patches must contain at most ${MAX_PATCH_COUNT} entries`)
+    }
+
+    const seen = new Set<string>()
+    const prepared: PreparedPatch[] = []
+    let totalBytes = 0
+    for (let index = 0; index < patches.length; index++) {
+      const patch = patches[index]
+      if (!patch || typeof patch.file_path !== "string" || patch.file_path.length === 0) {
+        throw UserFacingError.badRequest(`patches[${index}].file_path must be a non-empty string`)
+      }
+      if (patch.file_path.length > 4096) {
+        throw UserFacingError.badRequest(`patches[${index}].file_path exceeds 4096 characters`)
+      }
+      if (typeof patch.new_content !== "string") {
+        throw UserFacingError.badRequest(`patches[${index}].new_content must be a string`)
+      }
+      const contentBytes = Buffer.byteLength(patch.new_content, "utf8")
+      if (contentBytes > MAX_BACKUP_FILE_SIZE) {
+        throw UserFacingError.badRequest(`patches[${index}].new_content exceeds the 5 MB byte limit`)
+      }
+      totalBytes += contentBytes
+      if (totalBytes > MAX_PATCH_TOTAL_BYTES) {
+        throw UserFacingError.badRequest("combined patch content exceeds the 20 MB byte limit")
+      }
+
+      const fullPath = this.resolveSafePath(basePath, patch.file_path)
+      const dedupeKey = process.platform === "win32" ? fullPath.toLowerCase() : fullPath
+      if (seen.has(dedupeKey)) {
+        throw UserFacingError.badRequest(`Duplicate patch target: ${patch.file_path}`)
+      }
+      seen.add(dedupeKey)
+      prepared.push({
+        filePath: patch.file_path,
+        fullPath,
+        newContent: patch.new_content,
+        originalContent: null,
+        originalMode: 0o600,
+      })
+    }
+    return prepared
+  }
+
+  private async acquireFileLocks(client: PoolClient, fullPaths: string[]): Promise<void> {
+    const canonicalPaths = fullPaths.map((fullPath) =>
+      process.platform === "win32" ? path.normalize(fullPath).toLowerCase() : path.normalize(fullPath),
+    )
+    for (const fullPath of [...new Set(canonicalPaths)].sort()) {
+      const digest = crypto.createHash("sha256").update(fullPath).digest()
+      await db.queryWithClient(client, "SELECT pg_advisory_xact_lock($1, $2)", [
+        digest.readInt32BE(0),
+        digest.readInt32BE(4),
+      ])
+    }
+  }
+
+  private async extendFilesystemTransactionTimeout(client: PoolClient): Promise<void> {
+    await db.queryWithClient(client, "SELECT set_config('idle_in_transaction_session_timeout', $1, true)", [
+      String(FILE_TRANSACTION_IDLE_TIMEOUT_MS),
+    ])
+  }
+
+  private async readOriginalFile(fullPath: string, displayPath: string): Promise<string | null> {
+    return (await this.readFileSnapshot(fullPath, displayPath)).content
+  }
+
+  private async readFileSnapshot(
+    fullPath: string,
+    displayPath: string,
+  ): Promise<{ content: string | null; mode: number }> {
+    let fileStat
+    try {
+      fileStat = await fsp.stat(fullPath)
+    } catch (err) {
+      if (this.isMissingPathError(err)) return { content: null, mode: 0o600 }
+      throw err
+    }
+    if (!fileStat.isFile()) {
+      throw new Error(`Patch target is not a regular file: ${displayPath}`)
+    }
+    if (fileStat.size > MAX_BACKUP_FILE_SIZE) {
+      throw new Error(`File too large for backup: ${displayPath}`)
+    }
+    return { content: await fsp.readFile(fullPath, "utf-8"), mode: fileStat.mode & 0o777 }
+  }
+
+  private async ensureSafeParent(basePath: string, filePath: string, expectedFullPath: string): Promise<void> {
+    // Validate before creating anything. Then create one component at a time
+    // (never recursive mkdir) and realpath-check each component immediately.
+    // This is the strongest portable Node design available without dirfd/openat2.
+    await this.ensureResolvedPathUnchanged(basePath, filePath, expectedFullPath)
+    const base = resolvePathWithinBase(basePath, ".", { allowMissing: false }).realBase
+    const parent = path.dirname(expectedFullPath)
+    const relativeParent = path.relative(base, parent)
+    if (relativeParent === ".." || relativeParent.startsWith(`..${path.sep}`) || path.isAbsolute(relativeParent)) {
+      throw new Error(`Patch parent escapes repository: ${filePath}`)
+    }
+
+    let current = base
+    for (const component of relativeParent.split(path.sep).filter(Boolean)) {
+      current = path.join(current, component)
+      try {
+        await fsp.mkdir(current)
+      } catch (err) {
+        if (!this.isAlreadyExistsError(err)) throw err
+      }
+      const verified = resolvePathWithinBase(base, path.relative(base, current), { allowMissing: false })
+      if (!this.pathsEqual(verified.realPath, current)) {
+        throw new Error(`Patch parent path changed during validation: ${filePath}`)
+      }
+    }
+    await this.ensureResolvedPathUnchanged(basePath, filePath, expectedFullPath)
+  }
+
+  private async ensureResolvedPathUnchanged(
+    basePath: string,
+    filePath: string,
+    expectedFullPath: string,
+  ): Promise<void> {
+    const resolved = resolvePathWithinBase(basePath, filePath, { allowMissing: true })
+    const currentFullPath = resolved.existed ? resolved.realPath : resolved.resolvedPath
+    if (!this.pathsEqual(currentFullPath, expectedFullPath)) {
+      throw new Error(`Patch path changed during validation: ${filePath}`)
+    }
+  }
+
+  private async stageFile(txnId: string, fullPath: string, content: string, mode: number = 0o600): Promise<string> {
+    const tmpPath = path.join(path.dirname(fullPath), `.${path.basename(fullPath)}.scg-${txnId}-${uuidv4()}.tmp`)
+    const safeMode = Number.isInteger(mode) && mode >= 0 && mode <= 0o777 ? mode : 0o600
+    let handle: Awaited<ReturnType<typeof fsp.open>> | null = null
+    try {
+      handle = await fsp.open(tmpPath, "wx", safeMode)
+      await handle.writeFile(content, { encoding: "utf-8" })
+      await handle.sync()
+      await handle.close()
+      handle = null
+      return tmpPath
+    } catch (err) {
+      if (handle) {
+        try {
+          await handle.close()
+        } catch {
+          // Preserve the original staging error.
+        }
+      }
+      try {
+        await fsp.unlink(tmpPath)
+      } catch (cleanupErr) {
+        if (!this.isMissingPathError(cleanupErr)) {
+          log.error("Failed to clean up staged patch file", cleanupErr, { tmpPath })
+        }
+      }
+      throw err
+    }
+  }
+
+  private async cleanupTempFiles(paths: Iterable<string>): Promise<void> {
+    for (const tmpPath of paths) {
+      try {
+        await fsp.unlink(tmpPath)
+      } catch (err) {
+        if (!this.isMissingPathError(err)) {
+          log.error("Failed to clean up staged patch file", err, { tmpPath })
+        }
+      }
+    }
+  }
+
+  private async cleanupTransactionTempFiles(txnId: string, fullPath: string): Promise<void> {
+    const directory = path.dirname(fullPath)
+    const prefix = `.${path.basename(fullPath)}.scg-${txnId}-`
+    let names: string[]
+    try {
+      names = await fsp.readdir(directory)
+    } catch (err) {
+      if (this.isMissingPathError(err)) return
+      throw err
+    }
+    const tempPaths = names
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".tmp"))
+      .map((name) => path.join(directory, name))
+    await this.cleanupTempFiles(tempPaths)
+  }
+
+  private async restoreLandedFiles(
+    basePath: string,
+    txnId: string,
+    landed: PreparedPatch[],
+  ): Promise<string[]> {
+    const failures: string[] = []
+    for (const patch of [...landed].reverse()) {
+      try {
+        const current = await this.readOriginalFile(patch.fullPath, patch.filePath)
+        if (current !== patch.newContent) {
+          throw new Error(`Refusing to overwrite an externally modified file during compensation: ${patch.filePath}`)
+        }
+        if (patch.originalContent === null) {
+          try {
+            await fsp.unlink(patch.fullPath)
+          } catch (err) {
+            if (!this.isMissingPathError(err)) throw err
+          }
+        } else {
+          await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
+          await this.atomicWriteFile(txnId, patch.fullPath, patch.originalContent, patch.originalMode)
+        }
+      } catch (err) {
+        failures.push(patch.filePath)
+        log.error("Failed to compensate landed patch", err, { filePath: patch.filePath })
+      }
+    }
+    return failures
+  }
+
+  private resolveBackupPath(realBase: string, filePath: string): string {
+    const backupPath = path.isAbsolute(filePath) ? path.relative(realBase, filePath) : filePath
+    const safePath = resolvePathWithinBase(realBase, backupPath, { allowMissing: true })
+    return safePath.existed ? safePath.realPath : safePath.resolvedPath
+  }
+
+  private async atomicWriteFile(txnId: string, fullPath: string, content: string, mode: number = 0o600): Promise<void> {
+    const tmpPath = await this.stageFile(txnId, fullPath, content, mode)
+    try {
+      await fsp.rename(tmpPath, fullPath)
+    } catch (err) {
+      await this.cleanupTempFiles([tmpPath])
+      throw err
+    }
+  }
+
+  private pathsEqual(left: string, right: string): boolean {
+    const normalizedLeft = path.normalize(left)
+    const normalizedRight = path.normalize(right)
+    return process.platform === "win32"
+      ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+      : normalizedLeft === normalizedRight
+  }
+
+  private isMissingPathError(error: unknown): boolean {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
+  }
+
+  private isAlreadyExistsError(error: unknown): boolean {
+    return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"
+  }
+
   private async transitionState(txnId: string, newState: TransactionState): Promise<void> {
     // Wrap SELECT + validation + UPDATE in a single transaction with
     // FOR UPDATE row lock to eliminate the TOCTOU race condition.
@@ -1047,14 +1424,14 @@ export class TransactionalChangeEngine {
       const current = await client.query(`SELECT state FROM change_transactions WHERE txn_id = $1 FOR UPDATE`, [txnId])
       const stateValue = current.rows[0]?.["state"]
       const currentState = typeof stateValue === "string" ? (stateValue as TransactionState) : undefined
-      if (currentState) {
-        this.assertTransition(currentState, newState)
-      }
+      if (!currentState) throw UserFacingError.notFound(`Transaction ${txnId}`)
+      this.assertTransition(currentState, newState)
 
-      await client.query(`UPDATE change_transactions SET state = $1, updated_at = NOW() WHERE txn_id = $2`, [
+      const updated = await client.query(`UPDATE change_transactions SET state = $1, updated_at = NOW() WHERE txn_id = $2`, [
         newState,
         txnId,
       ])
+      if (updated.rowCount !== 1) throw new Error(`Failed to update transaction state: ${txnId}`)
     })
     log.info("Transaction state changed", { txnId, newState })
   }

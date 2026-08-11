@@ -31,7 +31,14 @@ import { uncertaintyTracker } from "../analysis-engine/uncertainty"
 import { homologInferenceEngine } from "../homolog-engine"
 import { transactionalChangeEngine } from "../transactional-editor"
 import { ingestor } from "../ingestor"
-import { authMiddleware, destroyAuthCleanup, isRequestAuthenticated, requireAdminKey } from "../middleware/auth"
+import {
+  authMiddleware,
+  destroyAuthCleanup,
+  isRequestAuthenticated,
+  requireAdminKey,
+  requirePrivilegedHttpRoute,
+  validateAdminApiKeyConfiguration,
+} from "../middleware/auth"
 import { rateLimitMiddleware, limiter } from "../middleware/rate-limiter"
 import {
   validateBody,
@@ -108,6 +115,10 @@ if (trustProxy !== undefined) {
 }
 
 const HSTS_MAX_AGE_SECONDS = serverConfig.hstsMaxAge
+const ADMIN_API_KEYS = (process.env["SCG_ADMIN_API_KEYS"] || "")
+  .split(",")
+  .map((key) => key.trim())
+  .filter(Boolean)
 
 function isHttpsRequest(req: Request): boolean {
   if (req.secure) return true
@@ -221,6 +232,7 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 })
 
 app.use(authMiddleware)
+app.use(requirePrivilegedHttpRoute)
 app.use(rateLimitMiddleware)
 
 // ────────── Error Handler ──────────
@@ -1837,6 +1849,63 @@ app.get(
   }),
 )
 
+// Keep every HTTP response on the documented JSON/sanitized contract. Express's
+// default error handler includes stack traces outside production and emits HTML;
+// several v2 handlers intentionally delegate errors with next(error), and JSON
+// parser failures also arrive here.
+app.use((req: Request, res: Response) => {
+  res.status(404).json({
+    error: "Endpoint not found",
+    ...(typeof req.correlationId === "string" && req.correlationId.length > 0
+      ? { correlationId: req.correlationId }
+      : {}),
+  })
+})
+
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next(err)
+    return
+  }
+
+  const correlationId = req.correlationId
+  const errorRecord =
+    err && typeof err === "object"
+      ? (err as { type?: unknown; status?: unknown; statusCode?: unknown })
+      : {}
+  const parserType = typeof errorRecord.type === "string" ? errorRecord.type : ""
+  const parserStatus =
+    typeof errorRecord.status === "number"
+      ? errorRecord.status
+      : typeof errorRecord.statusCode === "number"
+        ? errorRecord.statusCode
+        : 0
+
+  let status = 500
+  let message = "Internal server error"
+  if (parserStatus === 413 || parserType === "entity.too.large") {
+    status = 413
+    message = "Request body too large"
+  } else if (parserStatus === 400 || parserType === "entity.parse.failed") {
+    status = 400
+    message = "Malformed JSON request body"
+  } else if (isUserFacingError(err)) {
+    status = err instanceof UserFacingError ? err.statusCode : 422
+    message = (err as Error).message
+  }
+
+  log.error("HTTP request failed", err instanceof Error ? err : new Error(String(err)), {
+    method: req.method,
+    path: req.path,
+    status,
+    correlationId,
+  })
+  res.status(status).json({
+    error: message,
+    ...(typeof correlationId === "string" && correlationId.length > 0 ? { correlationId } : {}),
+  })
+})
+
 // ────────── Server Start ──────────
 
 const DEFAULT_PORT = 3100
@@ -1857,6 +1926,8 @@ function validateStartupConfiguration(): void {
   if (isProduction && ALLOWED_BASE_PATHS.length === 0) {
     errors.push("SCG_ALLOWED_BASE_PATHS must resolve to at least one accessible directory in production.")
   }
+
+  errors.push(...validateAdminApiKeyConfiguration(security.apiKeys, ADMIN_API_KEYS, isProduction))
 
   if (errors.length > 0) {
     throw new Error(errors.join(" "))

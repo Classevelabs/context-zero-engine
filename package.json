@@ -29,7 +29,12 @@
     "docker:logs": "docker compose logs -f scg",
     "mcp": "node dist/mcp-bridge/index.js",
     "mcp:dev": "ts-node src/mcp-bridge/index.ts",
-    "prestart": "npm run build"
+    "prestart": "npm run build",
+    "audit": "npm audit --audit-level=high",
+    "audit:prod": "npm audit --omit=dev --audit-level=high",
+    "package:verify": "npm run build && node scripts/verify-package.mjs",
+    "prepack": "npm run build",
+    "release:check": "npm run audit && npm run typecheck && npm run lint && npm run build && npm run test:ci && node scripts/verify-package.mjs"
   },
   "keywords": [
     "contextzero",

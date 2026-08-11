@@ -51,6 +51,9 @@ const MODE_BUDGETS: Record<CapsuleMode, number> = {
   standard: 12_000,
   strict: 24_000,
 }
+const MIN_TOKEN_BUDGET = 100
+const MAX_TOKEN_BUDGET = 100_000
+const MAX_FALLBACK_SOURCE_BYTES = 2 * 1024 * 1024
 
 /**
  * Resolution priority order (for reference). When budget is tight, we degrade from
@@ -88,7 +91,12 @@ export class CapsuleCompiler {
     tokenBudget?: number,
     repoBasePath?: string,
   ): Promise<ContextCapsule> {
-    const effectiveBudget = tokenBudget || MODE_BUDGETS[mode]
+    if (!Object.prototype.hasOwnProperty.call(MODE_BUDGETS, mode)) {
+      throw new Error("Invalid capsule mode")
+    }
+    const effectiveBudget = typeof tokenBudget === "number" && Number.isFinite(tokenBudget)
+      ? Math.min(MAX_TOKEN_BUDGET, Math.max(MIN_TOKEN_BUDGET, Math.trunc(tokenBudget)))
+      : MODE_BUDGETS[mode]
 
     // Check capsuleCache — keyed on symbol+snapshot+mode+budget
     const cacheKey = `capsule:${symbolVersionId}:${snapshotId}:${mode}:${effectiveBudget}`
@@ -115,7 +123,17 @@ export class CapsuleCompiler {
     let targetCode =
       target.body_source ??
       (await this.readSourceCode(resolvedBasePath, target.file_path, target.range_start_line, target.range_end_line))
-    let usedTokens = this.estimateTokens(targetCode) + this.estimateTokens(target.signature)
+    const truncateToTokens = (text: string, budget: number): string => {
+      if (budget <= 0) return ""
+      if (this.estimateTokens(text) <= budget) return text
+      const maxChars = budget * CHARS_PER_TOKEN
+      const marker = " /* truncated */"
+      return maxChars > marker.length
+        ? text.slice(0, maxChars - marker.length) + marker
+        : text.slice(0, maxChars)
+    }
+    const targetSignature = truncateToTokens(target.signature, effectiveBudget)
+    let usedTokens = this.estimateTokens(targetCode) + this.estimateTokens(targetSignature)
 
     const contextNodes: ContextNode[] = []
     const omissionRationale: string[] = []
@@ -126,10 +144,10 @@ export class CapsuleCompiler {
     // BUG-006 FIX: If the target code alone exceeds the token budget,
     // truncate it to fit within the budget.
     if (usedTokens > effectiveBudget) {
-      const signatureTokens = this.estimateTokens(target.signature)
+      const signatureTokens = this.estimateTokens(targetSignature)
       const availableForCode = effectiveBudget - signatureTokens
       if (availableForCode <= 0) {
-        targetCode = "[Target code omitted — token budget too small]"
+        targetCode = ""
       } else {
         const codeLines = targetCode.split("\n")
         const truncatedLines: string[] = []
@@ -493,7 +511,7 @@ export class CapsuleCompiler {
         symbol_id: target.symbol_id,
         name: target.canonical_name,
         code: targetCode,
-        signature: target.signature,
+        signature: targetSignature,
         location: {
           file_path: target.file_path,
           start_line: target.range_start_line,
@@ -549,13 +567,33 @@ export class CapsuleCompiler {
     try {
       const safePath = resolvePathWithinBase(basePath, filePath)
       const resolved = safePath.realPath
-      const content = await fsp.readFile(resolved, "utf-8")
+      if (!Number.isFinite(startLine) || !Number.isFinite(endLine)) {
+        return `[Source code unavailable — invalid line range]`
+      }
+      const handle = await fsp.open(resolved, "r")
+      let content: string
+      try {
+        const stat = await handle.stat()
+        if (!stat.isFile() || !Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_FALLBACK_SOURCE_BYTES) {
+          return `[Source code unavailable — file exceeds safe read limit]`
+        }
+        const data = Buffer.alloc(stat.size)
+        let offset = 0
+        while (offset < data.length) {
+          const { bytesRead } = await handle.read(data, offset, data.length - offset, offset)
+          if (bytesRead === 0) break
+          offset += bytesRead
+        }
+        content = data.subarray(0, offset).toString("utf8")
+      } finally {
+        await handle.close()
+      }
       const lines = content.split("\n")
 
       // BUG-005 FIX: Defensive validation of line ranges to prevent
       // code boundary leakage from stale or mis-indexed DB data.
-      const clampedStart = Math.max(1, startLine)
-      const clampedEnd = Math.min(lines.length, endLine)
+      const clampedStart = Math.max(1, Math.trunc(startLine))
+      const clampedEnd = Math.min(lines.length, Math.trunc(endLine))
 
       if (clampedStart !== startLine || clampedEnd !== endLine) {
         log.warn("Line range clamped — possible stale DB line numbers", {

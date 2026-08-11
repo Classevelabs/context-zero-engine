@@ -19,7 +19,6 @@ import { tokenizeName, tokenizeBody, tokenizeSignature, tokenizeBehavior, tokeni
 import {
   SparseVector,
   computeTF,
-  computeIDF,
   computeTFIDF,
   cosineSimilarity,
   generateMinHash,
@@ -55,6 +54,21 @@ const MAX_PG_PARAMS = 30000
 /** vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys */
 const SEMANTIC_VEC_COLS = 7
 const MAX_VEC_ROWS_PER_INSERT = Math.floor(MAX_PG_PARAMS / SEMANTIC_VEC_COLS) // ~4285
+const MAX_LSH_CANDIDATES = 1_000
+const EMBEDDING_PAGE_SIZE = 250
+const EMBEDDING_FLUSH_SYMBOLS = 200
+/**
+ * Bound IDF vocabulary retained per view. Tokens beyond this cap still receive
+ * the documented default IDF of 1.0 during vector construction. Without this
+ * bound, attacker-controlled identifiers can make batch ingestion consume
+ * unbounded heap and create multi-megabyte JSON parameters.
+ */
+const MAX_IDF_VOCABULARY_PER_VIEW = 50_000
+const EMPTY_MINHASH_VALUE = 0xffffffff
+
+function isEmptyMinHash(signature: number[]): boolean {
+  return signature.length === 0 || signature.every((value) => value === EMPTY_MINHASH_VALUE)
+}
 
 /**
  * Build a multi-row INSERT ... ON CONFLICT for semantic_vectors.
@@ -171,111 +185,49 @@ class SemanticEngine {
   }
 
   /**
-   * Compute IDF scores per view type from in-memory token streams.
-   * Avoids the DB round-trip that computeSnapshotIDF requires.
-   * Also persists the computed IDF into idf_corpus for use by
-   * searchByQuery, embedSymbol, and other callers.
-   */
-  private async computeIDFFromTokens(
-    snapshotId: string,
-    allTokenStreams: Map<string, Record<ViewType, string[]>>,
-  ): Promise<Record<ViewType, Record<string, number>>> {
-    const totalDocs = allTokenStreams.size
-    const idfByView: Record<string, Record<string, number>> = {} as Record<ViewType, Record<string, number>>
-
-    for (const viewType of VIEW_TYPES) {
-      // Build token sets from in-memory streams
-      const tokenSets: Set<string>[] = []
-      for (const viewTokens of allTokenStreams.values()) {
-        tokenSets.push(new Set(viewTokens[viewType]))
-      }
-
-      if (tokenSets.length === 0) {
-        idfByView[viewType] = {}
-        continue
-      }
-
-      // Compute IDF
-      const idfScores = computeIDF(tokenSets, totalDocs)
-      idfByView[viewType] = idfScores
-
-      // Build document count map for DB persistence
-      const tokenDocCounts: Record<string, number> = {}
-      for (const tokenSet of tokenSets) {
-        for (const token of tokenSet) {
-          tokenDocCounts[token] = (tokenDocCounts[token] || 0) + 1
-        }
-      }
-
-      // Persist to idf_corpus for other callers (searchByQuery, embedSymbol)
-      const corpusId = uuidv4()
-      await db.query(
-        `INSERT INTO idf_corpus (corpus_id, snapshot_id, view_type, document_count, token_document_counts)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (snapshot_id, view_type)
-                 DO UPDATE SET document_count = $4, token_document_counts = $5, computed_at = NOW()`,
-        [corpusId, snapshotId, viewType, totalDocs, JSON.stringify(tokenDocCounts)],
-      )
-    }
-
-    return idfByView as Record<ViewType, Record<string, number>>
-  }
-
-  /**
    * Compute IDF statistics for an entire snapshot, per view type.
-   * Loads all tokens from semantic_vectors for the given snapshot,
-   * computes IDF, and upserts into idf_corpus.
+   * PostgreSQL performs the document-frequency aggregation so source vectors
+   * are never all materialized in the Node process.
    */
   async computeSnapshotIDF(snapshotId: string): Promise<void> {
     const done = log.startTimer("computeSnapshotIDF", { snapshotId })
 
     try {
       for (const viewType of VIEW_TYPES) {
-        // Load all sparse vectors for this view type within the snapshot
-        const result = await db.query(
-          `SELECT sv.sparse_vector
+        const countResult = await db.query(
+          `SELECT COUNT(*)::int AS document_count
                      FROM semantic_vectors sv
                      JOIN symbol_versions symv ON symv.symbol_version_id = sv.symbol_version_id
-                     WHERE symv.snapshot_id = $1 AND sv.view_type = $2
-                     LIMIT 100000`,
+                     WHERE symv.snapshot_id = $1 AND sv.view_type = $2`,
           [snapshotId, viewType],
         )
+        const rawCount = countResult.rows[0]?.document_count
+        const totalDocs = typeof rawCount === "number" ? rawCount : Number.parseInt(String(rawCount ?? "0"), 10)
 
-        const rows = result.rows
-        const totalDocs = rows.length
-
-        if (totalDocs === 0) {
+        if (!Number.isFinite(totalDocs) || totalDocs <= 0) {
+          await db.query(`DELETE FROM idf_corpus WHERE snapshot_id = $1 AND view_type = $2`, [snapshotId, viewType])
           log.debug("No documents found for IDF computation", { snapshotId, viewType })
           continue
         }
 
-        // Build token sets from sparse vector keys
-        const tokenSets: Set<string>[] = []
-        for (const row of rows) {
-          let sparseVec: Record<string, number>
-          try {
-            sparseVec = typeof row.sparse_vector === "string" ? JSON.parse(row.sparse_vector) : row.sparse_vector
-          } catch (error) {
-            log.debug("Skipping corrupt semantic vector during IDF computation", {
-              snapshotId,
-              viewType,
-              error: error instanceof Error ? error.message : String(error),
-            })
-            continue
-          }
-          tokenSets.push(new Set(Object.keys(sparseVec)))
-        }
-
-        // Compute IDF — use tokenSets.length (actual valid documents)
-        // instead of totalDocs (which includes corrupt vectors that were skipped)
-        const idfScores = computeIDF(tokenSets, tokenSets.length)
-
-        // Build document count map for storage
-        const tokenDocCounts: Record<string, number> = {}
-        for (const tokenSet of tokenSets) {
-          for (const token of tokenSet) {
-            tokenDocCounts[token] = (tokenDocCounts[token] || 0) + 1
-          }
+        // Keep the most frequent vocabulary entries when the cap is reached.
+        // Unstored tokens use computeTFIDF's documented default IDF of 1.0.
+        const frequencyResult = await db.query(
+          `SELECT keys.token, COUNT(*)::int AS document_count
+                     FROM semantic_vectors sv
+                     JOIN symbol_versions symv ON symv.symbol_version_id = sv.symbol_version_id
+                     CROSS JOIN LATERAL jsonb_object_keys(sv.sparse_vector) AS keys(token)
+                     WHERE symv.snapshot_id = $1 AND sv.view_type = $2
+                     GROUP BY keys.token
+                     ORDER BY COUNT(*) DESC, keys.token
+                     LIMIT $3`,
+          [snapshotId, viewType, MAX_IDF_VOCABULARY_PER_VIEW],
+        )
+        const tokenDocCounts = Object.create(null) as Record<string, number>
+        for (const row of frequencyResult.rows) {
+          if (typeof row.token !== "string") continue
+          const frequency = typeof row.document_count === "number" ? row.document_count : Number(row.document_count)
+          if (Number.isFinite(frequency) && frequency > 0) tokenDocCounts[row.token] = frequency
         }
 
         // Upsert into idf_corpus
@@ -292,7 +244,7 @@ class SemanticEngine {
           snapshotId,
           viewType,
           totalDocs,
-          uniqueTokens: Object.keys(idfScores).length,
+          retainedTokens: frequencyResult.rows.length,
         })
       }
 
@@ -393,7 +345,7 @@ class SemanticEngine {
           minhash,
           tokenCount: tokens.length,
           // Band keys ride on the vector row — see migration 019.
-          bandKeys: computeBandKeys(minhash, LSH_ROWS_PER_BAND),
+          bandKeys: tokenSet.size > 0 ? computeBandKeys(minhash, LSH_ROWS_PER_BAND) : [],
         })
       }
 
@@ -420,6 +372,7 @@ class SemanticEngine {
     snapshotId: string,
     topK: number = 50,
   ): Promise<{ svId: string; estimatedSimilarity: number }[]> {
+    topK = Number.isFinite(topK) ? Math.min(200, Math.max(1, Math.trunc(topK))) : 50
     const done = log.startTimer("findSemanticCandidates", { symbolVersionId, snapshotId, topK })
 
     try {
@@ -445,7 +398,12 @@ class SemanticEngine {
       // Step 2: Compute band keys for the target's MinHash signatures
       const targetBandKeys: Record<string, number[]> = {}
       for (const [viewType, minhash] of Object.entries(targetMinHashes)) {
-        targetBandKeys[viewType] = computeBandKeys(minhash, LSH_ROWS_PER_BAND)
+        if (!isEmptyMinHash(minhash)) targetBandKeys[viewType] = computeBandKeys(minhash, LSH_ROWS_PER_BAND)
+      }
+
+      if (Object.keys(targetBandKeys).length === 0) {
+        done({ candidates: 0, mode: "empty-target" })
+        return []
       }
 
       // Step 3: Snapshots embedded before migration 019 have no band keys.
@@ -484,8 +442,10 @@ class SemanticEngine {
                      WHERE sv.snapshot_id = $1
                        AND sem.symbol_version_id != $2
                        AND sem.view_type = $3
-                       AND sem.band_keys && $4::int[]`,
-          [snapshotId, symbolVersionId, viewType, keys],
+                       AND sem.band_keys && $4::int[]
+                     ORDER BY sem.symbol_version_id
+                     LIMIT $5`,
+          [snapshotId, symbolVersionId, viewType, keys, MAX_LSH_CANDIDATES],
         )
         for (const row of result.rows) {
           candidateSvIds.add(row.symbol_version_id as string)
@@ -706,89 +666,120 @@ class SemanticEngine {
   }
 
   /**
-   * Batch-embed all symbols in a snapshot using a single-pass architecture.
+   * Batch-embed all symbols in a snapshot using two bounded, paginated passes.
    *
-   * Instead of the old double-pass approach (embed with IDF=1.0, compute IDF,
-   * re-embed with real IDF), this uses three in-memory phases:
-   *
-   *   Phase 1: Compute all 5-view token streams in memory (no DB writes)
-   *   Phase 2: Compute IDF directly from in-memory token streams (no DB reads)
-   *   Phase 3: Single persist pass — compute TF-IDF with real IDF, write once
-   *
-   * This halves DB writes and eliminates the redundant re-embedding pass.
-   * Returns the number of symbols embedded.
+   * Pass 1 computes document frequencies without retaining source bodies or
+   * per-symbol token streams. Pass 2 recomputes one page of token streams and
+   * persists vectors with the resulting IDF. The second tokenization pass is a
+   * deliberate CPU-for-memory tradeoff: repository size no longer determines
+   * how many source bodies and token arrays are simultaneously resident.
    */
   async batchEmbedSnapshot(snapshotId: string): Promise<number> {
     const done = log.startTimer("batchEmbedSnapshot", { snapshotId })
 
     try {
-      // Load all symbol versions for this snapshot with their data
-      const symbolsResult = await db.query(
-        `SELECT
-                    symv.symbol_version_id,
-                    symv.signature,
-                    symv.summary,
-                    symv.body_source,
-                    s.canonical_name,
-                    f.path AS file_path
-                 FROM symbol_versions symv
-                 JOIN symbols s ON s.symbol_id = symv.symbol_id
-                 JOIN files f ON f.file_id = symv.file_id
-                 WHERE symv.snapshot_id = $1`,
-        [snapshotId],
-      )
-
-      const symbols = symbolsResult.rows
-      log.info("Starting batch embedding (single-pass)", { snapshotId, symbolCount: symbols.length })
-
-      // Pre-load ALL behavioral and contract profiles in 2 bulk queries
-      const allSvIds = symbols.map((s) => s.symbol_version_id as string)
-      const loader = new BatchLoader()
-      const allBehavioral = await loader.loadBehavioralProfiles(allSvIds)
-      const allContracts = await loader.loadContractProfiles(allSvIds)
-
-      // ── Phase 1: Compute token streams in memory ─────────────────────
-      // Build Map<symbolVersionId, Record<ViewType, string[]>>
-      const allTokenStreams = new Map<string, Record<ViewType, string[]>>()
-
-      for (const sym of symbols) {
-        const svId = (sym.symbol_version_id as string) ?? ""
-        const name = (sym.canonical_name as string) ?? ""
-        const signature = (sym.signature as string) ?? ""
-
-        const { behaviorHints, contractHint } = this._buildHintsFromProfiles(
-          name,
-          allBehavioral.get(svId),
-          allContracts.get(svId),
-        )
-
-        // Use stored body_source for accurate TF-IDF embedding.
-        // Falls back to summary only when body_source is not available
-        // (e.g., symbols ingested before the body_source migration).
-        // Nullish coalescing: empty string is valid body (interfaces, type aliases)
-        const codeBody = (sym.body_source as string | null) ?? (sym.summary as string) ?? ""
-
-        const tokenStreams = this.computeTokenStreams(codeBody, name, signature, behaviorHints, contractHint)
-        allTokenStreams.set(svId, tokenStreams)
+      const loadPage = async (afterId?: string) => {
+        // A fresh loader bounds profile caches to one page.
+        const loader = new BatchLoader()
+        const page = await loader.loadSymbolVersionsBySnapshotPaginated(snapshotId, {
+          pageSize: EMBEDDING_PAGE_SIZE,
+          afterId,
+        })
+        const ids = page.rows.map((row) => row.symbol_version_id)
+        const [behavioral, contracts] = await Promise.all([
+          loader.loadBehavioralProfiles(ids),
+          loader.loadContractProfiles(ids),
+        ])
+        const streams = page.rows.map((symbol) => {
+          const { behaviorHints, contractHint } = this._buildHintsFromProfiles(
+            symbol.canonical_name,
+            behavioral.get(symbol.symbol_version_id),
+            contracts.get(symbol.symbol_version_id),
+          )
+          return {
+            symbolVersionId: symbol.symbol_version_id,
+            tokens: this.computeTokenStreams(
+              symbol.body_source ?? symbol.summary,
+              symbol.canonical_name,
+              symbol.signature,
+              behaviorHints,
+              contractHint,
+            ),
+          }
+        })
+        return { streams, nextCursor: page.nextCursor }
       }
 
-      log.info("Phase 1 complete: token streams computed in memory", {
-        snapshotId,
-        symbolCount: allTokenStreams.size,
-      })
+      log.info("Starting paginated batch embedding", { snapshotId, pageSize: EMBEDDING_PAGE_SIZE })
 
-      // ── Phase 2: Compute IDF from in-memory token streams ────────────
-      // No DB read needed — IDF is derived directly from the token sets.
-      // Also persists to idf_corpus for use by searchByQuery and embedSymbol.
-      const idfByView = await this.computeIDFFromTokens(snapshotId, allTokenStreams)
+      // Pass 1: retain only bounded document-frequency maps, not source rows.
+      const documentFrequencies = Object.fromEntries(VIEW_TYPES.map((view) => [view, new Map<string, number>()])) as Record<
+        ViewType,
+        Map<string, number>
+      >
+      const cappedViews = new Set<ViewType>()
+      let totalDocs = 0
+      let cursor: string | undefined
+      let hasMore = true
 
-      log.info("Phase 2 complete: IDF computed from in-memory tokens", { snapshotId })
+      while (hasMore) {
+        const page = await loadPage(cursor)
+        for (const stream of page.streams) {
+          totalDocs++
+          for (const viewType of VIEW_TYPES) {
+            const counts = documentFrequencies[viewType]
+            for (const token of new Set(stream.tokens[viewType])) {
+              const current = counts.get(token)
+              if (current !== undefined) {
+                counts.set(token, current + 1)
+              } else if (counts.size < MAX_IDF_VOCABULARY_PER_VIEW) {
+                counts.set(token, 1)
+              } else {
+                cappedViews.add(viewType)
+              }
+            }
+          }
+        }
+        hasMore = page.nextCursor !== null
+        cursor = page.nextCursor ?? undefined
+      }
 
-      // ── Phase 3: Single persist pass with real IDF ───────────────────
-      // Accumulate multi-row INSERT data across symbols, flushing when
-      // we approach the PostgreSQL parameter limit (~30K params).
-      // This reduces ~85 statements/symbol to ~2 statements per flush.
-      const FLUSH_SYMBOL_BATCH = 200 // flush every N symbols
+      if (totalDocs === 0) {
+        await db.query(`DELETE FROM idf_corpus WHERE snapshot_id = $1`, [snapshotId])
+        done({ embedded: 0 })
+        return 0
+      }
+
+      const idfByView = Object.create(null) as Record<ViewType, Record<string, number>>
+      for (const viewType of VIEW_TYPES) {
+        const countsObject = Object.create(null) as Record<string, number>
+        const scores = Object.create(null) as Record<string, number>
+        for (const [token, frequency] of documentFrequencies[viewType]) {
+          countsObject[token] = frequency
+          scores[token] = Math.log(1 + totalDocs / (1 + frequency))
+        }
+        idfByView[viewType] = scores
+
+        await db.query(
+          `INSERT INTO idf_corpus (corpus_id, snapshot_id, view_type, document_count, token_document_counts)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (snapshot_id, view_type)
+                     DO UPDATE SET document_count = $4, token_document_counts = $5, computed_at = NOW()`,
+          [uuidv4(), snapshotId, viewType, totalDocs, JSON.stringify(countsObject)],
+        )
+      }
+
+      if (cappedViews.size > 0) {
+        log.warn("IDF vocabulary cap reached; excess tokens will use default IDF", {
+          snapshotId,
+          views: [...cappedViews],
+          capPerView: MAX_IDF_VOCABULARY_PER_VIEW,
+        })
+      }
+
+      log.info("Pass 1 complete: bounded IDF corpus computed", { snapshotId, symbolCount: totalDocs })
+
+      // Pass 2: recompute one page at a time and persist real-IDF vectors.
       let embedded = 0
       let pendingVectorRows: {
         vectorId: string
@@ -814,47 +805,47 @@ class SemanticEngine {
       let bandMs = 0
       let flushMs = 0
 
-      for (const sym of symbols) {
-        const svId = sym.symbol_version_id as string
-        const viewTokens = allTokenStreams.get(svId)!
+      cursor = undefined
+      hasMore = true
+      while (hasMore) {
+        const page = await loadPage(cursor)
+        for (const stream of page.streams) {
+          for (const viewType of VIEW_TYPES) {
+            const tokens = stream.tokens[viewType]
+            let mark = Date.now()
+            const tfidf = computeTFIDF(computeTF(tokens), idfByView[viewType])
+            tfidfMs += Date.now() - mark
 
-        for (const viewType of VIEW_TYPES) {
-          const tokens = viewTokens[viewType]
-          let mark = Date.now()
-          const tf = computeTF(tokens)
-          const idf = idfByView[viewType] || {}
-          const tfidf = computeTFIDF(tf, idf)
-          tfidfMs += Date.now() - mark
+            mark = Date.now()
+            const tokenSet = new Set(tokens)
+            const minhash = generateMinHash(tokenSet, MINHASH_PERMUTATIONS)
+            minhashMs += Date.now() - mark
 
-          mark = Date.now()
-          const tokenSet = new Set(tokens)
-          const minhash = generateMinHash(tokenSet, MINHASH_PERMUTATIONS)
-          minhashMs += Date.now() - mark
+            mark = Date.now()
+            const bandKeys = tokenSet.size > 0 ? computeBandKeys(minhash, LSH_ROWS_PER_BAND) : []
+            bandMs += Date.now() - mark
 
-          mark = Date.now()
-          const bandKeys = computeBandKeys(minhash, LSH_ROWS_PER_BAND)
-          bandMs += Date.now() - mark
+            pendingVectorRows.push({
+              vectorId: uuidv4(),
+              symbolVersionId: stream.symbolVersionId,
+              viewType,
+              sparseJson: JSON.stringify(tfidf),
+              minhash,
+              tokenCount: tokens.length,
+              bandKeys,
+            })
+          }
 
-          pendingVectorRows.push({
-            vectorId: uuidv4(),
-            symbolVersionId: svId,
-            viewType,
-            sparseJson: JSON.stringify(tfidf),
-            minhash,
-            tokenCount: tokens.length,
-            bandKeys,
-          })
+          embedded++
+          if (embedded % EMBEDDING_FLUSH_SYMBOLS === 0) {
+            const mark = Date.now()
+            await flushPending()
+            flushMs += Date.now() - mark
+            log.info("Batch embedding progress", { snapshotId, embedded, total: totalDocs })
+          }
         }
-
-        embedded++
-
-        // Flush periodically to stay within PG parameter limits
-        if (embedded % FLUSH_SYMBOL_BATCH === 0) {
-          const mark = Date.now()
-          await flushPending()
-          flushMs += Date.now() - mark
-          log.info("Batch embedding progress", { snapshotId, embedded, total: symbols.length })
-        }
+        hasMore = page.nextCursor !== null
+        cursor = page.nextCursor ?? undefined
       }
 
       // Final flush for remaining symbols
@@ -862,7 +853,7 @@ class SemanticEngine {
       await flushPending()
       flushMs += Date.now() - finalMark
 
-      log.info("Phase 3 complete: all vectors persisted with real IDF", {
+      log.info("Pass 2 complete: all vectors persisted with real IDF", {
         snapshotId,
         embedded,
         tfidf_ms: tfidfMs,
@@ -896,6 +887,7 @@ class SemanticEngine {
     snapshotId: string,
     limit: number = 15,
   ): Promise<{ svId: string; similarity: number }[]> {
+    limit = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.trunc(limit))) : 15
     const done = log.startTimer("searchByQuery", { snapshotId, limit })
 
     try {
@@ -923,13 +915,8 @@ class SemanticEngine {
         for (const [token, freq] of Object.entries(docCounts)) {
           queryIDF[token] = Math.log(1 + totalDocs / (1 + freq))
         }
-        // OOV query tokens get maximum IDF — rare terms are highly discriminative
-        const defaultIDF = Math.log(1 + totalDocs)
-        for (const token of Object.keys(queryTF)) {
-          if (!(token in queryIDF)) {
-            queryIDF[token] = defaultIDF
-          }
-        }
+        // OOV and vocabulary-capped terms use computeTFIDF's default 1.0,
+        // matching the vectors produced by batch embedding.
       }
 
       // Step 4: Compute query TF-IDF vector
@@ -952,8 +939,10 @@ class SemanticEngine {
                      JOIN symbol_versions sv ON sv.symbol_version_id = sem.symbol_version_id
                      WHERE sv.snapshot_id = $1
                        AND sem.view_type = 'body'
-                       AND sem.band_keys && $2::int[]`,
-          [snapshotId, queryBandKeys],
+                       AND sem.band_keys && $2::int[]
+                     ORDER BY sem.symbol_version_id
+                     LIMIT $3`,
+          [snapshotId, queryBandKeys, MAX_LSH_CANDIDATES],
         )
 
         candidateSvIds = lshResult.rows.map((r) => r.symbol_version_id as string)

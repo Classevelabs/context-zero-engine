@@ -66,6 +66,17 @@ describe("searchCode — catastrophic backtracking protection", () => {
     expect(result.mode).toBe("regex")
   })
 
+  test("downgrades a backtracking regex to literal when no worker can contain it", async () => {
+    mockQuery.mockResolvedValue({ rows: [{ path: "src/a.ts" }], rowCount: 1 })
+
+    const result = await searchCode("11111111-1111-1111-1111-111111111111", "a+b")
+
+    // Under Jest there is no compiled sibling worker. The security boundary is
+    // the reported literal downgrade; mutating the fallback back to inline
+    // regex execution makes this assertion fail.
+    expect(result.mode).toBe("literal")
+  })
+
   test("every catastrophic pattern completes fast against an adversarial line", async () => {
     // The literal fallback must actually be linear. Each pattern is matched
     // against the string that makes its regex form blow up; the whole set has
