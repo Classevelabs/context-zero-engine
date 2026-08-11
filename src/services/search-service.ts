@@ -43,6 +43,20 @@ const SEARCH_DEADLINE_MS = 10_000
 
 /** Grace period for the worker to exit on its own before it is terminated. */
 const WORKER_KILL_GRACE_MS = 250
+const MAX_SEARCH_PATTERN_LENGTH = 2_000
+const MAX_FILE_PATTERN_LENGTH = 2_000
+const MAX_SEARCH_RESULTS = 100
+const MAX_CONTEXT_LINES = 5
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, Math.trunc(value)))
+    : fallback
+}
+
+function literalRegex(pattern: string): RegExp {
+  return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi")
+}
 
 export interface SearchCodeOptions {
   filePattern?: string
@@ -150,12 +164,11 @@ function buildSafeRegex(pattern: string, log?: MinimalLogger): { regex: RegExp; 
   } catch (error) {
     if (log) {
       log.debug("Falling back to literal search pattern", {
-        pattern,
         error: error instanceof Error ? error.message : String(error),
       })
     }
     return {
-      regex: new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+      regex: literalRegex(pattern),
       mode: "literal",
     }
   }
@@ -270,8 +283,15 @@ export async function searchCode(
   options: SearchCodeOptions = {},
   log?: MinimalLogger,
 ): Promise<SearchCodeResult> {
-  const maxResults = options.maxResults ?? 30
-  const contextLines = options.contextLines ?? 2
+  if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > MAX_SEARCH_PATTERN_LENGTH) {
+    throw UserFacingError.badRequest(`Search pattern must contain 1-${MAX_SEARCH_PATTERN_LENGTH} characters`)
+  }
+  if (options.filePattern !== undefined &&
+      (typeof options.filePattern !== "string" || options.filePattern.length > MAX_FILE_PATTERN_LENGTH)) {
+    throw UserFacingError.badRequest(`File pattern must be at most ${MAX_FILE_PATTERN_LENGTH} characters`)
+  }
+  const maxResults = boundedInteger(options.maxResults, 30, 1, MAX_SEARCH_RESULTS)
+  const contextLines = boundedInteger(options.contextLines, 2, 0, MAX_CONTEXT_LINES)
 
   // Resolve repo base path
   const repo = await coreDataService.getRepository(repoId)
@@ -290,7 +310,7 @@ export async function searchCode(
     [repoId],
   )
 
-  const { regex, mode: searchMode } = buildSafeRegex(pattern, log)
+  let { regex, mode: searchMode } = buildSafeRegex(pattern, log)
 
   // Resolve base symlinks once before the loop
   let realBase: string
@@ -319,6 +339,10 @@ export async function searchCode(
     })
   }
 
+  if (files.length === 0) {
+    return { pattern, mode: searchMode, total_matches: 0, matches: [] }
+  }
+
   const scanParams: ScanParams = {
     realBase,
     files,
@@ -336,6 +360,15 @@ export async function searchCode(
   let result: ScanResult | null = null
   if (canBacktrack(regex.source)) {
     result = await scanInWorker(scanParams, log)
+    if (!result) {
+      // A worker spawn/load failure must not move a potentially exponential
+      // regex back onto the main event loop. Literal degradation is safe and
+      // is reported honestly through `mode`.
+      regex = literalRegex(pattern)
+      searchMode = "literal"
+      scanParams.patternSource = regex.source
+      scanParams.patternFlags = regex.flags
+    }
   }
   if (!result) {
     result = await scanFiles(scanParams, (filePath, error) => {
@@ -354,7 +387,6 @@ export async function searchCode(
   if (timedOut && log) {
     log.warn("Search exceeded its time budget — returning partial results", {
       repo_id: repoId,
-      pattern,
       mode: searchMode,
       budget_ms: SEARCH_DEADLINE_MS,
       files_scanned: result.filesScanned,

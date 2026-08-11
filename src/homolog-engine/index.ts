@@ -79,6 +79,9 @@ export class HomologInferenceEngine {
     snapshotId: string,
     confidenceThreshold: number = DEFAULT_HOMOLOG_CONFIDENCE_THRESHOLD,
   ): Promise<HomologCandidate[]> {
+    confidenceThreshold = Number.isFinite(confidenceThreshold)
+      ? Math.min(1, Math.max(0, confidenceThreshold))
+      : DEFAULT_HOMOLOG_CONFIDENCE_THRESHOLD
     const timer = log.startTimer("findHomologs", {
       targetSymbolVersionId,
       snapshotId,
@@ -86,7 +89,7 @@ export class HomologInferenceEngine {
     })
 
     // Load target symbol data
-    const target = await this.loadSymbolData(targetSymbolVersionId)
+    const target = await this.loadSymbolData(targetSymbolVersionId, snapshotId)
     if (!target) {
       timer({ result: "target_not_found" })
       return []
@@ -164,6 +167,7 @@ export class HomologInferenceEngine {
     snapshotId: string,
   ): Promise<number> {
     if (homologs.length === 0) return 0
+    if (homologs.length > 500) throw new Error("Too many homologs to persist in one request")
 
     // Single transaction for all homologs — atomic batch persistence
     await db.transaction(async (client: PoolClient) => {
@@ -845,16 +849,16 @@ export class HomologInferenceEngine {
 
   // ────────── Data Loaders ──────────
 
-  private async loadSymbolData(svId: string): Promise<CandidateRow | null> {
+  private async loadSymbolData(svId: string, snapshotId: string): Promise<CandidateRow | null> {
     const result = await db.query(
       `
             SELECT sv.symbol_version_id, sv.symbol_id, s.canonical_name,
                    s.stable_key, sv.body_hash, sv.ast_hash, sv.normalized_ast_hash, sv.signature, s.kind
             FROM symbol_versions sv
             JOIN symbols s ON s.symbol_id = sv.symbol_id
-            WHERE sv.symbol_version_id = $1
+            WHERE sv.symbol_version_id = $1 AND sv.snapshot_id = $2
         `,
-      [svId],
+      [svId, snapshotId],
     )
     return (result.rows[0] as CandidateRow | undefined) ?? null
   }

@@ -23,6 +23,14 @@ describe("UncertaintyTracker", () => {
       const ann = tracker.createAnnotation("untested_path", null, "No tests")
       expect(ann.confidence_impact).toBe(0.08)
     })
+
+    test("adapter-specific flags receive a finite conservative default", () => {
+      const ann = tracker.createAnnotation("encoding_fallback", "sym-1", "Decoded with replacement characters")
+
+      expect(ann.source).toBe("encoding_fallback")
+      expect(ann.confidence_impact).toBe(0.05)
+      expect(Number.isFinite(tracker.computeSnapshotConfidence([ann]))).toBe(true)
+    })
   })
 
   describe("computeSnapshotConfidence", () => {
@@ -68,6 +76,19 @@ describe("UncertaintyTracker", () => {
       // Multiplicative: 0.70 * 0.65 * 0.80 * 0.75 * 0.78 = ~0.213
       expect(confidence).toBeGreaterThanOrEqual(0.1)
       expect(confidence).toBeLessThan(0.3)
+    })
+
+    test("sanitizes non-finite and out-of-range persisted impacts", () => {
+      const annotations = [
+        { ...tracker.createAnnotation("parse_error", null, "bad"), confidence_impact: Number.NaN },
+        { ...tracker.createAnnotation("eval_usage", null, "bad"), confidence_impact: Number.POSITIVE_INFINITY },
+        { ...tracker.createAnnotation("dynamic_dispatch", null, "bad"), confidence_impact: -10 },
+      ]
+
+      const confidence = tracker.computeSnapshotConfidence(annotations)
+      expect(Number.isFinite(confidence)).toBe(true)
+      expect(confidence).toBeGreaterThanOrEqual(0.1)
+      expect(confidence).toBeLessThanOrEqual(1)
     })
   })
 

@@ -294,6 +294,9 @@ describe("Transactional Integration — Engine State Machine", () => {
     })
     // UPDATE state
     mockQueryWithClient.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+    mockQueryWithClient.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+    mockQueryWithClient.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+    mockQueryWithClient.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
     await expect(engine.rollback("txn-001")).resolves.not.toThrow()
   })

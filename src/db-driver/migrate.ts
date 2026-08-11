@@ -17,6 +17,25 @@ const log = new Logger("migrations")
 const MIGRATION_LOCK_KEY = 73297
 const LOCK_POLL_INTERVAL_MS = 250
 
+export function validateMigrationFileSequence(files: string[]): void {
+  if (files.length === 0) throw new Error("No migration files found")
+  const seenNumbers = new Set<number>()
+  const numbers = files.map((file) => {
+    const match = /^(\d{3})_[a-z0-9][a-z0-9_]*\.sql$/.exec(file)
+    if (!match) throw new Error(`Invalid migration filename: ${file}`)
+    const number = Number(match[1])
+    if (seenNumbers.has(number)) throw new Error(`Duplicate migration number: ${match[1]}`)
+    seenNumbers.add(number)
+    return number
+  })
+  for (let index = 0; index < numbers.length; index++) {
+    const expected = index + 1
+    if (numbers[index] !== expected) {
+      throw new Error(`Migration sequence gap: expected ${String(expected).padStart(3, "0")}, found ${files[index]}`)
+    }
+  }
+}
+
 async function acquireMigrationLock(client: PoolClient, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
 
@@ -58,16 +77,21 @@ export async function runPendingMigrations(): Promise<number> {
   // Create a dedicated pool connection for the advisory lock.
   // Advisory locks in PostgreSQL are session-scoped — lock and unlock MUST
   // happen on the same connection, which db.query() does NOT guarantee.
+  const { lockTimeoutMs, statementTimeoutMs } = getMigrationTimeoutConfig()
   const lockPool = new Pool({
     ...getConnectionConfig(),
     max: 1,
+    connectionTimeoutMillis: lockTimeoutMs,
   })
-  const lockClient = await lockPool.connect()
-  const { lockTimeoutMs, statementTimeoutMs } = getMigrationTimeoutConfig()
+  let lockClient: PoolClient | null = null
+  let lockAcquired = false
 
   try {
+    const client = await lockPool.connect()
+    lockClient = client
     // Acquire advisory lock to prevent concurrent migration runs
-    await acquireMigrationLock(lockClient, lockTimeoutMs)
+    await acquireMigrationLock(client, lockTimeoutMs)
+    lockAcquired = true
 
     // Ensure tracking table exists
     await db.query(`
@@ -90,6 +114,14 @@ export async function runPendingMigrations(): Promise<number> {
       .readdirSync(migrationsDir)
       .filter((f) => f.endsWith(".sql"))
       .sort()
+    validateMigrationFileSequence(files)
+
+    const discovered = new Set(files)
+    for (const row of appliedRows) {
+      if (!discovered.has(row.filename)) {
+        throw new Error(`Applied migration is missing from disk: ${row.filename}`)
+      }
+    }
 
     // Validate checksums for already-applied migrations
     for (const file of files) {
@@ -109,17 +141,11 @@ export async function runPendingMigrations(): Promise<number> {
         continue
       }
 
-      if (process.env.NODE_ENV === "production") {
-        throw new Error(
-          `Checksum mismatch for already-applied migration ${file}: ` +
-            `stored=${storedChecksum}, current=${currentChecksum}. ` +
-            `Refusing to continue — applied migrations must not be modified in production.`,
-        )
-      }
-      log.warn(`Checksum mismatch for ${file}`, {
-        stored: storedChecksum,
-        current: currentChecksum,
-      })
+      throw new Error(
+        `Checksum mismatch for already-applied migration ${file}: ` +
+          `stored=${storedChecksum}, current=${currentChecksum}. ` +
+          `Refusing to continue — applied migrations must never be modified.`,
+      )
     }
 
     let appliedCount = 0
@@ -151,11 +177,12 @@ export async function runPendingMigrations(): Promise<number> {
 
     return appliedCount
   } finally {
-    // Release advisory lock on the SAME connection that acquired it
     try {
-      await lockClient.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY])
+      if (lockClient && lockAcquired) {
+        await lockClient.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY])
+      }
     } finally {
-      lockClient.release()
+      lockClient?.release()
       await lockPool.end()
     }
   }

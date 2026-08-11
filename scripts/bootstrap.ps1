@@ -75,21 +75,32 @@ function Ensure-DockerEnv {
         $content = Get-Content -Path $envPath -Raw
         $dbPassword = Get-EnvFileValue -Content $content -Key "DB_PASSWORD"
         $apiKeys = Get-EnvFileValue -Content $content -Key "SCG_API_KEYS"
+        $adminApiKeys = Get-EnvFileValue -Content $content -Key "SCG_ADMIN_API_KEYS"
         if ($dbPassword -eq "" -or $dbPassword -match "(?i)^(postgres|password|changeme|change_me_before_deploying|change-me-before-deploying|change_me_before_running|change-me-before-running)$") {
             throw "Existing .env has a missing or weak DB_PASSWORD. Replace it with a strong generated value before Docker startup."
         }
         if ($apiKeys -eq "" -or $apiKeys -eq "your-secret-key-here" -or ($apiKeys.Split(",") | Where-Object { $_.Trim().Length -lt 32 }).Count -gt 0) {
             throw "Existing .env has missing or weak SCG_API_KEYS. Set at least one 32+ character API key before Docker startup."
         }
+        $regularKeyList = $apiKeys.Split(",") | ForEach-Object { $_.Trim() }
+        $adminKeyList = $adminApiKeys.Split(",") | ForEach-Object { $_.Trim() }
+        if ($adminApiKeys -eq "" -or ($adminKeyList | Where-Object { $_.Length -lt 32 }).Count -gt 0) {
+            throw "Existing .env must define 32+ character SCG_ADMIN_API_KEYS for Docker production mode."
+        }
+        if (($adminKeyList | Where-Object { $regularKeyList -contains $_ }).Count -gt 0) {
+            throw "SCG_ADMIN_API_KEYS must not reuse a SCG_API_KEYS credential."
+        }
         return
     }
 
     $apiKey = New-HexSecret
     $dbPassword = New-HexSecret
+    $adminApiKey = New-HexSecret
     @(
         "# ContextZero Docker bootstrap configuration",
         "DB_PASSWORD=$dbPassword",
         "SCG_API_KEYS=$apiKey",
+        "SCG_ADMIN_API_KEYS=$adminApiKey",
         "SCG_REPOS_PATH=.",
         "SCG_ALLOWED_BASE_PATHS=/repos",
         "SCG_MAX_FILES_PER_REPO=20000",
@@ -152,7 +163,7 @@ Install-PythonDependency
 Ensure-PostgresBestEffort
 
 Write-Step "Installing Node dependencies"
-& $NpmCommand install
+& $NpmCommand ci
 
 $setupArgs = @()
 if (-not $NoMigrate) {

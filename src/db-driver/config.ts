@@ -56,8 +56,8 @@ function readIntEnv(keys: string[], fallback: number): number {
   for (const key of keys) {
     const value = process.env[key]
     if (typeof value !== "string" || value.trim().length === 0) continue
-    const parsed = parseInt(value, 10)
-    if (Number.isFinite(parsed) && parsed > 0) {
+    const parsed = Number(value)
+    if (Number.isSafeInteger(parsed) && parsed > 0) {
       return parsed
     }
   }
@@ -238,10 +238,12 @@ export function getConnectionConfig(): ConnectionConfig {
 
   const host = readStringEnv(["DB_HOST", "PGHOST"], "localhost")
   const ssl = buildSslConfig(host)
+  const port = readIntEnv(["DB_PORT", "PGPORT"], 5432)
+  if (port > 65535) throw new Error(`Database port is out of range: ${port}`)
 
   return {
     host,
-    port: readIntEnv(["DB_PORT", "PGPORT"], 5432),
+    port,
     database: readStringEnv(["DB_NAME", "PGDATABASE"], "scg_v2"),
     user: readStringEnv(["DB_USER", "PGUSER"], "postgres"),
     password,

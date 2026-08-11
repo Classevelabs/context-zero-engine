@@ -5,8 +5,10 @@
 **A local code-intelligence engine for AI agents.** ContextZero indexes a
 repository into a PostgreSQL-backed code graph and serves structured,
 token-budgeted context — symbols, dependencies, effects, contracts, similar
-code, and blast radius — over MCP and HTTP. Everything runs on your machine;
-nothing leaves it.
+code, and blast radius — over MCP and HTTP. The engine and its database run
+locally and do not require an external analysis or embedding API. If an
+operator enables repository validation commands, those commands inherit the
+repository's own behavior and may access the network.
 
 Built by [ClassEve](https://classeve.com). Licensed under Apache-2.0.
 
@@ -27,10 +29,11 @@ repository.
 ContextZero indexes the repository once and answers the same investigation
 with targeted queries: *give me this symbol with its dependencies and
 contracts*, *what breaks if I change it*, *where else does this logic exist*,
-*which tests cover it*. In recorded benchmark runs this cut the tokens an
-agent consumed by **63–92% depending on repository size** (12.4x on VS Code,
-12.9x across seven multi-language repos). See [BENCHMARKS.md](BENCHMARKS.md)
-for full methodology, results, and honest caveats.
+*which tests cover it*. Historical author-run benchmarks reported **63–92%
+token savings depending on repository size** (12.4x on VS Code, 12.9x across
+seven multi-language repos). Raw run artifacts are not committed, so treat
+these as reproducible targets, not guaranteed field performance. See
+[BENCHMARKS.md](BENCHMARKS.md) for methodology and caveats.
 
 ---
 
@@ -40,7 +43,7 @@ for full methodology, results, and honest caveats.
 |-----------|-------------|
 | **Context Capsules** | Token-budgeted context packages: source, dependencies, contracts, and effects in one call, with a 5-level degradation ladder. |
 | **Blast Radius** | 5-dimensional impact analysis (structural, behavioral, contract, homolog, historical) with severity and confidence scoring. |
-| **Behavioral Profiling** | Every function classified: pure / read_only / read_write / side_effecting. TS/JS external effects are **type-resolved** — each call traced through the compiler to its source module (pg, fs, axios, …), not pattern-guessed. Purity propagates through the call graph; resource lists stay per-symbol. Measured 100%/100% precision-recall on the shipped ground-truth suite (see [BENCHMARKS.md](BENCHMARKS.md)). |
+| **Behavioral Profiling** | Functions are classified as pure / read_only / read_write / side_effecting. TS/JS external effects are **type-resolved** through the compiler. The shipped, author-designed fixture suite measured 100% precision and recall; this is regression evidence, not a claim of perfect accuracy on arbitrary repositories (see [BENCHMARKS.md](BENCHMARKS.md)). |
 | **Effect Signatures** | 9 typed effects (reads, writes, opens, throws, calls_external, logs, emits, normalizes, acquires_lock), provenance-labeled (`direct` vs `transitive` with hop counts) and propagated with a bounded, kind-filtered policy. |
 | **Contract Extraction** | Input/output types, error contracts, security contracts, guard clauses, derived invariants — mined from the code itself. |
 | **Homolog Detection** | Finds behaviorally equivalent code (not just textual clones) via 7-dimensional evidence scoring with contradiction flags. |
@@ -81,7 +84,7 @@ ContextZero MCP Bridge (61 tools)    REST API (60 routes)
     |     Structural Graph | Capsule Compiler
     +-- Semantic Engine (TF-IDF, MinHash LSH, cosine similarity)
     +-- Homolog Engine (7-dimensional scoring)
-    +-- Transactional Editor (sandboxed validation, rollback)
+    +-- Transactional Editor (opt-in constrained validation, rollback)
     +-- Service Layer (transport-agnostic services)
     +-- Database Driver (circuit breaker, batch loader, advisory locks)
     |
@@ -131,7 +134,7 @@ MCP config for your client (`claude`, `codex`, `cursor`, or `all`).
 ### Manual install
 
 ```bash
-npm install
+npm ci
 
 createdb scg_v2
 psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
@@ -173,6 +176,13 @@ Any MCP client that speaks stdio works: the server is
 `node dist/mcp-bridge/index.js` with the `DB_*`/`SCG_*` environment (or a
 single `CONTEXTZERO_ENV_FILE` pointing at your `.env`).
 
+MCP uses a trusted local stdio child-process boundary; it is not a remote
+network authentication layer. Read tools are enabled by default. Before using
+ingestion, editing, retention cleanup, or validation tools, a local operator
+must set `SCG_MCP_MUTATIONS_ENABLED=true`. Validation commands additionally
+require `SCG_ALLOW_UNSANDBOXED_EXECUTION=true` and should run only on trusted
+repositories under a restricted operating-system account.
+
 ### 2. Index a repository
 
 From the MCP client, call:
@@ -205,14 +215,16 @@ curl -X POST http://localhost:3100/scg_codebase_overview \
 ```
 
 60 routes (7 GET + 53 POST) mirror the MCP tool surface plus health,
-readiness, Prometheus metrics, cache, and admin endpoints. All POST routes
-require API-key authentication (`X-API-Key` or `Authorization: Bearer`).
+readiness, Prometheus metrics, cache, and admin endpoints. All non-health
+routes require API-key authentication (`X-API-Key` or `Authorization:
+Bearer`). State-changing, repository-registration, and validation-command
+routes require a distinct `SCG_ADMIN_API_KEYS` credential.
 
 ### Docker (self-hosted server + bundled PostgreSQL)
 
 ```bash
 cp .env.docker.example .env
-# Set DB_PASSWORD and SCG_API_KEYS to strong secrets.
+# Set DB_PASSWORD, SCG_API_KEYS, and a distinct SCG_ADMIN_API_KEYS value.
 docker compose up -d
 ```
 
@@ -242,11 +254,11 @@ The complete registry is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Security
 
-- **Local by design** — no telemetry, no external APIs; analysis and storage stay on your machine
+- **Local by design** — no telemetry or required external analysis APIs; opt-in repository commands retain their own network capabilities
 - **SQL injection protection** — parameterized queries plus table/column allowlists for dynamic queries
 - **5-layer path traversal protection** — null bytes, URL encoding, backslash handling, symlink escape checks, base-path boundary enforcement
-- **Fail-closed authentication** — timing-safe comparison, 32-character minimum keys, per-IP brute-force lockout with exponential backoff
-- **Sandboxed validation** — resource limits, process groups, SIGKILL escalation, environment sanitization
+- **Fail-closed authentication** — timing-safe comparison, 32-character minimum keys, per-IP brute-force lockout, and separate production admin credentials for privileged HTTP routes
+- **Constrained validation runner** — disabled by default; applies time/output/resource limits, process groups, SIGKILL escalation, and environment sanitization, but does not isolate filesystem or network access
 - **Hardened HTTP surface** — per-route rate limits and body-size limits, input validation on every route, sanitized error responses (no stack traces, paths, or SQL)
 
 See [SECURITY.md](SECURITY.md) for the deployment hardening checklist and
@@ -254,7 +266,7 @@ how to report a vulnerability.
 
 ---
 
-## Benchmarks
+## Historical Benchmarks
 
 | Benchmark | Scale | Token reduction (exact-symbol baseline) |
 |---|---|---:|
@@ -262,15 +274,16 @@ how to report a vulnerability.
 | VS Code | 10,386 files / 125,777 symbol versions | 12.44x (91.96% savings) |
 | 7 multi-language repos | Django, Prometheus, Tokio, Commons Lang, Serilog, OkHttp, Alamofire | 12.86x (92.2% savings) |
 
-Methodology, per-repo tables, reproduction scripts, and the cases where the
-gain is small: [BENCHMARKS.md](BENCHMARKS.md).
+These are author-reported historical results; raw machine-readable run outputs
+are not committed. Methodology, reproduction scripts, and cases where the gain
+is small: [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
 ## Testing
 
 ```bash
-npm test              # full unit suite (40 suites, 1,400+ tests)
+npm test              # full unit suite
 npm run test:db       # opt-in integration test against a real PostgreSQL
 npm run test:ci       # with coverage
 npm run typecheck     # TypeScript strict mode

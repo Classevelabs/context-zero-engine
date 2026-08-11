@@ -8,7 +8,7 @@
  *   3. Risk scores — composite per-symbol risk from change frequency,
  *      bug density, regression rate, churn, and ownership dispersion
  *
- * Security: all git commands use execFileSync with argument arrays —
+ * Security: all git commands use asynchronous execFile with argument arrays —
  * never shell-interpolated strings.
  */
 
@@ -19,6 +19,7 @@ const execFileAsync = promisify(execFile)
 import { v4 as uuidv4 } from "uuid"
 import { db } from "../db-driver"
 import { Logger } from "../logger"
+import { resolveExistingPath } from "../path-security"
 
 const log = new Logger("temporal-engine")
 
@@ -204,6 +205,13 @@ export class TemporalEngine {
    *   ...
    */
   public async mineGitHistory(repoBasePath: string, maxCommits: number = DEFAULT_MAX_COMMITS): Promise<GitCommit[]> {
+    if (typeof repoBasePath !== "string" || repoBasePath.length === 0 || repoBasePath.length > 4096) {
+      throw new Error("Invalid repository path")
+    }
+    repoBasePath = resolveExistingPath(repoBasePath)
+    maxCommits = Number.isFinite(maxCommits)
+      ? Math.min(50_000, Math.max(1, Math.trunc(maxCommits)))
+      : DEFAULT_MAX_COMMITS
     const timer = log.startTimer("mineGitHistory", { repoBasePath, maxCommits })
 
     let raw: string
@@ -213,8 +221,10 @@ export class TemporalEngine {
         [
           "log",
           `--max-count=${maxCommits}`,
-          "--pretty=format:%H|%an|%ae|%ad|%s",
-          "--date=iso",
+          // NUL-delimited metadata and file names avoid confusing pipes,
+          // whitespace, or quoted path escapes with record structure.
+          "--pretty=format:%x1e%H%x00%an%x00%ae%x00%aI%x00%s%x00",
+          "-z",
           "--name-only",
           "--diff-filter=ACDMRT", // exclude renames-only noise
         ],
@@ -590,6 +600,7 @@ export class TemporalEngine {
     repoId: string,
     minJaccard: number = 0.1,
   ): Promise<CoChangePartner[]> {
+    minJaccard = Number.isFinite(minJaccard) ? Math.min(1, Math.max(0, minJaccard)) : 0.1
     const result = await db.query(
       `
             SELECT
@@ -610,6 +621,7 @@ export class TemporalEngine {
               AND (tcc.symbol_a_id = $1 OR tcc.symbol_b_id = $1)
               AND tcc.jaccard_coefficient >= $3
             ORDER BY tcc.jaccard_coefficient DESC
+            LIMIT 500
         `,
       [symbolId, repoId, minJaccard],
     )
@@ -624,6 +636,7 @@ export class TemporalEngine {
     snapshotId: string,
     limit: number = 20,
   ): Promise<(TemporalRiskScore & { canonical_name: string })[]> {
+    limit = Number.isFinite(limit) ? Math.min(500, Math.max(1, Math.trunc(limit))) : 20
     const result = await db.query(
       `
             SELECT trs.*, s.canonical_name
@@ -651,6 +664,7 @@ export class TemporalEngine {
     ownership_type: "sole" | "shared" | "orphaned"
     contributors: { author: string; commit_count: number; percentage: number }[]
   }> {
+    repoBasePath = resolveExistingPath(repoBasePath)
     // Get all file paths associated with this symbol
     const fileResult = await db.query(
       `
@@ -659,6 +673,7 @@ export class TemporalEngine {
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE s.symbol_id = $1 AND s.repo_id = $2
+            LIMIT 10
         `,
       [symbolId, repoId],
     )
@@ -686,8 +701,8 @@ export class TemporalEngine {
           {
             cwd: repoBasePath,
             encoding: "utf-8",
-            maxBuffer: 10 * 1024 * 1024,
-            timeout: 30_000,
+            maxBuffer: 2 * 1024 * 1024,
+            timeout: 5_000,
           },
         )
         logOutput = result.stdout
@@ -758,6 +773,8 @@ export class TemporalEngine {
    * followed by a blank line before the next commit.
    */
   private parseGitLog(raw: string): GitCommit[] {
+    if (raw.includes("\x1e")) return this.parseNullDelimitedGitLog(raw)
+
     const commits: GitCommit[] = []
     const lines = raw.split("\n")
 
@@ -826,6 +843,42 @@ export class TemporalEngine {
       commits.push(current)
     }
 
+    return commits
+  }
+
+  /** Parse the delimiter-safe format emitted by mineGitHistory. */
+  private parseNullDelimitedGitLog(raw: string): GitCommit[] {
+    const commits: GitCommit[] = []
+    for (const record of raw.split("\x1e").slice(1)) {
+      const fields = record.split("\0")
+      const hash = (fields[0] ?? "").replace(/^[\r\n]+/, "")
+      const authorName = fields[1] ?? ""
+      const authorEmail = fields[2] ?? ""
+      const date = new Date(fields[3] ?? "")
+      const subject = fields[4] ?? ""
+      if (!/^[0-9a-f]{40}$/i.test(hash) || !authorName || !authorEmail || Number.isNaN(date.getTime())) continue
+
+      const files: string[] = []
+      for (const rawPath of fields.slice(5)) {
+        // Git may place one formatting newline between the pretty header and
+        // the first NUL-delimited name. Do not trim other whitespace: it is
+        // legal in a repository path and therefore semantically meaningful.
+        const filePath = rawPath.replace(/^\r?\n/, "")
+        if (filePath.length > 0 && !this.isIgnoredPath(filePath)) files.push(filePath)
+      }
+
+      commits.push({
+        hash,
+        author_name: authorName,
+        author_email: authorEmail,
+        date,
+        subject,
+        files,
+        is_bug_fix: BUG_FIX_PATTERNS.some((pattern) => pattern.test(subject)),
+        is_revert: REVERT_PATTERN.test(subject),
+        is_merge: MERGE_PATTERN.test(subject),
+      })
+    }
     return commits
   }
 

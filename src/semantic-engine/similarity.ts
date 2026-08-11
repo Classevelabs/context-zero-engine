@@ -78,12 +78,13 @@ const PERM_B: bigint[] = []
  * TF(t) = 1 + log(count(t)) for each token t in the document.
  */
 export function computeTF(tokens: string[]): Record<string, number> {
-  const counts: Record<string, number> = {}
+  const counts: Record<string, number> = Object.create(null) as Record<string, number>
   for (const token of tokens) {
-    counts[token] = (counts[token] || 0) + 1
+    if (typeof token !== "string" || token.length === 0) continue
+    counts[token] = (counts[token] ?? 0) + 1
   }
 
-  const tf: Record<string, number> = {}
+  const tf: Record<string, number> = Object.create(null) as Record<string, number>
   for (const [token, count] of Object.entries(counts)) {
     tf[token] = 1 + Math.log(count)
   }
@@ -99,17 +100,17 @@ export function computeTF(tokens: string[]): Record<string, number> {
  */
 export function computeIDF(documentTokenSets: Set<string>[], totalDocs: number): Record<string, number> {
   // Guard: no documents → no IDF scores
-  if (totalDocs <= 0) return {}
+  if (!Number.isFinite(totalDocs) || totalDocs <= 0) return {}
 
   // Count how many documents contain each token
-  const docFreq: Record<string, number> = {}
+  const docFreq: Record<string, number> = Object.create(null) as Record<string, number>
   for (const tokenSet of documentTokenSets) {
     for (const token of tokenSet) {
       docFreq[token] = (docFreq[token] || 0) + 1
     }
   }
 
-  const idf: Record<string, number> = {}
+  const idf: Record<string, number> = Object.create(null) as Record<string, number>
   for (const [token, freq] of Object.entries(docFreq)) {
     idf[token] = Math.log(1 + totalDocs / (1 + freq))
   }
@@ -121,10 +122,11 @@ export function computeIDF(documentTokenSets: Set<string>[], totalDocs: number):
  * If a token has no IDF entry, it is assigned a default IDF of 1.0.
  */
 export function computeTFIDF(tf: Record<string, number>, idf: Record<string, number>): SparseVector {
-  const raw: SparseVector = {}
+  const raw: SparseVector = Object.create(null) as SparseVector
 
   for (const [token, tfValue] of Object.entries(tf)) {
     const idfValue = idf[token] ?? 1.0
+    if (!Number.isFinite(tfValue) || tfValue < 0 || !Number.isFinite(idfValue) || idfValue < 0) continue
     raw[token] = tfValue * idfValue
   }
 
@@ -139,7 +141,7 @@ export function computeTFIDF(tf: Record<string, number>, idf: Record<string, num
     return raw
   }
 
-  const normalized: SparseVector = {}
+  const normalized: SparseVector = Object.create(null) as SparseVector
   for (const [token, value] of Object.entries(raw)) {
     normalized[token] = value / magnitude
   }
@@ -162,13 +164,13 @@ export function cosineSimilarity(a: SparseVector, b: SparseVector): number {
 
   for (const [token, valueA] of Object.entries(smaller)) {
     const valueB = larger[token]
-    if (valueB !== undefined) {
+    if (Number.isFinite(valueA) && valueB !== undefined && Number.isFinite(valueB)) {
       dotProduct += valueA * valueB
     }
   }
 
   // Clamp to [0, 1] to handle floating-point noise
-  return Math.max(0, Math.min(1, dotProduct))
+  return Number.isFinite(dotProduct) ? Math.max(0, Math.min(1, dotProduct)) : 0
 }
 
 // --------------------------------------------------------------------------
@@ -190,7 +192,8 @@ export function cosineSimilarity(a: SparseVector, b: SparseVector): number {
  * @returns Array of minimum hash values, one per permutation
  */
 export function generateMinHash(tokens: Set<string>, numPermutations: number = 128): number[] {
-  const nPerms = Math.min(numPermutations, MAX_PERMUTATIONS)
+  const requested = Number.isFinite(numPermutations) ? Math.trunc(numPermutations) : 128
+  const nPerms = Math.max(1, Math.min(requested, MAX_PERMUTATIONS))
   const signature: number[] = new Array(nPerms).fill(0xffffffff)
 
   if (tokens.size === 0) {
@@ -270,16 +273,19 @@ export const LSH_ROWS_PER_BAND = 8
  * @returns Array of band hash integers (length = floor(signature.length / rowsPerBand))
  */
 export function computeBandHashes(signature: number[], rowsPerBand: number = LSH_ROWS_PER_BAND): number[] {
-  const numBands = Math.floor(signature.length / rowsPerBand)
+  if (signature.length === 0) return []
+  const requestedRows = Number.isFinite(rowsPerBand) ? Math.trunc(rowsPerBand) : LSH_ROWS_PER_BAND
+  const safeRowsPerBand = Math.max(1, Math.min(requestedRows, signature.length))
+  const numBands = Math.floor(signature.length / safeRowsPerBand)
   const bandHashes: number[] = new Array(numBands)
 
   for (let band = 0; band < numBands; band++) {
-    const offset = band * rowsPerBand
+    const offset = band * safeRowsPerBand
 
     // FNV-1a over the raw bytes of R consecutive 32-bit integers
     let hash = 0x811c9dc5 // FNV offset basis
 
-    for (let r = 0; r < rowsPerBand; r++) {
+    for (let r = 0; r < safeRowsPerBand; r++) {
       const value = signature[offset + r]!
 
       // Process each of the 4 bytes of the 32-bit integer (little-endian)
@@ -362,6 +368,7 @@ export function multiViewSimilarity(
   let activeWeight = 0
 
   for (const [viewType, weight] of Object.entries(weights)) {
+    if (!Number.isFinite(weight) || weight <= 0) continue
     const vecA = viewsA.get(viewType)
     const vecB = viewsB.get(viewType)
 
@@ -374,5 +381,6 @@ export function multiViewSimilarity(
 
   // Normalize by weight of views that were actually compared
   if (activeWeight === 0 || !isFinite(activeWeight)) return 0
-  return totalSimilarity / activeWeight
+  const similarity = totalSimilarity / activeWeight
+  return Number.isFinite(similarity) ? Math.max(0, Math.min(1, similarity)) : 0
 }

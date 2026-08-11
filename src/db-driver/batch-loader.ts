@@ -60,7 +60,6 @@ export class BatchLoader {
     }
 
     const allRows: T[] = []
-    let failedChunks = 0
     for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
       const chunk = ids.slice(i, i + CHUNK_SIZE)
       const placeholders = chunk.map((_, j) => `$${j + 1}`).join(",")
@@ -75,23 +74,15 @@ export class BatchLoader {
           allRows.push(...(result.rows as T[]))
         }
       } catch (err) {
-        failedChunks++
-        log.warn("chunkedInQuery: chunk query failed, skipping chunk", {
+        log.error("chunkedInQuery: chunk query failed; refusing partial results", err, {
           table,
           column,
+          context,
           chunkIndex: Math.floor(i / CHUNK_SIZE),
           chunkSize: chunk.length,
-          error: (err as Error).message,
         })
+        throw err
       }
-    }
-    if (failedChunks > 0) {
-      log.warn(`chunkedInQuery: ${failedChunks} chunk(s) failed`, {
-        table,
-        column,
-        context,
-        totalChunks: Math.ceil(ids.length / CHUNK_SIZE),
-      })
     }
     return allRows
   }

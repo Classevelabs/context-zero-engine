@@ -75,6 +75,21 @@ const DEFAULT_CONFIG: Omit<SandboxConfig, "cwd"> = {
   maxOutputBytes: 1_048_576, // 1MB
 }
 
+const UNSANDBOXED_EXECUTION_OPT_IN = "SCG_ALLOW_UNSANDBOXED_EXECUTION"
+
+/**
+ * The built-in runner constrains environment, time, output, and (on Linux)
+ * several process resources. It does not provide filesystem or network
+ * isolation, so repository-controlled commands require an explicit operator
+ * opt-in. Tests are exempt because they execute fixtures under the test runner.
+ */
+export function isRepositoryExecutionAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  if ((env["NODE_ENV"] || "").trim().toLowerCase() === "test") return true
+  return ["1", "true", "yes", "on"].includes(
+    (env[UNSANDBOXED_EXECUTION_OPT_IN] || "").trim().toLowerCase(),
+  )
+}
+
 /**
  * Detect whether `unshare` is available on this system.
  * Cached after first probe to avoid repeated execSync calls.
@@ -169,8 +184,10 @@ export function buildSanitizedEnv(cwd: string, extra?: Record<string, string>): 
     "RUBYLIB",
     "RUBYOPT",
   ])
-  for (const dangerous of DANGEROUS_ENV_VARS) {
-    delete safe[dangerous]
+  for (const key of Object.keys(safe)) {
+    if (DANGEROUS_ENV_VARS.has(key.toUpperCase())) {
+      delete safe[key]
+    }
   }
 
   return safe
@@ -186,6 +203,12 @@ export function buildSanitizedEnv(cwd: string, extra?: Record<string, string>): 
  * - Graceful SIGTERM -> hard SIGKILL escalation
  */
 export async function sandboxExec(command: string, args: string[], config: SandboxConfig): Promise<SandboxResult> {
+  if (!isRepositoryExecutionAllowed()) {
+    throw new Error(
+      "Repository command execution is disabled because this runner does not isolate filesystem or network access. " +
+        `Set ${UNSANDBOXED_EXECUTION_OPT_IN}=true only for trusted repositories and a restricted service identity.`,
+    )
+  }
   if (args.some((a) => a.includes("\0"))) {
     throw new Error("Null bytes are not permitted in command arguments")
   }
@@ -198,8 +221,12 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
   })
 
   const startTime = Date.now()
-  const effectiveTimeout = config.timeoutMs || DEFAULT_CONFIG.timeoutMs
-  const maxOutput = config.maxOutputBytes || DEFAULT_CONFIG.maxOutputBytes
+  const effectiveTimeout =
+    Number.isSafeInteger(config.timeoutMs) && config.timeoutMs > 0 ? config.timeoutMs : DEFAULT_CONFIG.timeoutMs
+  const maxOutput =
+    Number.isSafeInteger(config.maxOutputBytes) && config.maxOutputBytes > 0
+      ? config.maxOutputBytes
+      : DEFAULT_CONFIG.maxOutputBytes
 
   return new Promise<SandboxResult>((resolve) => {
     // Verify working directory exists and is within expected scope
@@ -219,6 +246,8 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
 
     let stdoutBuf = ""
     let stderrBuf = ""
+    let stdoutBytes = 0
+    let stderrBytes = 0
     let stdoutTruncated = false
     let stderrTruncated = false
     let timedOut = false
@@ -301,9 +330,12 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
     // Capture stdout with size limit
     child.stdout.on("data", (chunk: Buffer) => {
       if (!stdoutTruncated) {
-        stdoutBuf += chunk.toString("utf-8")
-        if (stdoutBuf.length > maxOutput) {
-          stdoutBuf = stdoutBuf.substring(0, maxOutput) + "\n... [output truncated at 1MB]"
+        const remaining = Math.max(0, maxOutput - stdoutBytes)
+        const captured = chunk.subarray(0, remaining)
+        stdoutBuf += captured.toString("utf-8")
+        stdoutBytes += captured.byteLength
+        if (captured.byteLength < chunk.byteLength) {
+          stdoutBuf += `\n... [output truncated at ${maxOutput} bytes]`
           stdoutTruncated = true
         }
       }
@@ -312,9 +344,12 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
     // Capture stderr with size limit
     child.stderr.on("data", (chunk: Buffer) => {
       if (!stderrTruncated) {
-        stderrBuf += chunk.toString("utf-8")
-        if (stderrBuf.length > maxOutput) {
-          stderrBuf = stderrBuf.substring(0, maxOutput) + "\n... [output truncated at 1MB]"
+        const remaining = Math.max(0, maxOutput - stderrBytes)
+        const captured = chunk.subarray(0, remaining)
+        stderrBuf += captured.toString("utf-8")
+        stderrBytes += captured.byteLength
+        if (captured.byteLength < chunk.byteLength) {
+          stderrBuf += `\n... [output truncated at ${maxOutput} bytes]`
           stderrTruncated = true
         }
       }
@@ -380,8 +415,8 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
         exitCode,
         timedOut,
         killed,
-        stdout_bytes: stdoutBuf.length,
-        stderr_bytes: stderrBuf.length,
+        stdout_bytes: stdoutBytes,
+        stderr_bytes: stderrBytes,
       })
 
       resolve({
@@ -398,14 +433,15 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
       if (finished) return
       finished = true
       clearTimeout(timeoutHandle)
+      if (sigkillTimer) clearTimeout(sigkillTimer)
 
       log.error("Sandbox spawn error", err, { command })
       resolve({
         exitCode: -1,
         stdout: stdoutBuf,
         stderr: `Spawn error: ${err.message}`,
-        timedOut: false,
-        killed: false,
+        timedOut,
+        killed,
         durationMs: Date.now() - startTime,
       })
     })

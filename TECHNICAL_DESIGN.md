@@ -329,7 +329,7 @@ Orchestrates:
 - 9-state transaction lifecycle with planning, patching, validation, propagation, commit/rollback
 - Git history mining with co-change pair computation (Jaccard similarity) and risk scoring
 - Runtime trace ingestion with observed edge persistence and evidence retrieval
-- Sandboxed subprocess execution with resource constraints
+- Opt-in constrained subprocess execution with resource/time limits
 
 ---
 
@@ -354,7 +354,7 @@ Orchestrates:
 2. SCG resolves likely target symbols
 3. SCG compiles context capsule
 4. The consumer proposes patch
-5. SCG applies patch in transaction sandbox
+5. SCG applies the patch transactionally
 6. SCG computes blast radius
 7. SCG validates syntax/types/tests/contracts
 8. SCG proposes homolog propagation
@@ -434,7 +434,10 @@ Target initial response expectations:
 Failed indexing or failed inference must not corrupt source-of-truth symbol state.
 
 ## 10.6 Security
-Code execution for validation must be sandboxed.
+Repository command execution is fail-closed by default. When explicitly
+enabled for trusted repositories, it must run under a restricted service
+identity with time, output, environment, and process controls. The current
+runner does not provide filesystem or network isolation.
 
 ---
 
@@ -1059,7 +1062,7 @@ Treat edits as formal transactions instead of direct file rewrites.
 1. plan change
 2. compile capsule
 3. prepare transaction
-4. apply patch in sandbox
+4. apply patch transactionally
 5. reindex affected graph region
 6. compute blast radius
 7. validate change
@@ -1077,11 +1080,13 @@ Treat edits as formal transactions instead of direct file rewrites.
 - `rolled_back`
 - `failed`
 
-## 19.4 Sandbox execution
-Patch application and validation run inside isolated environments:
-- container or microVM
-- restricted filesystem/network
-- resource/time limits
+## 19.4 Constrained command execution
+Patch application is transactional. Build/test validation commands are
+disabled unless `SCG_ALLOW_UNSANDBOXED_EXECUTION=true`. When enabled, the
+runner applies resource/time/output limits, environment sanitization, process
+groups, and best-effort Linux PID namespacing. It is not a container or
+microVM, does not restrict filesystem/network access, and provides no OS-level
+isolation on Windows.
 
 ## 19.5 Rollback
 Rollback restores:
@@ -1710,7 +1715,7 @@ Capsule includes:
 The consumer proposes patch to target symbol.
 
 ## Step 4: Apply and reindex
-SCG creates transaction, applies patch in sandbox, reindexes changed symbols.
+SCG creates a transaction, applies the patch, and reindexes changed symbols.
 
 ## Step 5: Blast radius
 SCG detects:
@@ -1739,15 +1744,23 @@ After approval and validation, SCG commits.
 # 24. Security and Isolation
 
 ## 24.1 Code access
-Access to repositories must be authenticated and authorized.
+HTTP repository access requires API authentication and an admin credential for
+mutation/command routes. MCP stdio inherits the local client's OS authority and
+must be treated as a trusted-local boundary. Both surfaces enforce configured
+repository base paths.
 
-## 24.2 Validation sandbox
-All builds/tests execute in sandboxed subprocesses:
-- process group isolation (`setsid`) with SIGTERM → SIGKILL escalation
-- `ulimit` resource constraints (CPU time, memory, file descriptors)
-- environment sanitization — credentials, secrets, and sensitive variables stripped
-- `unshare` namespace isolation when available on Linux
-- output truncation to prevent memory exhaustion
+## 24.2 Validation command runner
+Build/test commands are fail-closed unless an operator sets
+`SCG_ALLOW_UNSANDBOXED_EXECUTION=true`. The constrained runner provides:
+- process groups (`setsid`) with SIGTERM → SIGKILL escalation;
+- `ulimit` resource constraints where the platform supports them;
+- environment sanitization of known credential variables;
+- best-effort Linux PID namespacing; and
+- output truncation and timeouts.
+
+It does not restrict filesystem or network access. Windows has no OS-level
+isolation. Enable it only for trusted repositories under a restricted service
+identity; do not describe it as a security sandbox.
 
 ## 24.3 Secret handling
 SCG must not expose:
@@ -1898,7 +1911,7 @@ All five phases are fully implemented and operational:
 
 ## Phase 4: Transactional editing — COMPLETE
 - 9-state lifecycle with plan/prepare/apply/validate/commit/rollback
-- Sandboxed subprocess execution
+- Opt-in constrained subprocess execution (no filesystem/network isolation)
 - Semantic diff (9 dimensions) and contract diff
 - Homolog propagation proposals and execution
 
@@ -1960,7 +1973,7 @@ ContextZero is:
 
 > **A versioned, evidence-carrying, contract-aware code intelligence and change orchestration system that enables AI coding agents to operate on exact symbols, infer hidden homologous logic across a repository, compile minimal sufficient context, reason about blast radius natively, and execute validated transactional edits.**
 
-**52 production source files** | **37,800+ lines of TypeScript** | **13 analysis engines** | **61 MCP tools** | **60 HTTP routes** | **15 supported languages** | **29 database tables** | **17 migrations**
+**13 analysis engines** | **61 MCP tools** | **60 HTTP routes** | **15 supported languages** | **29 database tables** | **17 migrations**
 
 ContextZero is not:
 - a passive database,

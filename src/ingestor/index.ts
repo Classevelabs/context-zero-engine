@@ -148,9 +148,14 @@ const SKIP_DIRS = new Set([
   "_build",
 ])
 
-const MAX_FILE_SIZE = ingestionConfig.maxFileSizeBytes
-const MAX_FILE_COUNT = ingestionConfig.maxFilesPerRepo
-const INGEST_WORKER_CONCURRENCY = Math.max(1, ingestionConfig.workerConcurrency)
+const boundedConfigInteger = (value: number, fallback: number, min: number, max: number): number =>
+  Number.isFinite(value) ? Math.min(max, Math.max(min, Math.trunc(value))) : fallback
+const MAX_FILE_SIZE = boundedConfigInteger(ingestionConfig.maxFileSizeBytes, 1_048_576, 1, 5 * 1024 * 1024)
+const MAX_FILE_COUNT = boundedConfigInteger(ingestionConfig.maxFilesPerRepo, 100_000, 1, 500_000)
+const INGEST_WORKER_CONCURRENCY = boundedConfigInteger(ingestionConfig.workerConcurrency, 8, 1, 32)
+const PYTHON_TIMEOUT_MS = boundedConfigInteger(ingestionConfig.pythonTimeout, 30_000, 1_000, 5 * 60_000)
+const MAX_PYTHON_OUTPUT_BYTES = 16 * 1024 * 1024
+const MAX_INCREMENTAL_PATHS = 500
 
 /**
  * `packages/` was in SKIP_DIRS as a C#/.NET NuGet cache dir — but "packages" is ALSO the
@@ -329,6 +334,21 @@ export class Ingestor {
       const swiftPaths: string[] = []
       const phpPaths: string[] = []
       const bashPaths: string[] = []
+      const unchangedFiles: { filePath: string; lang: string }[] = []
+      const queueForExtraction = (filePath: string, lang: string): void => {
+        if (lang === "typescript" || lang === "javascript") tsPaths.push(filePath)
+        else if (lang === "python") pyPaths.push(filePath)
+        else if (lang === "cpp") cppPaths.push(filePath)
+        else if (lang === "go") goPaths.push(filePath)
+        else if (lang === "rust") rustPaths.push(filePath)
+        else if (lang === "java") javaPaths.push(filePath)
+        else if (lang === "csharp") csharpPaths.push(filePath)
+        else if (lang === "ruby") rubyPaths.push(filePath)
+        else if (lang === "kotlin") kotlinPaths.push(filePath)
+        else if (lang === "swift") swiftPaths.push(filePath)
+        else if (lang === "php") phpPaths.push(filePath)
+        else if (lang === "bash") bashPaths.push(filePath)
+      }
       let filesProcessed = 0
       let filesFailed = 0
       let symbolsExtracted = 0
@@ -358,39 +378,17 @@ export class Ingestor {
         // Delta optimization: skip extraction for files unchanged since parent snapshot
         if (parentHashes && parentHashes.get(relativePath) === contentHash) {
           unchangedCount++
+          unchangedFiles.push({ filePath, lang })
           continue
         }
 
-        if (lang === "typescript" || lang === "javascript") {
-          tsPaths.push(filePath)
-        } else if (lang === "python") {
-          pyPaths.push(filePath)
-        } else if (lang === "cpp") {
-          cppPaths.push(filePath)
-        } else if (lang === "go") {
-          goPaths.push(filePath)
-        } else if (lang === "rust") {
-          rustPaths.push(filePath)
-        } else if (lang === "java") {
-          javaPaths.push(filePath)
-        } else if (lang === "csharp") {
-          csharpPaths.push(filePath)
-        } else if (lang === "ruby") {
-          rubyPaths.push(filePath)
-        } else if (lang === "kotlin") {
-          kotlinPaths.push(filePath)
-        } else if (lang === "swift") {
-          swiftPaths.push(filePath)
-        } else if (lang === "php") {
-          phpPaths.push(filePath)
-        } else if (lang === "bash") {
-          bashPaths.push(filePath)
-        }
+        queueForExtraction(filePath, lang)
       }
 
       // 4.5 Bulk-copy symbol data for unchanged files from parent snapshot.
       // This is the core of incremental ingestion: instead of re-parsing unchanged files,
       // copy their symbol_versions, behavioral_profiles, and contract_profiles in 3 SQL queries.
+      let deltaCopySucceeded = false
       if (parentSnapshotId && unchangedCount > 0) {
         try {
           // Copy symbol versions: join on matching (path + content_hash) files
@@ -417,7 +415,6 @@ export class Ingestor {
             [parentSnapshotId, snapshotId],
           )
           const copiedSymbols = copyResult.rowCount ?? 0
-          symbolsExtracted += copiedSymbols
 
           // Copy behavioral profiles for newly copied symbol versions
           await db.query(
@@ -465,13 +462,17 @@ export class Ingestor {
             [parentSnapshotId, snapshotId],
           )
 
+          symbolsExtracted += copiedSymbols
           filesProcessed += unchangedCount
+          deltaCopySucceeded = true
           log.info("Delta ingestion: copied unchanged symbols from parent", {
             unchangedFiles: unchangedCount,
             copiedSymbols,
           })
         } catch (err) {
-          log.warn("Delta copy failed — unchanged files will be missed this run", {
+          for (const unchanged of unchangedFiles) queueForExtraction(unchanged.filePath, unchanged.lang)
+          unchangedCount = 0
+          log.warn("Delta copy failed — falling back to full extraction of unchanged files", {
             error: err instanceof Error ? err.message : String(err),
           })
         }
@@ -627,6 +628,42 @@ export class Ingestor {
             failureSummary.push(`${lang}: extraction failed for ${filePath} (see log)`)
           }
         }
+      }
+
+      // Raw relations are emitted by their source file. Reusing unchanged
+      // symbols without carrying their outgoing edges produced complete-looking
+      // delta snapshots with a silently amputated graph. Copy only relations
+      // whose SOURCE file is content-identical; destinations are rebound to
+      // whichever symbol versions now exist in the new snapshot.
+      if (deltaCopySucceeded && parentSnapshotId) {
+        const relationCopy = await db.query(
+          `INSERT INTO structural_relations (
+               relation_id, src_symbol_version_id, dst_symbol_version_id,
+               relation_type, strength, source, confidence, provenance
+           )
+           SELECT gen_random_uuid(), src_new.symbol_version_id, dst_new.symbol_version_id,
+                  sr.relation_type, sr.strength, sr.source, sr.confidence, sr.provenance
+           FROM structural_relations sr
+           JOIN symbol_versions src_old
+             ON src_old.symbol_version_id = sr.src_symbol_version_id AND src_old.snapshot_id = $1
+           JOIN files src_file_old ON src_file_old.file_id = src_old.file_id
+           JOIN files src_file_new
+             ON src_file_new.snapshot_id = $2
+            AND src_file_new.path = src_file_old.path
+            AND src_file_new.content_hash = src_file_old.content_hash
+           JOIN symbol_versions src_new
+             ON src_new.snapshot_id = $2 AND src_new.symbol_id = src_old.symbol_id
+           JOIN symbol_versions dst_old
+             ON dst_old.symbol_version_id = sr.dst_symbol_version_id AND dst_old.snapshot_id = $1
+           JOIN symbol_versions dst_new
+             ON dst_new.snapshot_id = $2 AND dst_new.symbol_id = dst_old.symbol_id
+           ON CONFLICT (src_symbol_version_id, dst_symbol_version_id, relation_type)
+           DO UPDATE SET
+             confidence = GREATEST(structural_relations.confidence, EXCLUDED.confidence),
+             strength = GREATEST(structural_relations.strength, EXCLUDED.strength)`,
+          [parentSnapshotId, snapshotId],
+        )
+        relationsExtracted += relationCopy.rowCount ?? 0
       }
 
       // Determine extraction health BEFORE running post-extraction analysis.
@@ -1175,8 +1212,8 @@ export class Ingestor {
       const pythonCommand = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3")
       const result = await execFileAsync(pythonCommand, [extractorPath, filePath], {
         cwd: repoPath,
-        timeout: ingestionConfig.pythonTimeout,
-        maxBuffer: 1_048_576,
+        timeout: PYTHON_TIMEOUT_MS,
+        maxBuffer: MAX_PYTHON_OUTPUT_BYTES,
         encoding: "utf-8",
       })
 
@@ -1536,6 +1573,10 @@ export class Ingestor {
       const repoResult = await db.query(`SELECT base_path FROM repositories WHERE repo_id = $1`, [repoId])
       const basePath = optionalStringField(firstRow(repoResult), "base_path")
       if (!basePath) throw new Error(`Repository base path not configured for repo: ${repoId}`)
+      // Validate and canonicalize the entire change set before deleting any
+      // indexed data. One malicious/invalid late entry must not leave earlier
+      // files partially invalidated.
+      changedPaths = this.normalizeChangedPaths(basePath, changedPaths)
 
       let symbolsUpdated = 0
       let relationsUpdated = 0
@@ -1813,6 +1854,22 @@ export class Ingestor {
         }
       }
 
+      // Incremental invalidation deletes semantic vectors through the
+      // symbol_versions foreign key. Rebuild the snapshot corpus after all
+      // changed symbols are re-created; otherwise edited symbols disappear
+      // from semantic search and the stored IDF corpus becomes stale.
+      if (changedPaths.length > 0) {
+        try {
+          const embedded = await semanticEngine.batchEmbedSnapshot(snapshotId)
+          log.info("Incremental: semantic embeddings rebuilt", { snapshotId, embedded })
+        } catch (err) {
+          log.warn("Incremental semantic embedding failed (non-fatal)", {
+            snapshotId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+      }
+
       // 5. Re-populate test artifacts for affected files
       const allSvRows = await coreDataService.getSymbolVersionsForSnapshot(snapshotId)
       await this.populateTestArtifacts(allSvRows, snapshotId, repoId)
@@ -1955,6 +2012,39 @@ export class Ingestor {
   private resolveSafePath(basePath: string, filePath: string): string {
     const safePath = resolvePathWithinBase(basePath, filePath, { allowMissing: true })
     return safePath.existed ? safePath.realPath : safePath.resolvedPath
+  }
+
+  private normalizeChangedPaths(basePath: string, changedPaths: string[]): string[] {
+    if (!Array.isArray(changedPaths) || changedPaths.length > MAX_INCREMENTAL_PATHS) {
+      throw new Error(`changedPaths must contain at most ${MAX_INCREMENTAL_PATHS} repository-relative paths`)
+    }
+    if (changedPaths.length === 0) return []
+    const normalized: string[] = []
+    const seen = new Set<string>()
+    for (const rawPath of changedPaths) {
+      if (typeof rawPath !== "string" || rawPath.length === 0 || rawPath.length > 2000 ||
+          path.isAbsolute(rawPath) || path.win32.isAbsolute(rawPath)) {
+        throw new Error("changedPaths contains an invalid or absolute path")
+      }
+      const portableInput = rawPath.replace(/\\/g, "/")
+      const directorySegments = portableInput.split("/").slice(0, -1)
+      if (directorySegments.some((segment) => !segment || segment === "." || segment === ".." ||
+          segment.startsWith(".") || SKIP_DIRS.has(segment))) {
+        throw new Error("changedPaths contains a skipped or unsafe directory")
+      }
+      const safePath = resolvePathWithinBase(basePath, portableInput, { allowMissing: true })
+      const candidate = safePath.existed ? safePath.realPath : safePath.resolvedPath
+      const relativePath = toPortableRelativePath(path.relative(safePath.realBase, candidate))
+      if (!relativePath || relativePath === ".." || relativePath.startsWith("../")) {
+        throw new Error("changedPaths contains a path outside the repository")
+      }
+      const dedupeKey = process.platform === "win32" ? relativePath.toLowerCase() : relativePath
+      if (!seen.has(dedupeKey)) {
+        seen.add(dedupeKey)
+        normalized.push(relativePath)
+      }
+    }
+    return normalized
   }
 
   private async findTsconfig(repoPath: string): Promise<string | null> {

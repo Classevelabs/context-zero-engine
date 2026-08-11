@@ -43,7 +43,30 @@ export interface ScanResult {
 }
 
 /** Files are read and matched this many at a time. */
-const BATCH_SIZE = 50
+const BATCH_SIZE = 16
+/** Indexed files can change after ingestion; never read an unbounded replacement. */
+const MAX_SCAN_FILE_BYTES = 2 * 1024 * 1024
+
+async function readBoundedFile(filePath: string): Promise<string> {
+  const handle = await fsp.open(filePath, "r")
+  try {
+    const stat = await handle.stat()
+    if (!stat.isFile()) throw new Error("indexed path is not a regular file")
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_SCAN_FILE_BYTES) {
+      throw new Error("indexed file exceeds search size limit")
+    }
+    const data = Buffer.alloc(stat.size)
+    let offset = 0
+    while (offset < data.length) {
+      const { bytesRead } = await handle.read(data, offset, data.length - offset, offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+    }
+    return data.subarray(0, offset).toString("utf8")
+  } finally {
+    await handle.close()
+  }
+}
 
 /**
  * Scan `files` for lines matching the pattern.
@@ -75,7 +98,7 @@ export async function scanFiles(
         const fileMatches: SearchMatch[] = []
         try {
           const safePath = resolvePathWithinBase(realBase, filePath)
-          const content = await fsp.readFile(safePath.realPath, "utf-8")
+          const content = await readBoundedFile(safePath.realPath)
           const lines = content.split("\n")
 
           for (let i = 0; i < lines.length; i++) {

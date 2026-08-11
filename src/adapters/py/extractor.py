@@ -21,6 +21,8 @@ import re
 import os
 from typing import List, Dict, Optional, Any, Set, Tuple
 
+MAX_SOURCE_BYTES = 5 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Behavior pattern definitions
@@ -941,17 +943,24 @@ def extract(filepath: str) -> Dict[str, Any]:
     uncertainty_flags: List[str] = []
 
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            source_code = f.read()
+        # Check and read through the same open handle. A separate getsize()
+        # check followed by read() allowed a post-check replacement/growth race
+        # to consume unbounded memory.
+        with open(filepath, "rb") as f:
+            stat = os.fstat(f.fileno())
+            if stat.st_size > MAX_SOURCE_BYTES:
+                return _empty_result(["source_too_large"])
+            raw_source = f.read(MAX_SOURCE_BYTES + 1)
+        if len(raw_source) > MAX_SOURCE_BYTES:
+            return _empty_result(["source_too_large"])
+    except OSError:
+        return _empty_result(["file_read_error"])
+
+    try:
+        source_code = raw_source.decode("utf-8")
     except UnicodeDecodeError:
-        # Try with latin-1 fallback
-        try:
-            with open(filepath, "r", encoding="latin-1") as f:
-                source_code = f.read()
-            uncertainty_flags.append("encoding_fallback")
-        except Exception:
-            print(f"Error: Cannot read file {filepath}", file=sys.stderr)
-            return _empty_result(["file_read_error"])
+        source_code = raw_source.decode("latin-1")
+        uncertainty_flags.append("encoding_fallback")
 
     if not source_code.strip():
         return _empty_result([])
