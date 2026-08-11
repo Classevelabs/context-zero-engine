@@ -77,6 +77,18 @@ describe("Database config", () => {
     expect(getConnectionConfig().password).toBe("")
   })
 
+  test("does not partially parse malformed database ports", async () => {
+    process.env["DB_PORT"] = "6543garbage"
+    const { getConnectionConfig } = await import("../db-driver/config")
+    expect(getConnectionConfig().port).toBe(5432)
+  })
+
+  test("rejects database ports outside the TCP range", async () => {
+    process.env["DB_PORT"] = "70000"
+    const { getConnectionConfig } = await import("../db-driver/config")
+    expect(() => getConnectionConfig()).toThrow("port is out of range")
+  })
+
   test("rejects missing password in production", async () => {
     process.env["NODE_ENV"] = "production"
     const { getConnectionConfig } = await import("../db-driver/config")

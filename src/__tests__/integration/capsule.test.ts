@@ -330,6 +330,21 @@ describe("Capsule Integration — Token Budget Enforcement", () => {
     expect(capsule.token_estimate).toBeLessThanOrEqual(500)
   })
 
+  test.each([
+    ["negative", -50, 100],
+    ["NaN", Number.NaN, 12_000],
+    ["positive infinity", Number.POSITIVE_INFINITY, 12_000],
+    ["over maximum", 1_000_000, 100_000],
+  ])("normalizes %s token budgets before use and persistence", async (_label, requested, expected) => {
+    setupMockForMode("standard", { depCount: 0, callerCount: 0, testCount: 0 })
+
+    const capsule = await compiler.compile(`sv-${_label}`, "snap-001", "standard", requested as number)
+
+    const persistenceCall = mockQuery.mock.calls.find((call) => String(call[0]).includes("INSERT INTO capsule_compilations"))
+    expect(persistenceCall?.[1]?.[4]).toBe(expected)
+    expect(capsule.token_estimate).toBeLessThanOrEqual(expected as number)
+  })
+
   test("very small budget limits included context nodes", async () => {
     // With a tiny budget and many large dependencies, fewer nodes should be included
     setupMockForMode("standard", { depCount: 20, depSummarySize: 500 })

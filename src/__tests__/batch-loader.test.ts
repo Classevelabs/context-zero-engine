@@ -97,6 +97,30 @@ describe("BatchLoader — chunkedInQuery", () => {
     expect(mockQuery).toHaveBeenCalledTimes(3)
     expect(result.size).toBe(10001)
   })
+
+  test("fails closed and caches nothing when a later chunk query fails", async () => {
+    const ids = Array.from({ length: 5001 }, (_, i) => `sv-${i}`)
+    const firstChunk = ids.slice(0, 5000).map((id) => ({
+      behavior_profile_id: `bp-${id}`,
+      symbol_version_id: id,
+    }))
+    const loader = new BatchLoader()
+    mockQuery
+      .mockResolvedValueOnce({ rows: firstChunk, rowCount: 5000 })
+      .mockRejectedValueOnce(new Error("DB down"))
+
+    await expect(loader.loadBehavioralProfiles(ids)).rejects.toThrow("DB down")
+
+    mockQuery.mockReset()
+    mockQuery
+      .mockResolvedValueOnce({ rows: firstChunk, rowCount: 5000 })
+      .mockResolvedValueOnce({
+        rows: [{ behavior_profile_id: `bp-${ids[5000]}`, symbol_version_id: ids[5000] }],
+        rowCount: 1,
+      })
+    await expect(loader.loadBehavioralProfiles(ids)).resolves.toHaveProperty("size", 5001)
+    expect(mockQuery).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe("BatchLoader — SQL injection prevention", () => {

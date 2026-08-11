@@ -15,6 +15,9 @@ import type { ExtractedRelation, StructuralRelation } from "../types"
 const log = new Logger("structural-graph")
 
 export class StructuralGraphEngine {
+  private boundedLimit(limit: number): number {
+    return Number.isFinite(limit) ? Math.min(1_000, Math.max(1, Math.trunc(limit))) : 500
+  }
   /**
    * Resolve raw adapter relations into DB structural_relations.
    * Maps source_key → symbol_id via symbols table, then creates edges.
@@ -141,6 +144,7 @@ export class StructuralGraphEngine {
    * Get all structural relations for a given symbol version (both directions).
    */
   public async getRelationsForSymbol(symbolVersionId: string, limit = 500): Promise<StructuralRelation[]> {
+    limit = this.boundedLimit(limit)
     const result = await db.query(
       `
             SELECT relation_id, src_symbol_version_id, dst_symbol_version_id,
@@ -159,6 +163,7 @@ export class StructuralGraphEngine {
    * Get direct callers of a symbol.
    */
   public async getCallers(symbolVersionId: string, limit = 500): Promise<StructuralRelation[]> {
+    limit = this.boundedLimit(limit)
     const result = await db.query(
       `
             SELECT relation_id, src_symbol_version_id, dst_symbol_version_id,
@@ -177,6 +182,7 @@ export class StructuralGraphEngine {
    * Get direct callees of a symbol.
    */
   public async getCallees(symbolVersionId: string, limit = 500): Promise<StructuralRelation[]> {
+    limit = this.boundedLimit(limit)
     const result = await db.query(
       `
             SELECT relation_id, src_symbol_version_id, dst_symbol_version_id,

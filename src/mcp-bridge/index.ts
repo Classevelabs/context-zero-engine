@@ -25,6 +25,7 @@ import { runPendingMigrations } from "../db-driver/migrate"
 import { transactionalChangeEngine } from "../transactional-editor"
 import { features, logging, retention as retentionConfig, server as serverConfig } from "../config"
 import { runRetentionPolicy } from "../services/retention-service"
+import { isMutatingMcpTool } from "./security"
 import {
   handleResolveSymbol,
   handleGetSymbolDetails,
@@ -306,6 +307,25 @@ function registerTool(name: string, config: McpToolConfig, handler: McpToolHandl
 
   // Wrap the handler to inject tool-name-aware auth + rate limiting
   const wrappedHandler: McpToolHandler = async (args: Record<string, unknown>) => {
+    // Mutation is an operator decision made in the MCP process environment,
+    // outside model-controlled tool arguments. The stdio client/child-process
+    // boundary is trusted-local and is not a filesystem or network sandbox.
+    if (isMutatingMcpTool(name) && !features.enableMcpMutations) {
+      log.warn("Blocked MCP mutation because operator opt-in is disabled", { tool: name })
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              error:
+                "MCP mutation tools are disabled. A trusted local operator must set SCG_MCP_MUTATIONS_ENABLED=true.",
+            }),
+          },
+        ],
+        isError: true,
+      }
+    }
+
     // ── Authentication gate ──
     // Admin tools require admin secret when configured; otherwise fall back to MCP_SECRET.
     const isAdminTool = name.startsWith("scg_admin_")
@@ -1509,6 +1529,11 @@ registerTool(
 async function main(): Promise<void> {
   log.info("Starting ContextZero MCP bridge", { version: SERVER_VERSION })
 
+  if (features.enableMcpAuth && !MCP_SECRET) {
+    log.error("SCG_MCP_AUTH_ENABLED=true requires SCG_MCP_SECRET to be set. Refusing to start.")
+    process.exit(1)
+  }
+
   // Refuse to start unauthenticated in production; warn in dev/test.
   if (!MCP_SECRET) {
     if (process.env["NODE_ENV"] === "production") {
@@ -1518,7 +1543,17 @@ async function main(): Promise<void> {
       )
       process.exit(1)
     }
-    log.warn("MCP bridge running WITHOUT authentication. Set SCG_MCP_SECRET for production use.")
+    log.warn(
+      "MCP bridge running without a per-call secret on a trusted local stdio channel. " +
+        "Do not expose stdio through an untrusted transport; set SCG_MCP_AUTH_ENABLED=true and SCG_MCP_SECRET for defense in depth.",
+    )
+  }
+
+  if (features.enableMcpMutations) {
+    log.warn(
+      "MCP mutation tools are ENABLED. Use only for trusted repositories under a restricted service identity; " +
+        "the stdio bridge does not provide filesystem or network isolation.",
+    )
   }
 
   // Run pending migrations before accepting connections

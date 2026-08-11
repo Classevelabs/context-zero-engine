@@ -181,11 +181,11 @@ class DatabaseDriver {
 
   private constructor() {
     const connConfig = getConnectionConfig()
-    const safeInt = (raw: string | undefined, fallback: number): number => {
-      const parsed = parseInt(raw || String(fallback), 10)
-      return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+    const safeInt = (raw: string | undefined, fallback: number, minimum: number = 0): number => {
+      const parsed = raw === undefined || raw.trim() === "" ? fallback : Number(raw)
+      return Number.isSafeInteger(parsed) && parsed >= minimum ? parsed : fallback
     }
-    const maxConnections = safeInt(process.env["DB_MAX_CONNECTIONS"], 20)
+    const maxConnections = safeInt(process.env["DB_MAX_CONNECTIONS"], 20, 1)
     // 120s, not 30s: ingestion legitimately runs long statements (bulk symbol
     // lookups, relation resolution) on a busy/vacuum-lagged database, and a
     // canceled statement there costs a whole extraction batch. This is a
@@ -220,9 +220,9 @@ class DatabaseDriver {
     })
 
     this.circuit = new CircuitBreaker({
-      failureThreshold: safeInt(process.env["DB_CIRCUIT_FAILURE_THRESHOLD"], 5),
+      failureThreshold: safeInt(process.env["DB_CIRCUIT_FAILURE_THRESHOLD"], 5, 1),
       resetTimeoutMs: safeInt(process.env["DB_CIRCUIT_RESET_TIMEOUT_MS"], 30_000),
-      halfOpenMaxSuccesses: safeInt(process.env["DB_CIRCUIT_HALF_OPEN_MAX"], 3),
+      halfOpenMaxSuccesses: safeInt(process.env["DB_CIRCUIT_HALF_OPEN_MAX"], 3, 1),
     })
 
     this.pool.on("error", (err: Error) => {
@@ -281,6 +281,12 @@ class DatabaseDriver {
       })
     }
 
+    // A connection error after PostgreSQL accepted a write has an ambiguous
+    // outcome. Blindly replaying INSERT/UPDATE/DELETE can duplicate effects.
+    // Automatic retries are therefore limited to clearly read-only statements;
+    // callers that need retryable writes must provide an idempotency key or own
+    // the transaction/retry boundary explicitly.
+    const retryableRead = /^\s*(?:SELECT|SHOW)\b/i.test(text)
     return withRetry(
       async () => {
         const start = Date.now()
@@ -308,7 +314,7 @@ class DatabaseDriver {
           throw error
         }
       },
-      { maxRetries: 2, baseDelayMs: 200, label: "query" },
+      { maxRetries: retryableRead ? 2 : 0, baseDelayMs: 200, label: "query" },
     )
   }
 
@@ -442,6 +448,20 @@ class DatabaseDriver {
     return `SET LOCAL statement_timeout = ${ms}`
   }
 
+  private validatedConflictClause(conflict: string | undefined): string {
+    if (conflict === undefined || conflict.trim().length === 0) return ""
+    const trimmed = conflict.trim()
+    const identifier = "[A-Za-z_][A-Za-z0-9_]*"
+    const target = `\\(\\s*${identifier}(?:\\s*,\\s*${identifier})*\\s*\\)`
+    const doNothing = new RegExp(`^ON\\s+CONFLICT(?:\\s*${target})?\\s+DO\\s+NOTHING$`, "i")
+    if (!doNothing.test(trimmed)) {
+      throw new Error(
+        "bulkInsert: conflict must be ON CONFLICT [(column, ...)] DO NOTHING using unquoted identifiers",
+      )
+    }
+    return ` ${trimmed}`
+  }
+
   public async batchInsert(statements: { text: string; params: unknown[] }[]): Promise<void> {
     await this.transaction(async (client) => {
       await client.query(this.bulkTimeoutSql())
@@ -465,9 +485,8 @@ class DatabaseDriver {
    * @param table             Target table name (validated identifier).
    * @param columns           Column names in row-order (validated identifiers).
    * @param rows              Each inner array MUST have `columns.length` items.
-   * @param options.conflict  Optional ON CONFLICT clause appended verbatim,
-   *                          e.g. `"ON CONFLICT (id) DO NOTHING"`. Caller is
-   *                          responsible for the validity of this clause.
+   * @param options.conflict  Optional narrowly validated ON CONFLICT ... DO
+   *                          NOTHING clause, e.g. `"ON CONFLICT (id) DO NOTHING"`.
    * @param options.client    Optional pg PoolClient to run inside an existing
    *                          transaction. If omitted, opens a single statement.
    * @returns                 Total number of rows inserted (per pg's rowCount).
@@ -478,6 +497,7 @@ class DatabaseDriver {
     rows: unknown[][],
     options: { conflict?: string; client?: PoolClient } = {},
   ): Promise<{ rowsInserted: number }> {
+    const conflictSql = this.validatedConflictClause(options.conflict)
     if (rows.length === 0) return { rowsInserted: 0 }
     if (columns.length === 0) {
       throw new Error("bulkInsert: columns must not be empty")
@@ -507,7 +527,6 @@ class DatabaseDriver {
     const maxRowsPerChunk = Math.max(1, Math.floor(MAX_PARAMS / colCount))
 
     const colList = columns.join(", ")
-    const conflictSql = options.conflict ? ` ${options.conflict}` : ""
     let totalInserted = 0
 
     const runStatement = async (chunk: unknown[][], client: PoolClient | DatabaseDriver): Promise<number> => {

@@ -1,17 +1,18 @@
 # Context Zero Engine — Benchmarks
 
-This document consolidates the benchmark runs used to validate ContextZero:
-a self-ingest run on the engine's own repository, a large-repository run on
-VS Code, and a multi-language run across seven well-known open-source
-projects. Every number here comes from a recorded run of the benchmark
-scripts in [`scripts/`](scripts/), and anyone can reproduce the methodology
-on their own machine.
+This document records historical, author-reported benchmark runs: a
+self-ingest run, a large-repository run on VS Code, and a multi-language run
+across seven open-source projects. The benchmark scripts are in [`scripts/`](scripts/),
+but the original raw machine-readable outputs and database snapshots are not
+committed. The tables are therefore historical claims and reproduction
+targets, not independently verifiable release evidence or guaranteed field
+performance.
 
 **Hardware note.** All measurements were taken on a typical mid-range
 developer laptop (quad-core x86-64) with a local PostgreSQL 16 instance and
-Node.js 22 — no server hardware, no clustering. Absolute timings will vary
-with disk, CPU, and database configuration; the reduction ratios are the
-durable signal.
+Node.js 22 — no server hardware, no clustering. Absolute timings and reduction
+ratios can vary with corpus revision, selected symbols, disk, CPU, database
+configuration, and current engine version.
 
 ---
 
@@ -33,7 +34,7 @@ durable signal.
 
 ---
 
-## Headline Results
+## Historical Headline Results
 
 | Benchmark | Scale | Exact-symbol reduction | Exact-symbol savings | Whole-source reduction |
 |---|---|---:|---:|---:|
@@ -191,7 +192,7 @@ From an instrumented full-analysis run on the engine's own codebase:
 
 ---
 
-## Effect-Analysis Accuracy (v2.5.0)
+## Fixture-Suite Effect-Analysis Accuracy (v2.5.0)
 
 v2.5.0 replaced pattern-guessed external effects with a type-resolved
 analyzer for TypeScript/JavaScript (every call resolved through the
@@ -229,12 +230,16 @@ Honest framing:
 
 ## Real-Project Benchmark Refresh (v2.5.0, 2026-07-10)
 
-Re-measured token savings with the v2.5.0 engine on four real, private,
+Author-reported token savings with the v2.5.0 engine on four real, private,
 actively developed repositories (same methodology as above: `ceil(bytes/4)`
 token policy, 8 real symbols per repository, exact-symbol grep-and-read
 baseline vs one strict context capsule per symbol). Run on a freshly
 compacted local PostgreSQL 16; the repositories are ClassEve production
 codebases, not toy corpora.
+
+Because those repositories and raw run outputs are private and absent from
+this repository, these four rows cannot be independently reproduced from the
+public checkout. They must not be used as release-gate evidence.
 
 | Repository | Files indexed | Symbols | Exact-symbol baseline (tokens) | ContextZero (tokens) | Reduction | Savings |
 |---|---:|---:|---:|---:|---:|---:|
@@ -274,6 +279,6 @@ npx ts-node scripts/bench-capsule.ts
 npx ts-node scripts/multi-language-bench-report.ts ./benchmarks
 ```
 
-Numbers on your machine will differ in absolute terms (disk, CPU,
-PostgreSQL configuration); the token-reduction ratios should be closely
-reproducible because the token policy is deterministic.
+Numbers on your machine may differ in both absolute terms and reduction ratios.
+The token-counting policy is deterministic, but corpus versions, selected
+symbols, ingestion results, and engine changes all affect the comparison.

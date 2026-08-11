@@ -84,6 +84,10 @@ describe("Transactional recovery", () => {
         rowCount: 1,
       })
       .mockResolvedValueOnce({
+        rows: [{ txn_id: "txn-001", state: "failed" }],
+        rowCount: 1,
+      })
+      .mockResolvedValueOnce({
         rows: [],
         rowCount: 0,
       })
@@ -95,6 +99,29 @@ describe("Transactional recovery", () => {
       scanned: 1,
       recovered: 0,
       recovery_failed: 1,
+      cleaned_terminal_backups: 0,
+    })
+  })
+
+  test("does not count a transaction completed by another recovery worker as failed", async () => {
+    const { transactionalChangeEngine } = await import("../transactional-editor")
+    jest.spyOn(transactionalChangeEngine, "rollback").mockRejectedValueOnce(new Error("state is already terminal"))
+
+    mockQuery
+      .mockResolvedValueOnce({
+        rows: [{ txn_id: "txn-raced", state: "failed", backup_count: "1" }],
+        rowCount: 1,
+      })
+      .mockResolvedValueOnce({
+        rows: [{ txn_id: "txn-raced", state: "rolled_back" }],
+        rowCount: 1,
+      })
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
+    await expect(transactionalChangeEngine.recoverStaleTransactions(60_000, 10)).resolves.toEqual({
+      scanned: 1,
+      recovered: 1,
+      recovery_failed: 0,
       cleaned_terminal_backups: 0,
     })
   })

@@ -116,8 +116,10 @@ ensure_docker_env() {
     echo "Using existing .env: $env_path"
     local db_password
     local api_keys
+    local admin_api_keys
     db_password="$(get_env_file_value "$env_path" "DB_PASSWORD")"
     api_keys="$(get_env_file_value "$env_path" "SCG_API_KEYS")"
+    admin_api_keys="$(get_env_file_value "$env_path" "SCG_ADMIN_API_KEYS")"
     if [[ -z "$db_password" || "$db_password" =~ ^([Pp][Oo][Ss][Tt][Gg][Rr][Ee][Ss]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Cc][Hh][Aa][Nn][Gg][Ee][Mm][Ee]|change_me_before_deploying|change-me-before-deploying|change_me_before_running|change-me-before-running)$ ]]; then
       echo "Existing .env has a missing or weak DB_PASSWORD. Replace it with a strong generated value before Docker startup." >&2
       exit 1
@@ -134,18 +136,42 @@ ensure_docker_env() {
         echo "Existing .env has an SCG_API_KEYS entry shorter than 32 characters." >&2
         exit 1
       fi
+    done
+    if [[ -z "$admin_api_keys" || "$admin_api_keys" == "$api_keys" ]]; then
+      echo "Existing .env must define distinct SCG_ADMIN_API_KEYS for Docker production mode." >&2
+      exit 1
     fi
+    IFS=',' read -ra admin_key_parts <<< "$admin_api_keys"
+    for key in "${admin_key_parts[@]}"; do
+      key="${key#"${key%%[![:space:]]*}"}"
+      key="${key%"${key##*[![:space:]]}"}"
+      if [[ ${#key} -lt 32 ]]; then
+        echo "Existing .env has an SCG_ADMIN_API_KEYS entry shorter than 32 characters." >&2
+        exit 1
+      fi
+      for regular_key in "${key_parts[@]}"; do
+        regular_key="${regular_key#"${regular_key%%[![:space:]]*}"}"
+        regular_key="${regular_key%"${regular_key##*[![:space:]]}"}"
+        if [[ "$key" == "$regular_key" ]]; then
+          echo "SCG_ADMIN_API_KEYS must not reuse any SCG_API_KEYS credential." >&2
+          exit 1
+        fi
+      done
+    done
     return
   fi
 
   local api_key
   local db_password
+  local admin_api_key
   api_key="$(new_hex_secret)"
   db_password="$(new_hex_secret)"
+  admin_api_key="$(new_hex_secret)"
   cat > "$env_path" <<EOF
 # ContextZero Docker bootstrap configuration
 DB_PASSWORD=$db_password
 SCG_API_KEYS=$api_key
+SCG_ADMIN_API_KEYS=$admin_api_key
 SCG_REPOS_PATH=.
 SCG_ALLOWED_BASE_PATHS=/repos
 SCG_MAX_FILES_PER_REPO=20000
@@ -217,7 +243,7 @@ install_python_dependency
 ensure_postgres_best_effort
 
 step "Installing Node dependencies"
-npm install
+npm ci
 
 step "Running ContextZero setup"
 if [[ "$NO_MIGRATE" == "true" ]]; then

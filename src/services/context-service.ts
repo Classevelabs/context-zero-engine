@@ -9,6 +9,7 @@
 
 import { db } from "../db-driver"
 import { blastRadiusEngine } from "../analysis-engine/blast-radius"
+import { UserFacingError } from "../types"
 
 // ────────── Result Types ──────────
 
@@ -61,6 +62,24 @@ export interface SmartContextOptions {
 // ────────── Constants ──────────
 
 const CHARS_PER_TOKEN = 4
+const MIN_TOKEN_BUDGET = 100
+const MAX_TOKEN_BUDGET = 100_000
+const MAX_TARGET_SYMBOLS = 20
+const MAX_CONTEXT_SYMBOLS = 500
+const MAX_OMITTED_DETAILS = 500
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / CHARS_PER_TOKEN)
+}
+
+function fitSourceToBudget(source: string, availableTokens: number): string {
+  if (availableTokens <= 0) return ""
+  if (estimateTokens(source) <= availableTokens) return source
+  const maxChars = availableTokens * CHARS_PER_TOKEN
+  const marker = "\n/* truncated to context token budget */"
+  if (maxChars <= marker.length) return source.slice(0, maxChars)
+  return source.slice(0, maxChars - marker.length) + marker
+}
 
 // ────────── Service Function ──────────
 
@@ -79,12 +98,27 @@ export async function compileSmartContext(
   snapshotId: string,
   options: SmartContextOptions = {},
 ): Promise<SmartContextResult> {
-  const tokenBudget = options.tokenBudget ?? 20_000
-  const depth = Math.min(Math.max(options.depth ?? 2, 1), 5)
+  if (typeof taskDescription !== "string" || taskDescription.trim().length === 0 || taskDescription.length > 2_000) {
+    throw UserFacingError.badRequest("Task description must contain 1-2000 characters")
+  }
+  if (!Array.isArray(targetSymbolVersionIds) || targetSymbolVersionIds.length === 0 ||
+      targetSymbolVersionIds.length > MAX_TARGET_SYMBOLS ||
+      targetSymbolVersionIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 128)) {
+    throw UserFacingError.badRequest(`Target symbols must contain 1-${MAX_TARGET_SYMBOLS} valid identifiers`)
+  }
+  const targetIds = [...new Set(targetSymbolVersionIds)]
+  const rawBudget = options.tokenBudget
+  const tokenBudget = typeof rawBudget === "number" && Number.isFinite(rawBudget)
+    ? Math.min(MAX_TOKEN_BUDGET, Math.max(MIN_TOKEN_BUDGET, Math.trunc(rawBudget)))
+    : 20_000
+  const rawDepth = options.depth
+  const depth = typeof rawDepth === "number" && Number.isFinite(rawDepth)
+    ? Math.min(Math.max(Math.trunc(rawDepth), 1), 5)
+    : 2
   let usedTokens = 0
 
   // Step 1: Load target symbols with source
-  const targetPH = targetSymbolVersionIds.map((_, i) => `$${i + 1}`).join(",")
+  const targetPH = targetIds.map((_, i) => `$${i + 1}`).join(",")
   const targetsResult = await db.query(
     `
         SELECT sv.symbol_version_id, s.canonical_name, s.kind, sv.signature,
@@ -95,12 +129,13 @@ export async function compileSmartContext(
         JOIN files f ON f.file_id = sv.file_id
         WHERE sv.symbol_version_id IN (${targetPH})
     `,
-    targetSymbolVersionIds,
+    targetIds,
   )
 
   const targets: TargetSymbol[] = (targetsResult.rows as Record<string, unknown>[]).map((t) => {
-    const source = (t.body_source as string | null) ?? "[source unavailable]"
-    const tokens = Math.ceil(source.length / CHARS_PER_TOKEN)
+    const rawSource = (t.body_source as string | null) ?? "[source unavailable]"
+    const source = fitSourceToBudget(rawSource, tokenBudget - usedTokens)
+    const tokens = estimateTokens(source)
     usedTokens += tokens
     return {
       symbol_version_id: (t.symbol_version_id as string) ?? "",
@@ -116,7 +151,7 @@ export async function compileSmartContext(
   })
 
   // Step 2: Compute blast radius
-  const blastReport = await blastRadiusEngine.computeBlastRadius(snapshotId, targetSymbolVersionIds, depth)
+  const blastReport = await blastRadiusEngine.computeBlastRadius(snapshotId, targetIds, depth)
 
   // Step 3: Collect all impacts, deduplicate by symbol_id, keep highest severity
   const allImpacts = [
@@ -171,10 +206,12 @@ export async function compileSmartContext(
   for (const impact of rankedImpacts) {
     const meta = impactSourceMap.get(impact.symbol_id)
     const source = (meta?.body_source as string | null | undefined) ?? null
-    const tokens = source ? Math.ceil(source.length / CHARS_PER_TOKEN) : 0
+    const tokens = source ? estimateTokens(source) : 0
 
-    if (usedTokens + tokens > tokenBudget) {
-      omitted.push(`${impact.symbol_name} (${impact.severity} ${impact.impact_type})`)
+    if (contextSymbols.length >= MAX_CONTEXT_SYMBOLS || usedTokens + tokens > tokenBudget) {
+      if (omitted.length < MAX_OMITTED_DETAILS) {
+        omitted.push(`${impact.symbol_name} (${impact.severity} ${impact.impact_type})`)
+      }
       continue
     }
 
@@ -193,6 +230,10 @@ export async function compileSmartContext(
     usedTokens += tokens
   }
 
+  if (rankedImpacts.length - contextSymbols.length > omitted.length) {
+    omitted.push(`[${rankedImpacts.length - contextSymbols.length - omitted.length} additional symbols omitted]`)
+  }
+
   return {
     task: taskDescription,
     targets,
@@ -205,7 +246,7 @@ export async function compileSmartContext(
     token_usage: {
       budget: tokenBudget,
       used: usedTokens,
-      remaining: tokenBudget - usedTokens,
+      remaining: Math.max(0, tokenBudget - usedTokens),
     },
   }
 }

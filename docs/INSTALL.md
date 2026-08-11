@@ -12,7 +12,7 @@ For operating guidance after installation, see `docs/OPERATIONS.md`.
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/classeve-public/context-zero-engine.git context-zero-engine
+git clone https://github.com/Classevelabs/context-zero-engine.git context-zero-engine
 cd context-zero-engine
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -Client claude
 ```
@@ -20,7 +20,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -Cli
 macOS or Linux:
 
 ```bash
-git clone https://github.com/classeve-public/context-zero-engine.git context-zero-engine
+git clone https://github.com/Classevelabs/context-zero-engine.git context-zero-engine
 cd context-zero-engine
 scripts/bootstrap.sh --client claude
 ```
@@ -56,7 +56,7 @@ Manual Docker path:
 
 ```bash
 cp .env.docker.example .env
-# Edit DB_PASSWORD and SCG_API_KEYS to strong values.
+# Edit DB_PASSWORD, SCG_API_KEYS, and distinct SCG_ADMIN_API_KEYS values.
 docker compose up -d --build
 ```
 
@@ -90,6 +90,13 @@ npm run mcp:install -- --client all --dry-run
 
 The installer is idempotent and creates timestamped backups before changing existing config files.
 When `.env` exists, the installer writes `CONTEXTZERO_ENV_FILE=<repo>/.env` into the client config instead of duplicating database credentials.
+
+The MCP server is a trusted local stdio child process. Read tools are enabled
+by default; set `SCG_MCP_MUTATIONS_ENABLED=true` only when a local operator
+intends to allow ingestion or editing. Validation commands also require
+`SCG_ALLOW_UNSANDBOXED_EXECUTION=true` and have no filesystem/network
+isolation, so use them only for trusted repositories under a restricted OS
+account.
 
 Supported config targets:
 
