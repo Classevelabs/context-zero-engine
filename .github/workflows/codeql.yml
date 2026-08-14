@@ -1,0 +1,52 @@
+name: CodeQL
+
+# The engine takes a repository it did not write, parses it, and builds SQL from
+# what it finds. Every one of those steps is a place where hostile input becomes
+# a query, a path, or a command. Taint analysis is what looks for that class of
+# mistake across the whole tree rather than in the files someone thought to test.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "42 4 * * 3"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyse ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    permissions:
+      security-events: write
+
+    strategy:
+      # One language failing should not hide the other language's findings.
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, python]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-and-quality
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
