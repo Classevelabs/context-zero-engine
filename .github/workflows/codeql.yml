@@ -45,6 +45,12 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-and-quality
+          # Same reasoning as the other repos: tests are not shipped, and 70-odd
+          # unused-variable notes from them hide the handful in src that matter.
+          config: |
+            paths-ignore:
+              - 'src/__tests__/**'
+              - '**/*.test.ts'
 
       - name: Analyse
         uses: github/codeql-action/analyze@v3
