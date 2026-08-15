@@ -544,8 +544,10 @@ async function ingestTarget(target: BenchTarget): Promise<TargetResult> {
 
 async function adapterSmoke(): Promise<SmokeRow[]> {
   const rows: SmokeRow[] = []
-  const tempDir = path.join(os.tmpdir(), `contextzero-smoke-${Date.now()}`)
-  await fsp.mkdir(tempDir, { recursive: true })
+  // mkdtemp rather than a Date.now() suffix: two runs in the same millisecond
+  // collide, and a predictable name under a shared /tmp is one a local user can
+  // pre-create as a symlink. Matches how the tests make their scratch dirs.
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "contextzero-smoke-"))
 
   const tsPath = path.join(tempDir, "sample.ts")
   await fsp.writeFile(tsPath, "export function add(a: number, b: number): number { return a + b; }\n", "utf8")
