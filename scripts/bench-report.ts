@@ -795,8 +795,8 @@ async function writeReport(data: {
         `\`${cmd.command}\``,
         cmd.exit_code === 0 ? "pass" : `fail (${cmd.exit_code ?? "null"})`,
         `${formatNumber(cmd.elapsed_ms)} ms`,
-        cmd.stdout_tail ? `\`${cmd.stdout_tail.replace(/\|/g, "\\|")}\`` : "",
-        cmd.stderr_tail ? `\`${cmd.stderr_tail.replace(/\|/g, "\\|")}\`` : "",
+        cmd.stdout_tail ? `\`${cmd.stdout_tail.replace(/\\/g, "\\\\").replace(/\|/g, "\\|")}\`` : "",
+        cmd.stderr_tail ? `\`${cmd.stderr_tail.replace(/\\/g, "\\\\").replace(/\|/g, "\\|")}\`` : "",
       ]),
     ),
   )
@@ -936,7 +936,7 @@ async function writeReport(data: {
         ["Stdio bridge starts", data.mcp.ok ? "yes" : "no"],
         ["Tools listed", formatNumber(data.mcp.tools)],
         ["Handshake and tools/list time", `${formatNumber(data.mcp.elapsed_ms)} ms`],
-        ["Stderr tail", data.mcp.stderr_tail ? `\`${data.mcp.stderr_tail.replace(/\|/g, "\\|")}\`` : ""],
+        ["Stderr tail", data.mcp.stderr_tail ? `\`${data.mcp.stderr_tail.replace(/\\/g, "\\\\").replace(/\|/g, "\\|")}\`` : ""],
       ],
     ),
   )

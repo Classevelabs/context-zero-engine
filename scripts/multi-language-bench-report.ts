@@ -238,7 +238,7 @@ function markdownTable(headers: string[], rows: Array<Array<string | number>>): 
   const header = `| ${headers.join(" | ")} |`
   const divider = `| ${headers.map(() => "---").join(" | ")} |`
   const body = rows.map(
-    (row) => `| ${row.map((cell) => String(cell).replace(/\n/g, "<br>").replace(/\|/g, "\\|")).join(" | ")} |`,
+    (row) => `| ${row.map((cell) => String(cell).replace(/\n/g, "<br>").replace(/\\/g, "\\\\").replace(/\|/g, "\\|")).join(" | ")} |`,
   )
   return [header, divider, ...body].join("\n")
 }
