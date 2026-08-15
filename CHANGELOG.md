@@ -7,6 +7,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased] — Ingestion architecture
 
+### Security
+
+- **A read-only API key could reach the admin-only HTTP routes.** Express matches
+  routes case-insensitively and ignores a trailing slash, but
+  `requirePrivilegedHttpRoute` compared the raw `req.path` against an exact
+  allowlist. `POST /scg_apply_patch/` and `POST /SCG_APPLY_PATCH` therefore
+  reached the same handler as `/scg_apply_patch` with the admin check skipped —
+  patch application, commits, rollbacks and repository registration were
+  reachable with an ordinary key. The gate now matches on the same normalised
+  form Express routed on. The `/scg_admin_*` routes were never exposed: they
+  carry their own `requireAdminKey` behind the global gate.
+
+- **A dangling symlink could be written through under `allowMissing`.**
+  `existsSync` stats through a link, so a dangling one read as absent and the
+  nearest-existing-ancestor walk stepped straight over it, returning a path whose
+  link component was never resolved. Recreating the target afterwards turned that
+  into a write outside the repository base. The walk now uses `lstat`, so it
+  stops at the link and the containment check sees the unresolved target.
+
+- Patch backups take one file handle and `fstat` through it rather than calling
+  `stat` and `readFile` on the name separately, so the regular-file and size
+  checks describe the same object the bytes come from.
+
+- `scripts/setup.mjs` and `scripts/doctor.mjs` wrote credentials to `.env` with
+  `"` escaped as `\"`, which dotenv does not unescape — a `DB_PASSWORD`
+  containing a quote came back different from the one that was typed. Values are
+  now placed in a quote style dotenv reads back literally, and a value that
+  cannot be represented is refused instead of silently corrupted.
+
 ### Changed
 
 - **LSH bands moved onto `semantic_vectors` as an array; the `lsh_bands` table

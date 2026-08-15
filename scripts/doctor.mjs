@@ -49,8 +49,20 @@ function parseEnvFile(filePath) {
   return parsed
 }
 
+// dotenv strips one layer of quotes and expands \n and \r inside double quotes.
+// It does not unescape \" or \\, so the previous `"${value.replace(/"/g,'\\"')}"`
+// wrote a password containing a quote back out as the literal \" — the engine
+// then authenticated with a different string than the operator typed. Single
+// quotes are taken literally by dotenv and are the only container that can hold
+// a double quote, so pick the container instead of escaping inside it.
 function escapeEnvValue(value) {
-  return /[\s#"]/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value
+  if (/[\n\r]/.test(value)) {
+    throw new Error("value contains a newline and cannot be written to .env")
+  }
+  if (!/[\s#"'\\]/.test(value)) return value
+  if (!value.includes("'")) return `'${value}'`
+  if (!value.includes('"')) return `"${value}"`
+  throw new Error("value contains both ' and \" and cannot be written to .env — set it by hand")
 }
 
 function createDefaultEnvFile() {
@@ -79,7 +91,12 @@ function createDefaultEnvFile() {
 }
 
 if (cliArgs.has("--fix") && !fs.existsSync(envPath)) {
-  createDefaultEnvFile()
+  try {
+    createDefaultEnvFile()
+  } catch (error) {
+    console.error(`Could not write ${envPath}: ${error instanceof Error ? error.message : String(error)}`)
+    process.exit(1)
+  }
 }
 
 const fileEnv = parseEnvFile(envPath)

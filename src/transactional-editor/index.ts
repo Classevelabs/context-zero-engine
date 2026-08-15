@@ -1241,20 +1241,29 @@ export class TransactionalChangeEngine {
     fullPath: string,
     displayPath: string,
   ): Promise<{ content: string | null; mode: number }> {
-    let fileStat
+    // stat() and readFile() are two independent name lookups, so a swap between
+    // them defeats both guards below — the size and regular-file checks describe
+    // whatever was there first, and the bytes come from whatever is there second.
+    // One handle, then fstat and read through it, so both describe one object.
+    let handle: Awaited<ReturnType<typeof fsp.open>>
     try {
-      fileStat = await fsp.stat(fullPath)
+      handle = await fsp.open(fullPath, "r")
     } catch (err) {
       if (this.isMissingPathError(err)) return { content: null, mode: 0o600 }
       throw err
     }
-    if (!fileStat.isFile()) {
-      throw new Error(`Patch target is not a regular file: ${displayPath}`)
+    try {
+      const fileStat = await handle.stat()
+      if (!fileStat.isFile()) {
+        throw new Error(`Patch target is not a regular file: ${displayPath}`)
+      }
+      if (fileStat.size > MAX_BACKUP_FILE_SIZE) {
+        throw new Error(`File too large for backup: ${displayPath}`)
+      }
+      return { content: await handle.readFile("utf-8"), mode: fileStat.mode & 0o777 }
+    } finally {
+      await handle.close()
     }
-    if (fileStat.size > MAX_BACKUP_FILE_SIZE) {
-      throw new Error(`File too large for backup: ${displayPath}`)
-    }
-    return { content: await fsp.readFile(fullPath, "utf-8"), mode: fileStat.mode & 0o777 }
   }
 
   private async ensureSafeParent(basePath: string, filePath: string, expectedFullPath: string): Promise<void> {

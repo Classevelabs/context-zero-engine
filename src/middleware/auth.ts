@@ -443,9 +443,28 @@ export function requireAdminKey(req: Request, res: Response, next: NextFunction)
   next()
 }
 
+/**
+ * Express matches routes case-insensitively and ignores a trailing slash unless
+ * told otherwise, so `/scg_apply_patch/` and `/SCG_APPLY_PATCH` reach the same
+ * handler as `/scg_apply_patch`. Comparing the raw path against the allowlist
+ * therefore waved those two spellings straight past the admin check while the
+ * route still ran — a read key could apply patches. The `/scg_admin_*` routes
+ * carry their own requireAdminKey and were never exposed; the paths in
+ * PRIVILEGED_HTTP_PATHS have only this gate, so it has to match on the same
+ * form Express routed on.
+ */
+function normalizeRoutePath(pathname: string): string {
+  let normalized = pathname.toLowerCase()
+  while (normalized.length > 1 && normalized.endsWith("/")) {
+    normalized = normalized.slice(0, -1)
+  }
+  return normalized
+}
+
 /** Apply the admin role boundary to every privileged HTTP operation. */
 export function requirePrivilegedHttpRoute(req: Request, res: Response, next: NextFunction): void {
-  if (!req.path.startsWith("/scg_admin_") && !PRIVILEGED_HTTP_PATHS.has(req.path)) {
+  const routePath = normalizeRoutePath(req.path)
+  if (!routePath.startsWith("/scg_admin_") && !PRIVILEGED_HTTP_PATHS.has(routePath)) {
     next()
     return
   }

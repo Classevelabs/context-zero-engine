@@ -36,7 +36,13 @@ export function resolveExistingPath(targetPath: string): string {
 
 function normalizePathForContainment(targetPath: string): string {
   let normalized = path.normalize(targetPath).replace(/\\/g, "/")
-  normalized = normalized.replace(/\/+$/, "")
+  // Trailing separators are stripped by index rather than with /\/+$/, which
+  // backtracks quadratically on a long run. normalize() collapses those runs
+  // first so it was never reachable, but containment is not the place to keep
+  // a sharp edge that only a second reading proves is blunt.
+  let end = normalized.length
+  while (end > 0 && normalized.charCodeAt(end - 1) === 47) end--
+  normalized = normalized.slice(0, end)
   if (normalized.length === 0) normalized = "/"
   if (/^[A-Za-z]:$/.test(normalized)) normalized += "/"
   return process.platform === "win32" ? normalized.toLowerCase() : normalized
@@ -50,10 +56,27 @@ export function isPathWithinBase(realBase: string, candidatePath: string): boole
   return candidate.startsWith(baseWithSeparator)
 }
 
+/**
+ * Existence test that does NOT follow symlinks.
+ *
+ * existsSync stats through the link, so a DANGLING symlink reads as absent.
+ * The ancestor walk then stepped straight over it, returned the base as the
+ * probe, and handed back a path whose link component was never resolved —
+ * recreating the target afterwards turns that into a write outside the base.
+ */
+function pathExistsWithoutFollowing(candidate: string): boolean {
+  try {
+    fs.lstatSync(candidate)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function findNearestExistingAncestor(targetPath: string): string {
   let current = targetPath
   for (;;) {
-    if (fs.existsSync(current)) {
+    if (pathExistsWithoutFollowing(current)) {
       return current
     }
     const parent = path.dirname(current)

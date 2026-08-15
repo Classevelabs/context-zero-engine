@@ -232,6 +232,31 @@ describe("Auth Middleware", () => {
     }
   })
 
+  test("holds the admin boundary against the spellings express also routes", async () => {
+    // Express matches case-insensitively and ignores a trailing slash, so each
+    // of these reaches the same handler as the canonical path. The gate used to
+    // compare the raw req.path, so a read key walked straight through.
+    const regular = "r".repeat(32)
+    process.env["SCG_API_KEYS"] = regular
+    process.env["SCG_ADMIN_API_KEYS"] = "a".repeat(32)
+    const { authMiddleware, requirePrivilegedHttpRoute } = await import("../middleware/auth")
+
+    for (const path of [
+      "/scg_apply_patch/",
+      "/SCG_APPLY_PATCH",
+      "/Scg_Apply_Patch",
+      "/SCG_APPLY_PATCH/",
+      "/scg_commit_change/",
+      "/SCG_ADMIN_CLEANUP_STALE",
+      "/scg_admin_cleanup_stale/",
+    ]) {
+      const call = createMockReqRes({ path, authorization: `Bearer ${regular}` })
+      authMiddleware(call.req as Request, call.res as Response, call.next as NextFunction)
+      requirePrivilegedHttpRoute(call.req as Request, call.res as Response, call.next as NextFunction)
+      expect(call.res.statusCode).toBe(403)
+    }
+  })
+
   test("does not elevate read routes to the admin role", async () => {
     const regular = "r".repeat(32)
     process.env["SCG_API_KEYS"] = regular

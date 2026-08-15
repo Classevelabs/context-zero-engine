@@ -127,6 +127,21 @@ describe("resolvePathWithinBase", () => {
     expect(() => resolvePathWithinBase(repoRoot, "escape/secret.txt")).toThrow("symlink escape")
   })
 
+  test("a DANGLING symlink parent cannot be written through under allowMissing", () => {
+    // existsSync() stats through the link, so a dangling one reads as absent and
+    // the ancestor walk stepped straight over it — the probe came back as the
+    // repo root, containment passed, and the caller was handed a path whose link
+    // component was never resolved. Recreating the target afterwards turns that
+    // handle into a write outside the repo.
+    const outsideDir = path.join(tempRoot, "outside-secrets")
+    fs.mkdirSync(outsideDir, { recursive: true })
+    const link = path.join(repoRoot, "escape")
+    symlinkDirectory(outsideDir, link)
+    fs.rmSync(outsideDir, { recursive: true, force: true }) // link now dangles
+
+    expect(() => resolvePathWithinBase(repoRoot, "escape/secret.txt", { allowMissing: true })).toThrow()
+  })
+
   test("allowMissing: true succeeds for non-existent file in valid dir", () => {
     const result = resolvePathWithinBase(repoRoot, "src/does-not-exist.ts", {
       allowMissing: true,
