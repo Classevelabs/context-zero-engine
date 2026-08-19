@@ -22,6 +22,7 @@ jest.mock("../config", () => ({
     snapshotMaxAgeDays: 90,
     maxSnapshotsPerRepo: 50,
     staleTransactionTimeoutMinutes: 60,
+    stuckIndexingTimeoutMinutes: 180,
     orphanCleanupEnabled: true,
     retentionIntervalMinutes: 360,
     retentionEnabled: true,
@@ -39,6 +40,7 @@ jest.mock("../logger", () => ({
 }))
 
 import {
+  cleanupStuckIndexingSnapshots,
   cleanupExpiredSnapshots,
   enforceSnapshotCap,
   cleanupStaleTransactions,
@@ -179,6 +181,9 @@ describe("runRetentionPolicy", () => {
   })
 
   it("acquires advisory lock, runs all phases, releases lock", async () => {
+    // Phase 0: cleanupStuckIndexingSnapshots
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
     // Phase 1: cleanupStaleTransactions
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
@@ -219,6 +224,9 @@ describe("runRetentionPolicy", () => {
   })
 
   it("isolates phase errors — failure in one does not abort others", async () => {
+    // Phase 0: stuck-indexing reap succeeds
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
     // Phase 1: stale cleanup FAILS
     mockQuery.mockRejectedValueOnce(new Error("DB timeout"))
 
@@ -312,5 +320,59 @@ describe("listStaleTransactions", () => {
     await listStaleTransactions(5)
 
     expect(mockQuery.mock.calls[0][1]?.[1]).toBe(5)
+  })
+})
+
+/**
+ * A snapshot abandoned mid-ingest must not stay unreadable forever.
+ *
+ * An ingest killed by sleep, OOM or Ctrl-C leaves its snapshot at 'indexing'
+ * with no process left to advance it. Nothing reaped that state, and the read
+ * guard correctly refuses to answer from a snapshot that claims to still be
+ * building — so the repository became permanently unreadable, with the only
+ * signal being a status nobody inspects.
+ */
+describe("cleanupStuckIndexingSnapshots", () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  it("marks snapshots stuck in 'indexing' past the timeout as failed", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ snapshot_id: "s1" }, { snapshot_id: "s2" }], rowCount: 2 })
+
+    const reaped = await cleanupStuckIndexingSnapshots()
+
+    expect(reaped).toBe(2)
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain("UPDATE snapshots")
+    // 'failed', not deleted: the row is evidence an ingest was attempted, and
+    // the read guard turns 'failed' into an actionable error. Deleting would
+    // return the caller to a silent "no data".
+    expect(sql).toContain("index_status = 'failed'")
+    expect(sql).toContain("index_status = 'indexing'")
+    // Age-bounded, so a long-running but live ingest is never reaped.
+    expect(sql).toContain("created_at <")
+    expect(params).toEqual([180])
+  })
+
+  it("never touches complete, partial or failed snapshots", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+    await cleanupStuckIndexingSnapshots()
+    const [sql] = mockQuery.mock.calls[0] as [string]
+    expect(sql).toContain("WHERE index_status = 'indexing'")
+    expect(sql).not.toContain("'complete'")
+    expect(sql).not.toContain("'partial'")
+  })
+
+  it("is disabled by a non-positive timeout and issues no query", async () => {
+    const { retention } = jest.requireMock("../config") as { retention: Record<string, number> }
+    const original = retention["stuckIndexingTimeoutMinutes"]
+    retention["stuckIndexingTimeoutMinutes"] = 0
+    try {
+      expect(await cleanupStuckIndexingSnapshots()).toBe(0)
+      expect(mockQuery).not.toHaveBeenCalled()
+    } finally {
+      retention["stuckIndexingTimeoutMinutes"] = original
+    }
   })
 })
