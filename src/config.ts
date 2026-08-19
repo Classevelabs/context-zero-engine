@@ -171,6 +171,19 @@ export const retention = Object.freeze({
   snapshotMaxAgeDays: envInt("SCG_SNAPSHOT_MAX_AGE_DAYS", 90),
   maxSnapshotsPerRepo: envInt("SCG_MAX_SNAPSHOTS_PER_REPO", 50),
   staleTransactionTimeoutMinutes: envInt("SCG_STALE_TXN_TIMEOUT_MINUTES", 60),
+  /**
+   * How long a snapshot may sit in `indexing` before it is presumed abandoned.
+   *
+   * An ingest that is killed mid-run — machine sleep, OOM, Ctrl-C, a crashed
+   * worker — leaves its snapshot at `indexing` with no process left to move it
+   * on. Nothing reaped that state, so it persisted forever, and the read guard
+   * correctly refuses to answer from a snapshot that claims to still be
+   * building. The repository therefore became permanently unreadable with no
+   * error anyone could act on. Generous by default: a large monorepo ingest
+   * legitimately runs for a long time, and reaping a LIVE ingest would be the
+   * worse failure.
+   */
+  stuckIndexingTimeoutMinutes: envInt("SCG_STUCK_INDEXING_TIMEOUT_MINUTES", 180),
   orphanCleanupEnabled: envBool("SCG_ORPHAN_CLEANUP_ENABLED", true),
   retentionIntervalMinutes: envInt("SCG_RETENTION_INTERVAL_MINUTES", 360), // 6 hours
   retentionEnabled: envBool("SCG_RETENTION_ENABLED", true),

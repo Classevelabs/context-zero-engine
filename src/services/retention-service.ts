@@ -25,6 +25,8 @@ const RETENTION_LOCK_ID = 999999937 // prime, avoids collision with ingestion lo
 export interface RetentionRunResult {
   snapshotsExpired: number
   snapshotsCapped: number
+  /** Snapshots abandoned mid-ingest and marked failed so reads get a real error. */
+  stuckIndexingReaped: number
   staleTransactionsCleaned: number
   orphansCleaned: number
   durationMs: number
@@ -155,6 +157,49 @@ export async function enforceSnapshotCap(): Promise<number> {
  * Clean up transactions stuck in intermediate states for longer than the timeout.
  * Marks them as 'failed' instead of deleting, to preserve audit trail.
  */
+/**
+ * Mark abandoned `indexing` snapshots as `failed`.
+ *
+ * A killed ingest — machine sleep, OOM, Ctrl-C, a crashed worker — leaves its
+ * snapshot at `indexing` with no process left to advance it. Nothing reaped
+ * that state, so it persisted indefinitely, and the read guard correctly
+ * refuses to answer from a snapshot that still claims to be building. The
+ * repository became permanently unreadable and the only signal was a status
+ * nobody was looking at.
+ *
+ * `failed` rather than deleted: the row is evidence that an ingest was
+ * attempted and did not finish, and the read guard already gives `failed` a
+ * clear, actionable error. Deleting it would return the caller to a silent
+ * "no data" — the exact ambiguity this whole class of fix exists to remove.
+ *
+ * Only snapshots older than the timeout are touched, so a long-running but
+ * genuinely live ingest is never reaped out from under itself.
+ */
+export async function cleanupStuckIndexingSnapshots(): Promise<number> {
+  const timeoutMinutes = retention.stuckIndexingTimeoutMinutes
+  if (timeoutMinutes <= 0) return 0
+
+  const timer = log.startTimer("cleanupStuckIndexingSnapshots")
+
+  const result = await db.query(
+    `
+        UPDATE snapshots
+        SET index_status = 'failed'
+        WHERE index_status = 'indexing'
+          AND created_at < NOW() - INTERVAL '1 minute' * $1
+        RETURNING snapshot_id
+    `,
+    [timeoutMinutes],
+  )
+
+  const count = result.rowCount ?? 0
+  if (count > 0) {
+    log.warn("Reaped snapshots abandoned in 'indexing'", { count, timeoutMinutes })
+  }
+  timer({ count })
+  return count
+}
+
 export async function cleanupStaleTransactions(): Promise<number> {
   const timeoutMinutes = retention.staleTransactionTimeoutMinutes
   if (timeoutMinutes <= 0) return 0
@@ -264,6 +309,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
     return {
       snapshotsExpired: 0,
       snapshotsCapped: 0,
+      stuckIndexingReaped: 0,
       staleTransactionsCleaned: 0,
       orphansCleaned: 0,
       durationMs: Date.now() - start,
@@ -273,10 +319,22 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
 
   let snapshotsExpired = 0
   let snapshotsCapped = 0
+  let stuckIndexingReaped = 0
   let staleTransactionsCleaned = 0
   let orphansCleaned = 0
 
   try {
+    // Phase 0: Snapshots abandoned mid-ingest. First, and in its own try, because
+    // until one of these is reaped the whole repository answers nothing readable —
+    // a worse state than any amount of stale data, and the cheapest to clear.
+    try {
+      stuckIndexingReaped = await cleanupStuckIndexingSnapshots()
+    } catch (err) {
+      const wrapped = err instanceof Error ? err : new Error(String(err))
+      log.error("Retention: stuck-indexing reap failed", wrapped)
+      errors.push(`stuck_indexing: ${wrapped.message}`)
+    }
+
     // Phase 1: Stale transactions (fast, high priority)
     try {
       staleTransactionsCleaned = await cleanupStaleTransactions()
@@ -321,6 +379,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
   log.info("Retention policy completed", {
     snapshotsExpired,
     snapshotsCapped,
+    stuckIndexingReaped,
     staleTransactionsCleaned,
     orphansCleaned,
     durationMs,
@@ -330,6 +389,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
   return {
     snapshotsExpired,
     snapshotsCapped,
+    stuckIndexingReaped,
     staleTransactionsCleaned,
     orphansCleaned,
     durationMs,
