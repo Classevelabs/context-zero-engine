@@ -432,6 +432,176 @@ export class CoreDataService {
     return optionalStringField(firstRow(result), "contract_profile_id") ?? id
   }
 
+  /**
+   * Rows per multi-row INSERT for the bulk profile writers.
+   *
+   * Postgres caps a statement at 65535 bound parameters. Behavioral profiles
+   * bind 14 columns per row, contracts 10, so 500 rows is 7000 and 5000
+   * parameters respectively — an order of magnitude inside the ceiling, while
+   * still collapsing tens of thousands of round trips into dozens. Raising
+   * this buys progressively less (the cost is already the round trip, not the
+   * row) and moves us toward a limit whose failure mode is an opaque driver
+   * error mid-ingest.
+   */
+  private static readonly PROFILE_CHUNK_ROWS = 500
+
+  /**
+   * Persist many behavioral profiles in a handful of statements.
+   *
+   * The per-row [upsertBehavioralProfile] above is correct but was being
+   * awaited once per symbol inside the ingest loop: on a 23k-symbol repository
+   * that is 23k sequential round trips, each paying full network and planner
+   * latency, and it is the single largest contributor to ingest wall-clock.
+   * Nothing about the work requires serialization — the rows are independent
+   * and the conflict target is a unique key — so the loop was pure overhead.
+   *
+   * Semantics are identical to calling [upsertBehavioralProfile] per row,
+   * including the ON CONFLICT update. Duplicate symbol_version_ids WITHIN one
+   * chunk are collapsed to the last occurrence before sending, because
+   * Postgres refuses "ON CONFLICT DO UPDATE command cannot affect row a second
+   * time" when a single statement touches the same conflict key twice — a
+   * failure the per-row path could never hit and which would otherwise turn a
+   * duplicate into a hard ingest error.
+   */
+  public async bulkUpsertBehavioralProfiles(
+    profiles: Array<Omit<BehavioralProfile, "behavior_profile_id">>,
+  ): Promise<number> {
+    if (profiles.length === 0) return 0
+
+    const deduped = new Map<string, Omit<BehavioralProfile, "behavior_profile_id">>()
+    for (const p of profiles) deduped.set(p.symbol_version_id, p)
+    const rows = [...deduped.values()]
+
+    const COLS = 14
+    let written = 0
+
+    for (let offset = 0; offset < rows.length; offset += CoreDataService.PROFILE_CHUNK_ROWS) {
+      const chunk = rows.slice(offset, offset + CoreDataService.PROFILE_CHUNK_ROWS)
+      const values: unknown[] = []
+      const tuples: string[] = []
+
+      chunk.forEach((profile, i) => {
+        const base = i * COLS
+        tuples.push(`(${Array.from({ length: COLS }, (_, c) => `$${base + c + 1}`).join(", ")})`)
+        values.push(
+          uuidv4(),
+          profile.symbol_version_id,
+          profile.purity_class,
+          profile.resource_touches,
+          profile.db_reads,
+          profile.db_writes,
+          profile.network_calls,
+          profile.cache_ops,
+          profile.file_io,
+          profile.auth_operations,
+          profile.validation_operations,
+          profile.exception_profile,
+          profile.state_mutation_profile,
+          profile.transaction_profile,
+        )
+      })
+
+      const result = await db.query(
+        `
+            INSERT INTO behavioral_profiles (
+                behavior_profile_id, symbol_version_id, purity_class,
+                resource_touches, db_reads, db_writes, network_calls, cache_ops, file_io,
+                auth_operations, validation_operations, exception_profile,
+                state_mutation_profile, transaction_profile
+            ) VALUES ${tuples.join(", ")}
+            ON CONFLICT (symbol_version_id) DO UPDATE SET
+                purity_class = EXCLUDED.purity_class,
+                resource_touches = EXCLUDED.resource_touches,
+                db_reads = EXCLUDED.db_reads,
+                db_writes = EXCLUDED.db_writes,
+                network_calls = EXCLUDED.network_calls,
+                cache_ops = EXCLUDED.cache_ops,
+                file_io = EXCLUDED.file_io,
+                auth_operations = EXCLUDED.auth_operations,
+                validation_operations = EXCLUDED.validation_operations,
+                exception_profile = EXCLUDED.exception_profile,
+                state_mutation_profile = EXCLUDED.state_mutation_profile,
+                transaction_profile = EXCLUDED.transaction_profile
+        `,
+        values,
+      )
+      written += result.rowCount ?? chunk.length
+    }
+
+    return written
+  }
+
+  /** Bulk sibling of [upsertContractProfile]; see [bulkUpsertBehavioralProfiles]. */
+  public async bulkUpsertContractProfiles(
+    profiles: Array<{
+      symbol_version_id: string
+      input_contract: string
+      output_contract: string
+      error_contract: string
+      schema_refs: string[]
+      api_contract_refs: string[]
+      serialization_contract: string
+      security_contract: string
+      derived_invariants_count: number
+    }>,
+  ): Promise<number> {
+    if (profiles.length === 0) return 0
+
+    const deduped = new Map<string, (typeof profiles)[number]>()
+    for (const p of profiles) deduped.set(p.symbol_version_id, p)
+    const rows = [...deduped.values()]
+
+    const COLS = 10
+    let written = 0
+
+    for (let offset = 0; offset < rows.length; offset += CoreDataService.PROFILE_CHUNK_ROWS) {
+      const chunk = rows.slice(offset, offset + CoreDataService.PROFILE_CHUNK_ROWS)
+      const values: unknown[] = []
+      const tuples: string[] = []
+
+      chunk.forEach((profile, i) => {
+        const base = i * COLS
+        tuples.push(`(${Array.from({ length: COLS }, (_, c) => `$${base + c + 1}`).join(", ")})`)
+        values.push(
+          uuidv4(),
+          profile.symbol_version_id,
+          profile.input_contract,
+          profile.output_contract,
+          profile.error_contract,
+          profile.schema_refs,
+          profile.api_contract_refs,
+          profile.serialization_contract,
+          profile.security_contract,
+          profile.derived_invariants_count,
+        )
+      })
+
+      const result = await db.query(
+        `
+            INSERT INTO contract_profiles (
+                contract_profile_id, symbol_version_id,
+                input_contract, output_contract, error_contract,
+                schema_refs, api_contract_refs, serialization_contract,
+                security_contract, derived_invariants_count
+            ) VALUES ${tuples.join(", ")}
+            ON CONFLICT (symbol_version_id) DO UPDATE SET
+                input_contract = EXCLUDED.input_contract,
+                output_contract = EXCLUDED.output_contract,
+                error_contract = EXCLUDED.error_contract,
+                schema_refs = EXCLUDED.schema_refs,
+                api_contract_refs = EXCLUDED.api_contract_refs,
+                serialization_contract = EXCLUDED.serialization_contract,
+                security_contract = EXCLUDED.security_contract,
+                derived_invariants_count = EXCLUDED.derived_invariants_count
+        `,
+        values,
+      )
+      written += result.rowCount ?? chunk.length
+    }
+
+    return written
+  }
+
   public async insertInvariant(invariant: {
     repo_id: string
     scope_symbol_id: string | null

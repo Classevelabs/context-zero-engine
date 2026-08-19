@@ -41,3 +41,7 @@ tmp/
 **/__pycache__/
 .bench-bin/
 .benchmark-results/
+
+# Timestamped .env backups written by scripts/setup.mjs — these carry real
+# credentials and must never be tracked.
+.env.bak-*

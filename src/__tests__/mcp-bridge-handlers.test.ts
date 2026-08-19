@@ -257,6 +257,11 @@ import {
   handleBatchEmbed,
   handleCacheStats,
   SAFE_ERROR_PREFIXES,
+  resetIndexIntegrityCache,
+  resolveIndexIntegrity,
+  extractIntegrityRef,
+  decideIndexIntegrity,
+  mergeIntegrityAnnotation,
 } from "../mcp-bridge/handlers"
 
 import { structuralGraphEngine } from "../analysis-engine"
@@ -290,6 +295,11 @@ function parseResult(result: { content: Array<{ text: string }> }): unknown {
 
 beforeEach(() => {
   jest.clearAllMocks()
+  // The index-integrity guard memoizes snapshot status in module state, which
+  // jest.clearAllMocks() does not touch. Without this reset one test's status
+  // lookup answers the next test's guard, and the db.query mock chains silently
+  // stop lining up — tests would pass for the wrong reason.
+  resetIndexIntegrityCache()
 })
 
 // ═══════════════════════════════════════════════════════════
@@ -1295,6 +1305,7 @@ describe("handleListSnapshots", () => {
 describe("handleSnapshotStats", () => {
   test("returns stats on happy path", async () => {
     mockDbQuery
+      .mockResolvedValueOnce({ rows: [{ snapshot_id: VALID_UUID, index_status: "complete" }] }) // integrity guard
       .mockResolvedValueOnce({ rows: [{ snapshot_id: VALID_UUID, index_status: "complete" }] }) // snapshot check
       .mockResolvedValueOnce({ rows: [{ cnt: 10 }] }) // file count
       .mockResolvedValueOnce({ rows: [{ cnt: 50 }] }) // symbol count
@@ -1318,6 +1329,7 @@ describe("handleSnapshotStats", () => {
 
   test("returns error for orphaned snapshot", async () => {
     mockDbQuery
+      .mockResolvedValueOnce({ rows: [{ snapshot_id: VALID_UUID, index_status: "complete" }] }) // integrity guard
       .mockResolvedValueOnce({ rows: [{ snapshot_id: VALID_UUID, index_status: "complete" }] })
       .mockResolvedValueOnce({ rows: [{ cnt: 0 }] })
       .mockResolvedValueOnce({ rows: [{ cnt: 0 }] })
@@ -2304,5 +2316,310 @@ describe("handleCacheStats", () => {
     expect(body).toHaveProperty("capsule")
     expect(body).toHaveProperty("homolog")
     expect(body).toHaveProperty("query")
+  })
+})
+
+// ═══════════════════════════════════════════════════════════
+// BUG-002: index integrity guard
+//
+// Regression tests for the defect where a read tool resolving through a
+// snapshot with index_status != 'complete' returned a clean, successful,
+// EMPTY result. `scg_get_symbol_relations` on a 'partial' snapshot answered
+// `{relations: [], count: 0}` — which a downstream agent reads as "nothing
+// calls this function", i.e. dead code, and then deletes or rewrites live
+// code on that basis.
+//
+// Every test below fails against the pre-fix handlers (verified by disabling
+// guardRead and watching them go red).
+// ═══════════════════════════════════════════════════════════
+
+describe("BUG-002 index integrity guard", () => {
+  /** Make the guard's status lookup answer with the given index_status. */
+  function withSnapshotStatus(status: string): void {
+    mockDbQuery.mockResolvedValue({ rows: [{ snapshot_id: VALID_UUID, index_status: status }] })
+  }
+
+  describe("strict tools refuse to answer from an incomplete index", () => {
+    test("partial snapshot: scg_get_symbol_relations errors instead of returning a clean empty result", async () => {
+      withSnapshotStatus("partial")
+      // The dangerous pre-fix answer: the graph genuinely has no edges yet.
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([])
+
+      const result = await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)
+
+      expect(result.isError).toBe(true)
+      const body = parseResult(result) as { error: string; relations?: unknown; count?: number }
+      expect(body.error).toContain("Index incomplete")
+      expect(body.error).toContain("partial")
+      expect(body.error).toContain("scg_get_symbol_relations")
+      // The false-negative payload must not be present at all.
+      expect(body.relations).toBeUndefined()
+      expect(body.count).toBeUndefined()
+      // And we refuse before touching the graph — no misleading work performed.
+      expect(structuralGraphEngine.getRelationsForSymbol).not.toHaveBeenCalled()
+    })
+
+    test("failed snapshot: scg_get_symbol_relations errors", async () => {
+      withSnapshotStatus("failed")
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([])
+
+      const result = await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)
+
+      expect(result.isError).toBe(true)
+      expect((parseResult(result) as { error: string }).error).toContain("failed")
+    })
+
+    test.each(["pending", "indexing"])(
+      "%s snapshot is refused too — an in-flight index is not a whole one",
+      async (status) => {
+        withSnapshotStatus(status)
+        ;(structuralGraphEngine.getCallers as jest.Mock).mockResolvedValue([])
+
+        const result = await handleGetSymbolRelations({ symbol_version_id: VALID_UUID, direction: "inbound" }, log)
+
+        expect(result.isError).toBe(true)
+        expect((parseResult(result) as { error: string }).error).toContain(status)
+      },
+    )
+
+    test("partial snapshot: scg_blast_radius errors — an empty blast radius reads as 'safe to change'", async () => {
+      withSnapshotStatus("partial")
+      ;(blastRadiusEngine.computeBlastRadius as jest.Mock).mockResolvedValue({ impacted: [] })
+
+      const result = await handleBlastRadius({ symbol_version_ids: [VALID_UUID_2], snapshot_id: VALID_UUID }, log)
+
+      expect(result.isError).toBe(true)
+      expect((parseResult(result) as { error: string }).error).toContain("Index incomplete")
+      expect(blastRadiusEngine.computeBlastRadius).not.toHaveBeenCalled()
+    })
+
+    test("complete snapshot: the answer is returned untouched, with no added fields", async () => {
+      withSnapshotStatus("complete")
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([{ type: "calls" }])
+
+      const result = await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)
+
+      expect(result.isError).toBeUndefined()
+      const body = parseResult(result) as Record<string, unknown>
+      expect(body.count).toBe(1)
+      expect(body).not.toHaveProperty("index_status")
+      expect(body).not.toHaveProperty("warning")
+    })
+  })
+
+  describe("flag tools answer, but never present partial data as complete", () => {
+    test("partial snapshot: scg_codebase_overview succeeds and is stamped degraded", async () => {
+      withSnapshotStatus("partial")
+      mockGetCodebaseOverview.mockResolvedValue({ files: 3, symbols: 12 })
+
+      const result = await handleCodebaseOverview({ repo_id: VALID_UUID_2, snapshot_id: VALID_UUID }, log)
+
+      expect(result.isError).toBeUndefined()
+      const body = parseResult(result) as { index_status: string; warning: string; files: number }
+      expect(body.index_status).toBe("partial")
+      expect(body.warning).toContain("DEGRADED INDEX")
+      expect(body.warning).toContain("does NOT prove absence")
+      // The useful payload survives — a flag is not a refusal.
+      expect(body.files).toBe(3)
+    })
+
+    test("the degraded flag is the FIRST key, so a reader meets it before the data", async () => {
+      withSnapshotStatus("partial")
+      mockGetCodebaseOverview.mockResolvedValue({ files: 3 })
+
+      const result = await handleCodebaseOverview({ repo_id: VALID_UUID_2, snapshot_id: VALID_UUID }, log)
+
+      expect(Object.keys(parseResult(result) as Record<string, unknown>)[0]).toBe("index_status")
+    })
+
+    test("failed snapshot: even a flag tool errors — failed data is not merely incomplete", async () => {
+      withSnapshotStatus("failed")
+      mockGetCodebaseOverview.mockResolvedValue({ files: 0 })
+
+      const result = await handleCodebaseOverview({ repo_id: VALID_UUID_2, snapshot_id: VALID_UUID }, log)
+
+      expect(result.isError).toBe(true)
+      expect(mockGetCodebaseOverview).not.toHaveBeenCalled()
+    })
+
+    test("complete snapshot: no annotation is added", async () => {
+      withSnapshotStatus("complete")
+      mockGetCodebaseOverview.mockResolvedValue({ files: 3 })
+
+      const body = parseResult(
+        await handleCodebaseOverview({ repo_id: VALID_UUID_2, snapshot_id: VALID_UUID }, log),
+      ) as Record<string, unknown>
+      expect(body).not.toHaveProperty("index_status")
+    })
+  })
+
+  describe("diagnostics stay answerable — a broken index must remain diagnosable", () => {
+    test("failed snapshot: scg_snapshot_stats still answers, stamped degraded", async () => {
+      // Refusing the tool you use to find out WHY the index is broken is the
+      // classic worse-than-no-gate outcome. It answers, loudly flagged.
+      mockDbQuery
+        .mockResolvedValueOnce({ rows: [{ snapshot_id: VALID_UUID, index_status: "failed" }] }) // integrity guard
+        .mockResolvedValueOnce({ rows: [{ snapshot_id: VALID_UUID, index_status: "failed" }] }) // handler's own check
+        .mockResolvedValueOnce({ rows: [{ cnt: 4 }] })
+        .mockResolvedValueOnce({ rows: [{ cnt: 9 }] })
+        .mockResolvedValueOnce({ rows: [{ cnt: 2 }] })
+      ;(uncertaintyTracker.getSnapshotUncertainty as jest.Mock).mockResolvedValue({ score: 0.9 })
+
+      const result = await handleSnapshotStats({ snapshot_id: VALID_UUID }, log)
+
+      expect(result.isError).toBeUndefined()
+      const body = parseResult(result) as { index_status: string; files: number; symbols: number }
+      expect(body.index_status).toBe("failed")
+      expect(body.files).toBe(4)
+      expect(body.symbols).toBe(9)
+    })
+
+    test("failed snapshot: scg_get_uncertainty still answers, stamped degraded", async () => {
+      withSnapshotStatus("failed")
+      ;(uncertaintyTracker.getSnapshotUncertainty as jest.Mock).mockResolvedValue({ score: 0.9 })
+
+      const result = await handleGetUncertainty({ snapshot_id: VALID_UUID }, log)
+
+      expect(result.isError).toBeUndefined()
+      expect((parseResult(result) as { index_status: string }).index_status).toBe("failed")
+    })
+
+    test("decideIndexIntegrity: the diagnostic policy never blocks, at any status", () => {
+      for (const status of ["partial", "failed", "indexing", "pending", "unknown"] as const) {
+        expect(decideIndexIntegrity({ status }, "diagnostic", "scg_snapshot_stats").block).toBe(false)
+      }
+    })
+  })
+
+  describe("reference resolution", () => {
+    test("derives the snapshot from symbol_version_id when no snapshot_id is supplied", async () => {
+      withSnapshotStatus("partial")
+      await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)
+
+      const sql = String(mockDbQuery.mock.calls[0][0])
+      expect(sql).toContain("symbol_versions")
+      expect(sql).toContain("index_status")
+      expect(mockDbQuery.mock.calls[0][1]).toEqual([VALID_UUID])
+    })
+
+    test("a repo-derived status flags but NEVER blocks — an older complete snapshot may still serve", async () => {
+      // scg_search_code carries only repo_id, so the status can only come from
+      // the repo's newest snapshot. Blocking there would deny a caller data an
+      // earlier, complete snapshot can legitimately answer.
+      withSnapshotStatus("failed")
+      mockSearchCode.mockResolvedValue({ matches: [], total: 0 })
+
+      const result = await handleSearchCode({ repo_id: VALID_UUID, pattern: "foo" }, log)
+
+      expect(result.isError).toBeUndefined()
+      const body = parseResult(result) as { index_status: string; warning: string }
+      expect(body.index_status).toBe("failed")
+      expect(body.warning).toContain("newest snapshot for this repository")
+    })
+
+    test("decideIndexIntegrity: repo-derived refs never block under either policy", () => {
+      for (const policy of ["strict", "flag"] as const) {
+        for (const status of ["partial", "failed", "indexing"] as const) {
+          const decision = decideIndexIntegrity({ status, derived_from_repo: true }, policy, "scg_x")
+          expect(decision.block).toBe(false)
+          expect(decision.annotation?.index_status).toBe(status)
+        }
+      }
+    })
+
+    test("extractIntegrityRef prefers an explicit snapshot_id over derived references", () => {
+      const ref = extractIntegrityRef({
+        snapshot_id: VALID_UUID,
+        symbol_version_id: VALID_UUID_2,
+        repo_id: VALID_UUID_3,
+      })
+      expect(ref.snapshotId).toBe(VALID_UUID)
+    })
+
+    test("extractIntegrityRef ignores malformed ids, so a bad request issues no query", async () => {
+      expect(extractIntegrityRef({ symbol_version_id: "not-a-uuid", repo_id: 42 })).toEqual({})
+
+      const result = await handleGetSymbolRelations({ symbol_version_id: "not-a-uuid" }, log)
+      expect(result.isError).toBe(true)
+      expect(mockDbQuery).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("unresolvable status fails toward 'say so', not toward silent completeness", () => {
+    test("a missing snapshot row flags 'unknown' rather than blocking a strict read", async () => {
+      mockDbQuery.mockResolvedValue({ rows: [] })
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([])
+
+      const result = await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)
+
+      expect(result.isError).toBeUndefined()
+      const body = parseResult(result) as { index_status: string; warning: string; count: number }
+      expect(body.index_status).toBe("unknown")
+      expect(body.warning).toContain("UNVERIFIED")
+      expect(body.count).toBe(0)
+    })
+
+    test("a DB failure during the status lookup degrades to 'unknown', never to 'complete'", async () => {
+      mockDbQuery.mockRejectedValue(new Error("connection terminated"))
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([])
+
+      const body = parseResult(await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)) as {
+        index_status: string
+      }
+      expect(body.index_status).toBe("unknown")
+    })
+
+    test("an unrecognized index_status value is treated as unknown, not as complete", async () => {
+      withSnapshotStatus("something_new")
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([])
+
+      const body = parseResult(await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)) as {
+        index_status: string
+      }
+      expect(body.index_status).toBe("unknown")
+    })
+  })
+
+  describe("cost", () => {
+    test("the status lookup is memoized — five reads do not mean five round-trips", async () => {
+      withSnapshotStatus("complete")
+      ;(structuralGraphEngine.getRelationsForSymbol as jest.Mock).mockResolvedValue([])
+
+      for (let i = 0; i < 5; i++) {
+        await handleGetSymbolRelations({ symbol_version_id: VALID_UUID }, log)
+      }
+
+      const statusQueries = mockDbQuery.mock.calls.filter((c) => String(c[0]).includes("index_status"))
+      expect(statusQueries).toHaveLength(1)
+    })
+
+    test("resetIndexIntegrityCache clears the memo", async () => {
+      withSnapshotStatus("complete")
+      await resolveIndexIntegrity({ snapshotId: VALID_UUID })
+      resetIndexIntegrityCache()
+      await resolveIndexIntegrity({ snapshotId: VALID_UUID })
+      expect(mockDbQuery.mock.calls.filter((c) => String(c[0]).includes("index_status"))).toHaveLength(2)
+    })
+  })
+
+  describe("mergeIntegrityAnnotation", () => {
+    test("returns the payload untouched when there is nothing to flag", () => {
+      const payload = { a: 1 }
+      expect(mergeIntegrityAnnotation(payload, { block: false })).toBe(payload)
+    })
+
+    test("the annotation wins over a colliding payload key", () => {
+      const decision = decideIndexIntegrity({ status: "partial", snapshot_id: VALID_UUID }, "flag", "scg_x")
+      const merged = mergeIntegrityAnnotation({ index_status: "complete", a: 1 }, decision) as Record<string, unknown>
+      expect(merged.index_status).toBe("partial")
+      expect(merged.a).toBe(1)
+    })
+
+    test("a non-object payload is wrapped rather than losing the warning", () => {
+      const decision = decideIndexIntegrity({ status: "partial" }, "flag", "scg_x")
+      const merged = mergeIntegrityAnnotation([1, 2], decision) as Record<string, unknown>
+      expect(merged.index_status).toBe("partial")
+      expect(merged.results).toEqual([1, 2])
+    })
   })
 })

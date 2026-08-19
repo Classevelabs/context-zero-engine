@@ -17,6 +17,7 @@ beforeEach(() => {
   process.env["DB_PASSWORD"] = ""
   process.env["PGPASSWORD"] = ""
   process.env["CONTEXTZERO_ENV_FILE"] = ""
+  process.env["SCG_MCP_MUTATIONS_ENABLED"] = ""
 })
 
 afterAll(() => {
@@ -415,7 +416,15 @@ describe("features config", () => {
   })
 
   test("enableMcpMutations is an explicit opt-in", async () => {
-    delete process.env["SCG_MCP_MUTATIONS_ENABLED"]
+    // Empty string, not delete: config.ts runs dotenv.config() at import, and
+    // dotenv REPOPULATES a key it finds missing from the repo's .env. Deleting
+    // therefore asserted the default only on a machine whose .env happens to
+    // omit this key — the test failed for anyone who had enabled mutations
+    // locally, which is a property of the developer's disk, not of the code.
+    // envBool() treats "" as unset and returns its fallback, so this is the
+    // real default; it is the same guard this file's beforeEach already uses
+    // for DB_PASSWORD and friends.
+    process.env["SCG_MCP_MUTATIONS_ENABLED"] = ""
     let config = await import("../config")
     expect(config.features.enableMcpMutations).toBe(false)
 

@@ -24,9 +24,11 @@ export class ContractEngine {
   /**
    * Extract contract profile from adapter hints and persist to DB.
    */
+  /** @param persist see BehavioralEngine.extractBehavioralProfiles. */
   public async extractContractProfile(
     symbolVersionId: string,
     hint: ContractHint,
+    persist = true,
   ): Promise<Omit<ContractProfile, "contract_profile_id">> {
     const timer = log.startTimer("extractContractProfile", { symbolVersionId })
 
@@ -55,7 +57,7 @@ export class ContractEngine {
       derived_invariants_count: 0,
     }
 
-    await coreDataService.upsertContractProfile(profile)
+    if (persist) await coreDataService.upsertContractProfile(profile)
     timer()
     return profile
   }

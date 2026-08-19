@@ -25,9 +25,16 @@ export class BehavioralEngine {
    * Process raw behavior hints from adapter into structured profiles
    * and persist to DB.
    */
+  /**
+   * @param persist write the profile immediately. Defaults to true so every
+   *   existing caller is unchanged. The ingest loop passes false and collects
+   *   the returned profiles for one bulk write instead, because awaiting a
+   *   round trip per symbol here was the dominant cost of a full ingest.
+   */
   public async extractBehavioralProfiles(
     symbolVersionId: string,
     hints: BehaviorHint[],
+    persist = true,
   ): Promise<Omit<BehavioralProfile, "behavior_profile_id">> {
     const timer = log.startTimer("extractBehavioralProfiles", {
       symbolVersionId,
@@ -150,7 +157,7 @@ export class BehavioralEngine {
       transaction_profile: [...new Set(transactions)],
     }
 
-    await coreDataService.upsertBehavioralProfile(profile)
+    if (persist) await coreDataService.upsertBehavioralProfile(profile)
     timer({ purityClass })
     return profile
   }
