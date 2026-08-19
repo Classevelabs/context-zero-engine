@@ -92,6 +92,7 @@ export const SAFE_ERROR_PREFIXES = [
   "Repository base path not configured",
   "Allowed base path violation",
   "File too large",
+  "Index incomplete",
 ] as const
 
 // ────────── MCP CallToolResult ──────────
@@ -196,9 +197,488 @@ function isUUID(v: unknown): v is string {
   return typeof v === "string" && UUID_RE.test(v)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// INDEX INTEGRITY GUARD  (BUG-002)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Sibling of the BUG-001 orphan check in scg_snapshot_stats below.
+//
+// An ingest that ends with snapshots.index_status != 'complete' leaves a graph
+// with missing nodes and missing edges. Before this guard every read tool
+// answered from that graph as though it were whole: scg_get_symbol_relations
+// on a 'partial' snapshot validated the UUID, queried, and returned a clean
+// `{relations: [], count: 0}` with no error and no flag. A downstream agent
+// reads "0 callers" as "nothing calls this" — i.e. dead code — and deletes or
+// rewrites live code on that basis. That is not a small inaccuracy; it is a
+// confident false negative produced by a silent partial index.
+//
+// ────────── THE RULE (applied consistently in INDEX_INTEGRITY_POLICIES) ──────────
+//
+//   'failed'                        → BLOCK every guarded read except the
+//                                     diagnostics below. A failed ingest is not
+//                                     "less data", it is untrustworthy data; no
+//                                     answer derived from it is safe.
+//
+//   'partial' / 'pending' /         → decided by the SHAPE of the tool's answer:
+//   'indexing'
+//
+//     "strict"  the answer is an ENUMERATION whose emptiness or shortness reads
+//               as a negative existence claim — "nothing calls this", "nothing
+//               is impacted", "no test covers this". A wrong empty answer here
+//               licenses deletion, so it is refused outright rather than
+//               softened. (relations, neighbors, blast radius, dispatch edges,
+//               class hierarchy, tests, explain_relation, propagation, context
+//               capsule, smart context, plan_change)
+//
+//     "flag"    the answer is already understood as best-effort — ranked,
+//               descriptive, or sampled — and never claims to be exhaustive, so
+//               partial data is still useful. Returned as normal plus an
+//               unmissable top-level `index_status` and `warning`. (search,
+//               overview, symbol details, profiles, semantic search, …)
+//
+//     "diagnostic"  the tool's job IS to report on index health, so it must
+//               keep answering when the index is unhealthy — refusing it would
+//               leave the failure undiagnosable, which is worse than no gate at
+//               all. Never blocks at any status; still carries the degraded
+//               stamp. (scg_snapshot_stats, scg_get_uncertainty)
+//
+//   'unknown'   (snapshot row absent, or the status lookup itself failed)
+//                                   → FLAG, never block, under BOTH policies.
+//               We cannot prove the index is complete, so we must never present
+//               it as complete; but one small SELECT hiccuping must not brick
+//               every read in the product. Fail toward "say so", not toward
+//               either silent completeness or a dead product.
+//
+//   'complete'                      → nothing added. Zero payload cost on the
+//                                     healthy path.
+//
+// A repo-derived reference (repo_id with no snapshot_id) can NEVER block: the
+// repo may still hold an older complete snapshot the caller is entitled to
+// read. Repo-derived refs report the newest snapshot's status as a flag only.
+
+export type IndexIntegrityStatus = "complete" | "partial" | "failed" | "pending" | "indexing" | "unknown"
+export type IndexIntegrityPolicy = "strict" | "flag" | "diagnostic"
+
+/** Minimal logger surface — satisfied by both McpLogger and the HTTP Logger. */
+interface IntegrityLogger {
+  warn(message: string, data?: Record<string, unknown>): void
+}
+
+export interface IndexIntegrity {
+  status: IndexIntegrityStatus
+  snapshot_id?: string
+  /** true when the status came from the repo's newest snapshot, not an explicit id */
+  derived_from_repo?: boolean
+}
+
+export interface IndexIntegrityDecision {
+  /** true → the caller must refuse to answer; `message` says why. */
+  block: boolean
+  message?: string
+  /** Merged into successful response bodies when the index is not 'complete'. */
+  annotation?: { index_status: IndexIntegrityStatus; warning: string }
+}
+
+/** How a request points at a snapshot, in descending order of directness. */
+export interface IndexIntegrityRef {
+  snapshotId?: string
+  symbolVersionIds?: string[]
+  symbolId?: string
+  repoId?: string
+}
+
+// Higher = worse. Used to pick the worst status across a batch of ids, and to
+// decide blocking. Anything unrecognized normalizes to 'unknown', never
+// 'complete' — an unknown status must not be mistaken for a healthy one.
+const INDEX_STATUS_SEVERITY: Record<IndexIntegrityStatus, number> = {
+  complete: 0,
+  unknown: 1,
+  pending: 2,
+  indexing: 2,
+  partial: 3,
+  failed: 4,
+}
+
+function normalizeIndexStatus(raw: unknown): IndexIntegrityStatus {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : ""
+  return v in INDEX_STATUS_SEVERITY && v !== "unknown" ? (v as IndexIntegrityStatus) : "unknown"
+}
+
+// ────────── Status cache ──────────
+//
+// The correctness fix must not cost a DB round-trip on every tool call, and a
+// single tool call can resolve the same snapshot more than once (guard + the
+// handler's own lookups). A short-TTL memo keyed by the reference collapses
+// those to one query and also covers the burst of calls an agent makes inside
+// one turn, without an N+1 anywhere.
+//
+// Staleness is bounded and lands on the safe side: index_status only ever moves
+// pending → indexing → complete | partial | failed, and a re-ingest of a
+// partial/failed snapshot re-enters 'indexing' first. So the worst a stale
+// entry can produce is a warning that is a few seconds out of date — never a
+// stale "complete" over live degraded data.
+const INDEX_STATUS_CACHE_TTL_MS = 5_000
+const INDEX_STATUS_CACHE_MAX_ENTRIES = 512
+const indexStatusCache = new Map<string, { value: IndexIntegrity; expiresAt: number }>()
+
+/** Test seam — module-level cache would otherwise leak between test cases. */
+export function resetIndexIntegrityCache(): void {
+  indexStatusCache.clear()
+}
+
+function cacheGet(key: string): IndexIntegrity | undefined {
+  const hit = indexStatusCache.get(key)
+  if (!hit) return undefined
+  if (hit.expiresAt <= Date.now()) {
+    indexStatusCache.delete(key)
+    return undefined
+  }
+  return hit.value
+}
+
+function cacheSet(key: string, value: IndexIntegrity): void {
+  if (indexStatusCache.size >= INDEX_STATUS_CACHE_MAX_ENTRIES) {
+    const oldest = indexStatusCache.keys().next()
+    if (!oldest.done) indexStatusCache.delete(oldest.value)
+  }
+  indexStatusCache.set(key, { value, expiresAt: Date.now() + INDEX_STATUS_CACHE_TTL_MS })
+}
+
+// ────────── Reference extraction ──────────
+
+function pushUUIDs(out: string[], value: unknown): void {
+  if (isUUID(value)) {
+    out.push(value)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) if (isUUID(v)) out.push(v)
+  }
+}
+
+/**
+ * Pull a snapshot reference out of a tool's arguments / request body.
+ *
+ * Both transports name these fields identically, so one extractor serves the
+ * MCP bridge and the HTTP API. Only syntactically valid UUIDs are accepted —
+ * a malformed id yields no reference and therefore issues no query, leaving
+ * the handler's own validation to produce the error.
+ */
+export function extractIntegrityRef(source: Record<string, unknown>): IndexIntegrityRef {
+  const snapshotCandidates: string[] = []
+  pushUUIDs(snapshotCandidates, source["snapshot_id"])
+  pushUUIDs(snapshotCandidates, source["base_snapshot_id"])
+
+  const svIds: string[] = []
+  pushUUIDs(svIds, source["symbol_version_id"])
+  pushUUIDs(svIds, source["symbol_version_ids"])
+  pushUUIDs(svIds, source["target_symbol_version_ids"])
+  pushUUIDs(svIds, source["before_symbol_version_id"])
+  pushUUIDs(svIds, source["after_symbol_version_id"])
+  pushUUIDs(svIds, source["src_symbol_version_id"])
+  pushUUIDs(svIds, source["dst_symbol_version_id"])
+
+  const symbolIds: string[] = []
+  pushUUIDs(symbolIds, source["symbol_id"])
+
+  const repoIds: string[] = []
+  pushUUIDs(repoIds, source["repo_id"])
+
+  const ref: IndexIntegrityRef = {}
+  if (snapshotCandidates.length > 0) ref.snapshotId = snapshotCandidates[0]
+  // Capped: these all share one snapshot in practice, and an unbounded IN list
+  // is how a guard turns into its own performance defect.
+  if (svIds.length > 0) ref.symbolVersionIds = [...new Set(svIds)].slice(0, 20)
+  if (symbolIds.length > 0) ref.symbolId = symbolIds[0]
+  if (repoIds.length > 0) ref.repoId = repoIds[0]
+  return ref
+}
+
+function refCacheKey(ref: IndexIntegrityRef): string | undefined {
+  if (ref.snapshotId) return `snap:${ref.snapshotId}`
+  if (ref.symbolVersionIds && ref.symbolVersionIds.length > 0) return `sv:${[...ref.symbolVersionIds].sort().join(",")}`
+  if (ref.symbolId) return `sym:${ref.symbolId}`
+  if (ref.repoId) return `repo:${ref.repoId}`
+  return undefined
+}
+
+function worstOf(rows: Record<string, unknown>[]): IndexIntegrity {
+  let worst: IndexIntegrity = { status: "unknown" }
+  let worstSeverity = -1
+  for (const row of rows) {
+    const status = normalizeIndexStatus(row["index_status"])
+    const severity = INDEX_STATUS_SEVERITY[status]
+    if (severity > worstSeverity) {
+      worstSeverity = severity
+      worst = { status, snapshot_id: typeof row["snapshot_id"] === "string" ? row["snapshot_id"] : undefined }
+    }
+  }
+  return worst
+}
+
+/**
+ * Resolve the index_status behind a request. One DB round-trip at most, memoized.
+ * Never throws — an unresolvable status becomes 'unknown', which flags but never blocks.
+ */
+export async function resolveIndexIntegrity(ref: IndexIntegrityRef, log?: IntegrityLogger): Promise<IndexIntegrity> {
+  const key = refCacheKey(ref)
+  if (!key) return { status: "unknown" }
+  const cached = cacheGet(key)
+  if (cached) return cached
+
+  let resolved: IndexIntegrity = { status: "unknown" }
+  try {
+    if (ref.snapshotId) {
+      const result = await db.query(`SELECT snapshot_id, index_status FROM snapshots WHERE snapshot_id = $1`, [
+        ref.snapshotId,
+      ])
+      const rows = (result?.rows ?? []) as Record<string, unknown>[]
+      resolved = rows.length > 0 ? worstOf(rows) : { status: "unknown", snapshot_id: ref.snapshotId }
+    } else if (ref.symbolVersionIds && ref.symbolVersionIds.length > 0) {
+      const ids = ref.symbolVersionIds
+      const placeholders = ids.map((_, i) => `$${i + 1}`).join(",")
+      const result = await db.query(
+        `SELECT sn.snapshot_id, sn.index_status
+             FROM symbol_versions sv
+             JOIN snapshots sn ON sn.snapshot_id = sv.snapshot_id
+             WHERE sv.symbol_version_id IN (${placeholders})`,
+        ids,
+      )
+      const rows = (result?.rows ?? []) as Record<string, unknown>[]
+      resolved = rows.length > 0 ? worstOf(rows) : { status: "unknown" }
+    } else if (ref.symbolId) {
+      const result = await db.query(
+        `SELECT sn.snapshot_id, sn.index_status
+             FROM symbol_versions sv
+             JOIN snapshots sn ON sn.snapshot_id = sv.snapshot_id
+             WHERE sv.symbol_id = $1
+             ORDER BY sn.indexed_at DESC LIMIT 1`,
+        [ref.symbolId],
+      )
+      const rows = (result?.rows ?? []) as Record<string, unknown>[]
+      resolved = rows.length > 0 ? worstOf(rows) : { status: "unknown" }
+    } else if (ref.repoId) {
+      const result = await db.query(
+        `SELECT snapshot_id, index_status FROM snapshots
+             WHERE repo_id = $1 ORDER BY indexed_at DESC LIMIT 1`,
+        [ref.repoId],
+      )
+      const rows = (result?.rows ?? []) as Record<string, unknown>[]
+      resolved = rows.length > 0 ? { ...worstOf(rows), derived_from_repo: true } : { status: "unknown" }
+    }
+  } catch (err) {
+    // Fail toward "say so": an unresolvable status must never be reported as
+    // 'complete', and must never take the whole product down either.
+    log?.warn("Index integrity lookup failed — treating index status as unknown", {
+      error: err instanceof Error ? err.message : String(err),
+    })
+    resolved = { status: "unknown" }
+  }
+
+  cacheSet(key, resolved)
+  return resolved
+}
+
+// ────────── Decision ──────────
+
+function describeSnapshot(integrity: IndexIntegrity): string {
+  return integrity.snapshot_id ? `snapshot ${integrity.snapshot_id}` : "the snapshot behind this request"
+}
+
+export function decideIndexIntegrity(
+  integrity: IndexIntegrity,
+  policy: IndexIntegrityPolicy,
+  toolName: string,
+): IndexIntegrityDecision {
+  if (integrity.status === "complete") return { block: false }
+
+  if (integrity.status === "unknown") {
+    return {
+      block: false,
+      annotation: {
+        index_status: "unknown",
+        warning:
+          `DEGRADED INDEX: the index_status behind this request could not be resolved, so completeness is ` +
+          `UNVERIFIED. Results may be incomplete — an absent result does NOT prove absence. Confirm the ` +
+          `snapshot with scg_snapshot_stats before treating anything here as exhaustive.`,
+      },
+    }
+  }
+
+  // 'failed' blocks under "strict" AND "flag" — a failed ingest is not "less
+  // data", it is data of unknown shape, so even a ranked/best-effort answer
+  // drawn from it is misleading. 'partial'/'pending'/'indexing' block only
+  // under "strict".
+  //
+  // "diagnostic" never blocks at any status. scg_snapshot_stats and
+  // scg_get_uncertainty are the tools you reach for to find out WHY the index
+  // is broken; refusing them would leave the failure undiagnosable, which is
+  // the classic worse-than-no-gate outcome. They report the degraded status as
+  // data instead.
+  //
+  // A repo-derived status describes only the repo's NEWEST snapshot; an older
+  // complete snapshot may still be perfectly readable, so it never blocks.
+  const blocking =
+    !integrity.derived_from_repo &&
+    policy !== "diagnostic" &&
+    (integrity.status === "failed" || policy === "strict")
+  if (blocking) {
+    return {
+      block: true,
+      message:
+        `Index incomplete: ${describeSnapshot(integrity)} has index_status='${integrity.status}'. ` +
+        `Refusing to answer ${toolName} from an incomplete graph — an empty or short result would be ` +
+        `indistinguishable from "nothing exists", and that answer gets acted on as dead code. ` +
+        `Re-ingest the repository (scg_ingest_repo) and retry.`,
+    }
+  }
+
+  return {
+    block: false,
+    annotation: {
+      index_status: integrity.status,
+      warning:
+        `DEGRADED INDEX: ${describeSnapshot(integrity)} has index_status='${integrity.status}'` +
+        `${integrity.derived_from_repo ? " (newest snapshot for this repository)" : ""}. Results may be ` +
+        `incomplete — an absent result does NOT prove absence. Re-ingest the repository (scg_ingest_repo) ` +
+        `before relying on this.`,
+    },
+  }
+}
+
+/**
+ * The single entry point both transports call: extract → resolve → decide.
+ */
+export async function checkIndexIntegrity(
+  source: Record<string, unknown>,
+  policy: IndexIntegrityPolicy,
+  toolName: string,
+  log?: IntegrityLogger,
+): Promise<IndexIntegrityDecision> {
+  const integrity = await resolveIndexIntegrity(extractIntegrityRef(source), log)
+  return decideIndexIntegrity(integrity, policy, toolName)
+}
+
+/** Merge the degraded-status annotation into a successful response payload. */
+export function mergeIntegrityAnnotation(payload: unknown, decision: IndexIntegrityDecision): unknown {
+  if (!decision.annotation) return payload
+  if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+    // Annotation spread twice on purpose: the first spread fixes `index_status`
+    // and `warning` as the FIRST keys (a reader — human or model — must meet the
+    // warning before the data), the second guarantees the annotation's values
+    // win if a payload ever grows a field of the same name. A degraded flag that
+    // a payload key could silently overwrite is not a flag.
+    return { ...decision.annotation, ...(payload as Record<string, unknown>), ...decision.annotation }
+  }
+  // Non-object payloads are wrapped rather than silently losing the warning.
+  return { ...decision.annotation, results: payload }
+}
+
+// ────────── Policy table ──────────
+//
+// Every snapshot-resolving READ tool appears here exactly once. Keeping the
+// table separate from the handler bodies is the point: coverage is auditable in
+// one place, and `guardRead` throws at module load for a tool that is wrapped
+// without a registered policy, so a tool cannot be half-guarded.
+//
+// Deliberately ABSENT, with reasons:
+//   scg_list_repos / scg_list_snapshots — describe repos and snapshots
+//     themselves; scg_list_snapshots already returns each row's index_status.
+//   scg_get_symbol_lineage — cross-snapshot by design; there is no single
+//     snapshot whose status would qualify the answer.
+//   scg_native_* — read the working tree directly and never touch the index.
+//   scg_health_check / scg_cache_stats / scg_admin_* — server state, no snapshot.
+//   scg_get_transaction — transaction metadata, not graph data.
+//   Mutation tools (register/ingest/incremental_index/batch_embed/
+//     persist_homologs/create_change_transaction/apply_patch/validate_change/
+//     commit/rollback/prepare_change/apply_propagation/review_homolog/
+//     ingest_runtime_trace) — writes, not reads. The change-transaction path
+//     already refuses a non-'complete' validation snapshot in
+//     src/transactional-editor/index.ts.
+export const INDEX_INTEGRITY_POLICIES: Record<string, IndexIntegrityPolicy> = {
+  // strict — an empty answer here reads as "nothing exists" and licenses deletion
+  scg_get_symbol_relations: "strict",
+  scg_get_neighbors: "strict",
+  scg_blast_radius: "strict",
+  scg_get_dispatch_edges: "strict",
+  scg_get_class_hierarchy: "strict",
+  scg_get_tests: "strict",
+  scg_explain_relation: "strict",
+  scg_propagation_proposals: "strict",
+  scg_compile_context_capsule: "strict",
+  scg_smart_context: "strict",
+  scg_plan_change: "strict",
+
+  // flag — best-effort/ranked/descriptive answers; partial data is still useful
+  scg_resolve_symbol: "flag",
+  scg_get_symbol_details: "flag",
+  scg_get_behavioral_profile: "flag",
+  scg_get_contract_profile: "flag",
+  scg_get_invariants: "flag",
+  scg_find_homologs: "flag",
+  scg_read_source: "flag",
+  scg_search_code: "flag",
+  scg_codebase_overview: "flag",
+  scg_semantic_search: "flag",
+  scg_find_concept: "flag",
+  scg_get_effect_signature: "flag",
+  scg_diff_effects: "flag",
+  scg_get_concept_family: "flag",
+  scg_list_concept_families: "flag",
+  scg_get_temporal_risk: "flag",
+  scg_get_co_change_partners: "flag",
+  scg_get_runtime_evidence: "flag",
+  scg_semantic_diff: "flag",
+  scg_contract_diff: "flag",
+
+  // diagnostic — these tools EXIST to report on index health, so they must keep
+  // answering when the index is unhealthy. They still carry the degraded stamp.
+  scg_snapshot_stats: "diagnostic",
+  scg_get_uncertainty: "diagnostic",
+}
+
+type ToolHandlerFn = (args: Record<string, unknown>, log: McpLogger) => Promise<CallToolResult>
+
+/** Re-serialize an MCP result with the degraded-status annotation merged in. */
+function annotateCallToolResult(result: CallToolResult, decision: IndexIntegrityDecision): CallToolResult {
+  const first = result.content?.[0]
+  if (first && first.type === "text") {
+    try {
+      const merged = mergeIntegrityAnnotation(JSON.parse(first.text), decision)
+      return { ...result, content: [{ type: "text" as const, text: JSON.stringify(merged, null, 2) }] }
+    } catch {
+      /* fall through — the warning is appended below rather than dropped */
+    }
+  }
+  return {
+    ...result,
+    content: [...(result.content ?? []), { type: "text" as const, text: JSON.stringify(decision.annotation) }],
+  }
+}
+
+/**
+ * Wrap one MCP read handler with the index-integrity guard.
+ *
+ * Costs one memoized status lookup. On a healthy 'complete' index the payload
+ * is returned byte-for-byte unchanged — no re-serialization, no extra fields.
+ */
+function guardRead(toolName: string, handler: ToolHandlerFn): ToolHandlerFn {
+  const policy = INDEX_INTEGRITY_POLICIES[toolName]
+  if (!policy) {
+    throw new Error(`No index-integrity policy registered for ${toolName}`)
+  }
+  return async (args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> => {
+    const decision = await checkIndexIntegrity(args, policy, toolName, log)
+    if (decision.block) return errorResult(decision.message ?? "Index incomplete")
+    const result = await handler(args, log)
+    if (!decision.annotation || result.isError) return result
+    return annotateCallToolResult(result, decision)
+  }
+}
+
 // ────────── Tool 1: Resolve Symbol ──────────
 
-export async function handleResolveSymbol(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleResolveSymbolImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const query = requireString(args, "query")
   const repo_id = requireString(args, "repo_id")
   const snapshot_id = optionalString(args, "snapshot_id")
@@ -216,7 +696,7 @@ export async function handleResolveSymbol(args: Record<string, unknown>, log: Mc
 
 // ────────── Tool 2: Get Symbol Details ──────────
 
-export async function handleGetSymbolDetails(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetSymbolDetailsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   const view_mode = optionalString(args, "view_mode") || "summary"
 
@@ -233,7 +713,7 @@ export async function handleGetSymbolDetails(args: Record<string, unknown>, log:
 
 // ────────── Tool 3: Get Symbol Relations ──────────
 
-export async function handleGetSymbolRelations(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetSymbolRelationsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   const direction = optionalString(args, "direction") || "both"
 
@@ -320,7 +800,7 @@ export async function handleGetSymbolRelations(args: Record<string, unknown>, lo
 
 // ────────── Tool 4: Get Behavioral Profile ──────────
 
-export async function handleGetBehavioralProfile(
+async function handleGetBehavioralProfileImpl(
   args: Record<string, unknown>,
   log: McpLogger,
 ): Promise<CallToolResult> {
@@ -338,7 +818,7 @@ export async function handleGetBehavioralProfile(
 
 // ────────── Tool 5: Get Contract Profile ──────────
 
-export async function handleGetContractProfile(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetContractProfileImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   if (!isUUID(symbol_version_id)) return errorResult("symbol_version_id is required and must be a valid UUID")
 
@@ -353,7 +833,7 @@ export async function handleGetContractProfile(args: Record<string, unknown>, lo
 
 // ────────── Tool 6: Get Invariants ──────────
 
-export async function handleGetInvariants(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetInvariantsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_id = requireString(args, "symbol_id")
   if (!isUUID(symbol_id)) return errorResult("symbol_id is required and must be a valid UUID")
 
@@ -365,7 +845,7 @@ export async function handleGetInvariants(args: Record<string, unknown>, log: Mc
 
 // ────────── Tool 7: Get Uncertainty Report ──────────
 
-export async function handleGetUncertainty(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetUncertaintyImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const snapshot_id = requireString(args, "snapshot_id")
   if (!isUUID(snapshot_id)) return errorResult("snapshot_id is required and must be a valid UUID")
 
@@ -377,7 +857,7 @@ export async function handleGetUncertainty(args: Record<string, unknown>, log: M
 
 // ────────── Tool 8: Find Homologs ──────────
 
-export async function handleFindHomologs(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleFindHomologsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   const snapshot_id = requireString(args, "snapshot_id")
   const rawConf =
@@ -409,7 +889,7 @@ export async function handleFindHomologs(args: Record<string, unknown>, log: Mcp
 
 // ────────── Tool 9: Blast Radius ──────────
 
-export async function handleBlastRadius(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleBlastRadiusImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_version_ids = args.symbol_version_ids
   const snapshot_id = requireString(args, "snapshot_id")
   const rawDepth =
@@ -434,7 +914,7 @@ export async function handleBlastRadius(args: Record<string, unknown>, log: McpL
 
 // ────────── Tool 10: Compile Context Capsule ──────────
 
-export async function handleCompileContextCapsule(
+async function handleCompileContextCapsuleImpl(
   args: Record<string, unknown>,
   log: McpLogger,
 ): Promise<CallToolResult> {
@@ -635,7 +1115,7 @@ export async function handleRollbackChange(args: Record<string, unknown>, log: M
 
 // ────────── Tool 16: Propagation Proposals ──────────
 
-export async function handlePropagationProposals(
+async function handlePropagationProposalsImpl(
   args: Record<string, unknown>,
   log: McpLogger,
 ): Promise<CallToolResult> {
@@ -861,7 +1341,7 @@ export async function handleListSnapshots(args: Record<string, unknown>, log: Mc
 
 // ────────── Tool 21: Snapshot Stats ──────────
 
-export async function handleSnapshotStats(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleSnapshotStatsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const snapshot_id = requireString(args, "snapshot_id")
   if (!isUUID(snapshot_id)) return errorResult("snapshot_id is required and must be a valid UUID")
 
@@ -951,7 +1431,7 @@ export async function handlePersistHomologs(args: Record<string, unknown>, log: 
 // survives repo path changes. Falls back to disk for pre-migration data.
 // Supports batch queries (multiple symbol_version_ids in one call).
 
-export async function handleReadSource(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleReadSourceImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const repo_id = requireString(args, "repo_id")
   const symbol_version_id = optionalString(args, "symbol_version_id")
   const symbol_version_ids = optionalArray<string>(args, "symbol_version_ids")
@@ -1083,7 +1563,7 @@ export async function handleReadSource(args: Record<string, unknown>, log: McpLo
 // lines with context. This enables deep audit through MCP without
 // needing to read every file manually.
 
-export async function handleSearchCode(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleSearchCodeImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const repo_id = requireString(args, "repo_id")
   const pattern = requireString(args, "pattern")
   const file_pattern = optionalString(args, "file_pattern")
@@ -1115,7 +1595,7 @@ export async function handleSearchCode(args: Record<string, unknown>, log: McpLo
 // "What does this codebase look like? Where are the risks?"
 // This is the tool that turns ContextZero from an indexer into an auditor.
 
-export async function handleCodebaseOverview(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleCodebaseOverviewImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const repo_id = requireString(args, "repo_id")
   const snapshot_id = requireString(args, "snapshot_id")
 
@@ -1292,7 +1772,7 @@ export async function handleNativeSearchCode(args: Record<string, unknown>, log:
 // function bodies. "where does the code accumulate V×V matrices"
 // returns relevant symbols ranked by body-view cosine similarity.
 
-export async function handleSemanticSearch(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleSemanticSearchImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const query = requireString(args, "query")
   const snapshot_id = requireString(args, "snapshot_id")
   const limit = typeof args.limit === "number" ? Math.min(Math.max(args.limit, 1), 50) : 15
@@ -1400,7 +1880,7 @@ export async function handleSemanticSearch(args: Record<string, unknown>, log: M
 //
 // This is the "give me everything I need for this change" tool.
 
-export async function handleSmartContext(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleSmartContextImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const task_description = requireString(args, "task_description")
   const target_symbol_version_ids = requireArray<string>(args, "target_symbol_version_ids")
   const snapshot_id = requireString(args, "snapshot_id")
@@ -1436,7 +1916,7 @@ export async function handleSmartContext(args: Record<string, unknown>, log: Mcp
 /**
  * Get dispatch edges for a symbol — resolved method chains.
  */
-export async function handleGetDispatchEdges(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
+async function handleGetDispatchEdgesImpl(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   if (!isUUID(symbol_version_id)) return errorResult("symbol_version_id required")
 
@@ -1453,7 +1933,7 @@ export async function handleGetDispatchEdges(args: Record<string, unknown>, _log
 /**
  * Get class hierarchy (MRO) for a class symbol.
  */
-export async function handleGetClassHierarchy(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
+async function handleGetClassHierarchyImpl(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
   const snapshot_id = requireString(args, "snapshot_id")
   const symbol_version_id = requireString(args, "symbol_version_id")
   if (!isUUID(snapshot_id) || !isUUID(symbol_version_id))
@@ -1487,7 +1967,7 @@ export async function handleGetSymbolLineage(args: Record<string, unknown>, _log
 /**
  * Get effect signature for a symbol.
  */
-export async function handleGetEffectSignature(
+async function handleGetEffectSignatureImpl(
   args: Record<string, unknown>,
   _log: McpLogger,
 ): Promise<CallToolResult> {
@@ -1519,7 +1999,7 @@ export async function handleGetEffectSignature(
 /**
  * Diff effects between two symbol versions (before/after change).
  */
-export async function handleDiffEffects(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
+async function handleDiffEffectsImpl(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
   const before_sv_id = requireString(args, "before_symbol_version_id")
   const after_sv_id = requireString(args, "after_symbol_version_id")
   if (!isUUID(before_sv_id) || !isUUID(after_sv_id))
@@ -1538,7 +2018,7 @@ export async function handleDiffEffects(args: Record<string, unknown>, _log: Mcp
 /**
  * Get concept family for a symbol.
  */
-export async function handleGetConceptFamily(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
+async function handleGetConceptFamilyImpl(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   if (!isUUID(symbol_version_id)) return errorResult("symbol_version_id required")
 
@@ -1558,7 +2038,7 @@ export async function handleGetConceptFamily(args: Record<string, unknown>, _log
 /**
  * List all concept families in a snapshot.
  */
-export async function handleListConceptFamilies(
+async function handleListConceptFamiliesImpl(
   args: Record<string, unknown>,
   _log: McpLogger,
 ): Promise<CallToolResult> {
@@ -1578,7 +2058,7 @@ export async function handleListConceptFamilies(
 /**
  * Get temporal risk score for a symbol.
  */
-export async function handleGetTemporalRisk(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
+async function handleGetTemporalRiskImpl(args: Record<string, unknown>, _log: McpLogger): Promise<CallToolResult> {
   const symbol_id = requireString(args, "symbol_id")
   const snapshot_id = requireString(args, "snapshot_id")
   if (!isUUID(symbol_id) || !isUUID(snapshot_id)) return errorResult("symbol_id and snapshot_id required")
@@ -1600,7 +2080,7 @@ export async function handleGetTemporalRisk(args: Record<string, unknown>, _log:
 /**
  * Get co-change partners for a symbol.
  */
-export async function handleGetCoChangePartners(
+async function handleGetCoChangePartnersImpl(
   args: Record<string, unknown>,
   _log: McpLogger,
 ): Promise<CallToolResult> {
@@ -1690,7 +2170,7 @@ export async function handleIngestRuntimeTrace(
 /**
  * Get runtime evidence for a symbol.
  */
-export async function handleGetRuntimeEvidence(
+async function handleGetRuntimeEvidenceImpl(
   args: Record<string, unknown>,
   _log: McpLogger,
 ): Promise<CallToolResult> {
@@ -1810,7 +2290,7 @@ export async function handleCacheStats(_args: Record<string, unknown>, _log: Mcp
 
 // ────────── Tool 43: Get Tests ──────────
 
-export async function handleGetTests(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetTestsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_id = requireString(args, "symbol_id")
   const snapshot_id = requireString(args, "snapshot_id")
   if (!isUUID(symbol_id)) return errorResult("symbol_id is required and must be a valid UUID")
@@ -1822,7 +2302,7 @@ export async function handleGetTests(args: Record<string, unknown>, log: McpLogg
 
 // ────────── Tool 44: Explain Relation ──────────
 
-export async function handleExplainRelation(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleExplainRelationImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const src_symbol_version_id = requireString(args, "src_symbol_version_id")
   const dst_symbol_version_id = requireString(args, "dst_symbol_version_id")
   const snapshot_id = requireString(args, "snapshot_id")
@@ -1836,7 +2316,7 @@ export async function handleExplainRelation(args: Record<string, unknown>, log: 
 
 // ────────── Tool 45: Get Neighbors ──────────
 
-export async function handleGetNeighbors(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleGetNeighborsImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const symbol_version_id = requireString(args, "symbol_version_id")
   const snapshot_id = requireString(args, "snapshot_id")
   if (!isUUID(symbol_version_id)) return errorResult("symbol_version_id is required and must be a valid UUID")
@@ -1861,7 +2341,7 @@ export async function handleGetNeighbors(args: Record<string, unknown>, log: Mcp
 
 // ────────── Tool 46: Find Concept ──────────
 
-export async function handleFindConcept(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleFindConceptImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const concept = requireString(args, "concept")
   const repo_id = requireString(args, "repo_id")
   const snapshot_id = requireString(args, "snapshot_id")
@@ -1878,7 +2358,7 @@ export async function handleFindConcept(args: Record<string, unknown>, log: McpL
 
 // ────────── Tool 47: Semantic Diff ──────────
 
-export async function handleSemanticDiff(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleSemanticDiffImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const before_symbol_version_id = requireString(args, "before_symbol_version_id")
   const after_symbol_version_id = requireString(args, "after_symbol_version_id")
   if (!isUUID(before_symbol_version_id))
@@ -1892,7 +2372,7 @@ export async function handleSemanticDiff(args: Record<string, unknown>, log: Mcp
 
 // ────────── Tool 48: Contract Diff ──────────
 
-export async function handleContractDiff(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handleContractDiffImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const before_symbol_version_id = optionalString(args, "before_symbol_version_id") || undefined
   const after_symbol_version_id = optionalString(args, "after_symbol_version_id") || undefined
   const txn_id = optionalString(args, "txn_id") || undefined
@@ -1911,7 +2391,7 @@ export async function handleContractDiff(args: Record<string, unknown>, log: Mcp
 
 // ────────── Tool 49: Plan Change ──────────
 
-export async function handlePlanChange(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
+async function handlePlanChangeImpl(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
   const repo_id = requireString(args, "repo_id")
   const snapshot_id = requireString(args, "snapshot_id")
   const task_description = requireString(args, "task_description")
@@ -2104,3 +2584,49 @@ export async function handleAdminSystemInfo(_args: Record<string, unknown>, log:
     caches: cacheStats,
   })
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// GUARDED READ EXPORTS — BUG-002
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Every snapshot-resolving read tool is exported through `guardRead` so the
+// index-integrity check cannot be forgotten in one handler body. The `…Impl`
+// functions above are deliberately NOT exported: one public path per tool, so
+// nothing can call the unguarded version by accident.
+
+// strict — refuses to answer from an incomplete index
+export const handleGetSymbolRelations = guardRead("scg_get_symbol_relations", handleGetSymbolRelationsImpl)
+export const handleGetNeighbors = guardRead("scg_get_neighbors", handleGetNeighborsImpl)
+export const handleBlastRadius = guardRead("scg_blast_radius", handleBlastRadiusImpl)
+export const handleGetDispatchEdges = guardRead("scg_get_dispatch_edges", handleGetDispatchEdgesImpl)
+export const handleGetClassHierarchy = guardRead("scg_get_class_hierarchy", handleGetClassHierarchyImpl)
+export const handleGetTests = guardRead("scg_get_tests", handleGetTestsImpl)
+export const handleExplainRelation = guardRead("scg_explain_relation", handleExplainRelationImpl)
+export const handlePropagationProposals = guardRead("scg_propagation_proposals", handlePropagationProposalsImpl)
+export const handleCompileContextCapsule = guardRead("scg_compile_context_capsule", handleCompileContextCapsuleImpl)
+export const handleSmartContext = guardRead("scg_smart_context", handleSmartContextImpl)
+export const handlePlanChange = guardRead("scg_plan_change", handlePlanChangeImpl)
+
+// flag — answers, but never silently presents partial data as complete
+export const handleResolveSymbol = guardRead("scg_resolve_symbol", handleResolveSymbolImpl)
+export const handleGetSymbolDetails = guardRead("scg_get_symbol_details", handleGetSymbolDetailsImpl)
+export const handleGetBehavioralProfile = guardRead("scg_get_behavioral_profile", handleGetBehavioralProfileImpl)
+export const handleGetContractProfile = guardRead("scg_get_contract_profile", handleGetContractProfileImpl)
+export const handleGetInvariants = guardRead("scg_get_invariants", handleGetInvariantsImpl)
+export const handleGetUncertainty = guardRead("scg_get_uncertainty", handleGetUncertaintyImpl)
+export const handleFindHomologs = guardRead("scg_find_homologs", handleFindHomologsImpl)
+export const handleSnapshotStats = guardRead("scg_snapshot_stats", handleSnapshotStatsImpl)
+export const handleReadSource = guardRead("scg_read_source", handleReadSourceImpl)
+export const handleSearchCode = guardRead("scg_search_code", handleSearchCodeImpl)
+export const handleCodebaseOverview = guardRead("scg_codebase_overview", handleCodebaseOverviewImpl)
+export const handleSemanticSearch = guardRead("scg_semantic_search", handleSemanticSearchImpl)
+export const handleFindConcept = guardRead("scg_find_concept", handleFindConceptImpl)
+export const handleGetEffectSignature = guardRead("scg_get_effect_signature", handleGetEffectSignatureImpl)
+export const handleDiffEffects = guardRead("scg_diff_effects", handleDiffEffectsImpl)
+export const handleGetConceptFamily = guardRead("scg_get_concept_family", handleGetConceptFamilyImpl)
+export const handleListConceptFamilies = guardRead("scg_list_concept_families", handleListConceptFamiliesImpl)
+export const handleGetTemporalRisk = guardRead("scg_get_temporal_risk", handleGetTemporalRiskImpl)
+export const handleGetCoChangePartners = guardRead("scg_get_co_change_partners", handleGetCoChangePartnersImpl)
+export const handleGetRuntimeEvidence = guardRead("scg_get_runtime_evidence", handleGetRuntimeEvidenceImpl)
+export const handleSemanticDiff = guardRead("scg_semantic_diff", handleSemanticDiffImpl)
+export const handleContractDiff = guardRead("scg_contract_diff", handleContractDiffImpl)

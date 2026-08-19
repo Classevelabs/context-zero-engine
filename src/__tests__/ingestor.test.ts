@@ -55,6 +55,8 @@ const mockMergeSymbol = jest.fn().mockResolvedValue("sym-001")
 const mockGetSymbolVersionsForSnapshot = jest.fn().mockResolvedValue([])
 const mockInsertTestArtifact = jest.fn().mockResolvedValue(undefined)
 
+const mockBulkUpsertBehavioralProfiles = jest.fn().mockResolvedValue(0)
+const mockBulkUpsertContractProfiles = jest.fn().mockResolvedValue(0)
 jest.mock("../db-driver/core_data", () => ({
   coreDataService: {
     createRepository: (...args: any[]) => mockCreateRepository(...args),
@@ -64,6 +66,11 @@ jest.mock("../db-driver/core_data", () => ({
     mergeSymbol: (...args: any[]) => mockMergeSymbol(...args),
     getSymbolVersionsForSnapshot: (...args: any[]) => mockGetSymbolVersionsForSnapshot(...args),
     insertTestArtifact: (...args: any[]) => mockInsertTestArtifact(...args),
+    // The ingest loop persists profiles through these bulk writers rather than
+    // one round trip per symbol; the mock must carry them or the ingest throws
+    // and every status assertion in this file reports "failed" instead.
+    bulkUpsertBehavioralProfiles: (...args: any[]) => mockBulkUpsertBehavioralProfiles(...args),
+    bulkUpsertContractProfiles: (...args: any[]) => mockBulkUpsertContractProfiles(...args),
   },
 }))
 
@@ -2110,5 +2117,82 @@ describe("Ingestor — SKIP_DIRS coverage", () => {
 
     // readdir should only be called once (for root), no subdirectory recursion
     expect(mockReaddir).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * A refused ingest must be distinguishable from an empty one.
+ *
+ * The lock-contention path returned the success shape with every counter at
+ * zero and no error field. A caller cannot tell that apart from a repository
+ * that genuinely has no indexable files, so a concurrent run was recorded as a
+ * completed index and whatever graph already existed was trusted as current.
+ */
+describe("Ingestor — advisory lock contention is an error, not a silent no-op", () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+    mockAdvisoryRelease.mockResolvedValue(undefined)
+  })
+
+  it("reports an error and a machine-readable code when the ingest lock is held", async () => {
+    mockTryAdvisoryLock.mockResolvedValue(null)
+
+    const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123")
+
+    expect(result.error).toBeDefined()
+    expect(result.error_code).toBe("INGEST_LOCK_HELD")
+    // The counters stay zero, which is exactly why the error field has to be
+    // there — the zeros alone read as a successful empty ingest.
+    expect(result.files_processed).toBe(0)
+    expect(result.snapshot_id).toBe("")
+  })
+
+  it("does not set an error when the lock is acquired normally", async () => {
+    mockTryAdvisoryLock.mockResolvedValue({ release: mockAdvisoryRelease })
+    mockReaddir.mockResolvedValueOnce([])
+
+    const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123")
+
+    expect(result.error).toBeUndefined()
+    expect(result.error_code).toBeUndefined()
+  })
+})
+
+/**
+ * Incremental re-indexing must not delete a file's INBOUND edges.
+ *
+ * A relation is re-extracted by the file that declares its source. Deleting by
+ * `dst_symbol_version_id` removed edges owned by files that are not being
+ * re-indexed on this pass and will never re-emit them, so editing one file
+ * silently erased its own callers — "who calls this?" answered nothing, and
+ * the symbol read as dead code until a full re-ingest.
+ */
+describe("Ingestor — incremental delete preserves inbound relations", () => {
+  it("deletes relations by source only, never by destination", () => {
+    const source = require("fs").readFileSync(
+      require("path").join(__dirname, "..", "ingestor", "index.ts"),
+      "utf8",
+    ) as string
+
+    // Isolate the incremental invalidation delete.
+    const stmt = source
+      .split("DELETE FROM structural_relations")
+      .slice(1)
+      .map((chunk) => chunk.slice(0, 400))
+
+    expect(stmt.length).toBeGreaterThan(0)
+
+    const incremental = stmt.filter((s) => s.includes("symbol_versions WHERE file_id"))
+    expect(incremental.length).toBeGreaterThan(0)
+
+    for (const s of incremental) {
+      expect(s).toContain("src_symbol_version_id IN")
+      // The load-bearing assertion: no destination-side deletion in the
+      // per-file invalidation. Dangling rows are removed by the
+      // ON DELETE CASCADE on structural_relations -> symbol_versions when the
+      // symbol versions themselves go, which is verified against the live
+      // schema (confdeltype = 'c' on both FKs).
+      expect(s).not.toContain("dst_symbol_version_id IN")
+    }
   })
 })

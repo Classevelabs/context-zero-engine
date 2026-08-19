@@ -458,7 +458,27 @@ export interface IngestionResult {
   deep_contracts_mined?: number
   concept_families_built?: number
   temporal_co_changes_found?: number
+  /**
+   * Set when the ingest did NOT run. Absent on every successful ingest.
+   *
+   * A refused ingest used to return this whole structure zeroed with no error
+   * field, which is indistinguishable from a repository that genuinely has no
+   * files: the caller sees files_processed 0 and no failure, records success,
+   * and moves on believing the index is current. Any consumer must treat a
+   * present `error` as "nothing happened", not as "an empty repository".
+   */
+  error?: string
+  /** Machine-readable companion to `error`, for callers that branch on cause. */
+  error_code?: IngestionErrorCode
 }
+
+/**
+ * Why an ingest refused to run. Distinct from per-file extraction failures,
+ * which are counted in `files_failed` and explained in `failure_summary`.
+ */
+export type IngestionErrorCode =
+  /** Another ingest holds the advisory lock for this repo+commit. Retry later. */
+  | "INGEST_LOCK_HELD"
 
 // ============================================================================
 // V2 ENTITIES — Dispatch, Lineage, Effects, Families, Temporal, Runtime

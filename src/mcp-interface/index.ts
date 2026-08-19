@@ -245,7 +245,48 @@ app.use(rateLimitMiddleware)
  * Uses the shared SAFE_ERROR_PREFIXES from handlers.ts — single source of truth
  * for both the REST API and MCP bridge.
  */
-import { SAFE_ERROR_PREFIXES } from "../mcp-bridge/handlers"
+import {
+  SAFE_ERROR_PREFIXES,
+  INDEX_INTEGRITY_POLICIES,
+  checkIndexIntegrity,
+  mergeIntegrityAnnotation,
+} from "../mcp-bridge/handlers"
+
+// ────────── Index Integrity Gate (BUG-002) ──────────
+//
+// Same guard, same policy table, same single helper as the MCP bridge — see the
+// long rule comment in src/mcp-bridge/handlers.ts. Wired here as one middleware
+// so a route is guarded by adding a single line to its chain, rather than by
+// remembering to repeat a check inside sixty handler bodies.
+//
+// Placed AFTER the JSON parser and validateBody so req.body is populated and
+// already shape-checked. A blocked read answers 409 Conflict: the request is
+// well-formed, the stored index is in a state that cannot answer it honestly.
+
+function indexIntegrityGate(toolName: string): (req: Request, res: Response, next: NextFunction) => void {
+  const policy = INDEX_INTEGRITY_POLICIES[toolName]
+  if (!policy) {
+    throw new Error(`No index-integrity policy registered for ${toolName}`)
+  }
+  return (req: Request, res: Response, next: NextFunction) => {
+    checkIndexIntegrity((req.body ?? {}) as Record<string, unknown>, policy, toolName, log)
+      .then((decision) => {
+        if (decision.block) {
+          res.status(409).json({ error: decision.message, correlationId: req.correlationId })
+          return
+        }
+        if (decision.annotation) {
+          const sendJson = res.json.bind(res)
+          // Only successful payloads are annotated — an error body already says
+          // what went wrong, and 'complete' indexes never reach this branch.
+          res.json = (body: unknown) =>
+            res.statusCode >= 400 ? sendJson(body) : sendJson(mergeIntegrityAnnotation(body, decision))
+        }
+        next()
+      })
+      .catch(next)
+  }
+}
 
 function isUserFacingError(err: unknown): boolean {
   if (err instanceof UserFacingError) return true
@@ -477,6 +518,7 @@ app.post(
     kind_filter: optionalString,
     limit: optionalBoundedInt(1, MAX_LIST_LIMIT),
   }),
+  indexIntegrityGate("scg_resolve_symbol"),
   safeHandler(async (req, res) => {
     const { query, repo_id, snapshot_id, kind_filter, limit = 10 } = req.body
 
@@ -494,6 +536,7 @@ app.post(
     symbol_version_id: requireUUID,
     view_mode: optionalEnum("code", "summary", "signature"),
   }),
+  indexIntegrityGate("scg_get_symbol_details"),
   safeHandler(async (req, res) => {
     const { symbol_version_id, view_mode = "summary" } = req.body
 
@@ -511,6 +554,7 @@ app.post(
     symbol_version_id: requireUUID,
     direction: optionalEnum("inbound", "outbound", "both"),
   }),
+  indexIntegrityGate("scg_get_symbol_relations"),
   safeHandler(async (req, res) => {
     const { symbol_version_id, direction = "both" } = req.body
 
@@ -533,6 +577,7 @@ app.post(
   "/scg_get_behavioral_profile",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID }),
+  indexIntegrityGate("scg_get_behavioral_profile"),
   safeHandler(async (req, res) => {
     const profile = await behavioralEngine.getProfile(req.body.symbol_version_id)
     if (!profile) {
@@ -549,6 +594,7 @@ app.post(
   "/scg_get_contract_profile",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID }),
+  indexIntegrityGate("scg_get_contract_profile"),
   safeHandler(async (req, res) => {
     const profile = await contractEngine.getProfile(req.body.symbol_version_id)
     if (!profile) {
@@ -565,6 +611,7 @@ app.post(
   "/scg_get_invariants",
   JSON_QUERY,
   validateBody({ symbol_id: requireUUID }),
+  indexIntegrityGate("scg_get_invariants"),
   safeHandler(async (req, res) => {
     const invariants = await contractEngine.getInvariantsForSymbol(req.body.symbol_id)
     res.json({ invariants, count: invariants.length })
@@ -581,6 +628,7 @@ app.post(
     snapshot_id: requireUUID,
     confidence_threshold: optionalConfidence,
   }),
+  indexIntegrityGate("scg_find_homologs"),
   safeHandler(async (req, res) => {
     const { symbol_version_id, snapshot_id, confidence_threshold = 0.7 } = req.body
 
@@ -600,6 +648,7 @@ app.post(
     snapshot_id: requireUUID,
     depth: optionalBoundedInt(1, MAX_GRAPH_DEPTH),
   }),
+  indexIntegrityGate("scg_blast_radius"),
   safeHandler(async (req, res) => {
     const { symbol_version_ids, snapshot_id, depth = 2 } = req.body
 
@@ -620,6 +669,7 @@ app.post(
     mode: optionalEnum("minimal", "standard", "strict"),
     token_budget: optionalBoundedInt(100, MAX_TOKEN_BUDGET),
   }),
+  indexIntegrityGate("scg_compile_context_capsule"),
   safeHandler(async (req, res) => {
     const { symbol_version_id, snapshot_id, mode = "standard", token_budget } = req.body
 
@@ -651,6 +701,7 @@ app.post(
   "/scg_get_uncertainty",
   JSON_QUERY,
   validateBody({ snapshot_id: requireUUID }),
+  indexIntegrityGate("scg_get_uncertainty"),
   safeHandler(async (req, res) => {
     const report = await uncertaintyTracker.getSnapshotUncertainty(req.body.snapshot_id)
     res.json({ report })
@@ -840,6 +891,7 @@ app.post(
     txn_id: requireUUID,
     snapshot_id: requireUUID,
   }),
+  indexIntegrityGate("scg_propagation_proposals"),
   safeHandler(async (req, res) => {
     const { txn_id, snapshot_id } = req.body
 
@@ -936,6 +988,7 @@ app.post(
   "/scg_snapshot_stats",
   JSON_QUERY,
   validateBody({ snapshot_id: requireUUID }),
+  indexIntegrityGate("scg_snapshot_stats"),
   safeHandler(async (req, res) => {
     const { snapshot_id } = req.body
 
@@ -1035,6 +1088,7 @@ app.post(
     },
     file_path: optionalString,
   }),
+  indexIntegrityGate("scg_read_source"),
   safeHandler(async (req, res) => {
     const { repo_id, symbol_version_id, symbol_version_ids, file_path: reqFilePath } = req.body
 
@@ -1140,6 +1194,7 @@ app.post(
     max_results: optionalBoundedInt(1, 100),
     context_lines: optionalBoundedInt(0, 5),
   }),
+  indexIntegrityGate("scg_search_code"),
   safeHandler(async (req, res) => {
     const { repo_id, pattern, file_pattern, max_results = 30, context_lines: ctxLines = 2 } = req.body
 
@@ -1166,6 +1221,7 @@ app.post(
     repo_id: requireUUID,
     snapshot_id: requireUUID,
   }),
+  indexIntegrityGate("scg_codebase_overview"),
   safeHandler(async (req, res) => {
     const { snapshot_id } = req.body
 
@@ -1183,6 +1239,7 @@ app.post(
     query: requireString,
     snapshot_id: requireUUID,
   }),
+  indexIntegrityGate("scg_semantic_search"),
   safeHandler(async (req, res) => {
     const { query, snapshot_id, limit: rawLimit, include_source } = req.body
     const limit = typeof rawLimit === "number" ? Math.min(Math.max(rawLimit, 1), 50) : 15
@@ -1250,6 +1307,7 @@ app.post(
     target_symbol_version_ids: requireUUIDArray,
     snapshot_id: requireUUID,
   }),
+  indexIntegrityGate("scg_smart_context"),
   safeHandler(async (req, res) => {
     const {
       task_description,
@@ -1275,6 +1333,7 @@ app.post(
   "/scg_get_dispatch_edges",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID }),
+  indexIntegrityGate("scg_get_dispatch_edges"),
   safeHandler(async (req, res) => {
     const { symbol_version_id } = req.body
     const { dispatchResolver } = await import("../analysis-engine/dispatch-resolver")
@@ -1287,6 +1346,7 @@ app.post(
   "/scg_get_class_hierarchy",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID, snapshot_id: requireUUID }),
+  indexIntegrityGate("scg_get_class_hierarchy"),
   safeHandler(async (req, res) => {
     const { symbol_version_id, snapshot_id } = req.body
     const { dispatchResolver } = await import("../analysis-engine/dispatch-resolver")
@@ -1311,6 +1371,7 @@ app.post(
   "/scg_get_effect_signature",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID }),
+  indexIntegrityGate("scg_get_effect_signature"),
   safeHandler(async (req, res) => {
     const { symbol_version_id } = req.body
     const { effectEngine } = await import("../analysis-engine/effect-engine")
@@ -1342,6 +1403,7 @@ app.post(
     before_symbol_version_id: requireUUID,
     after_symbol_version_id: requireUUID,
   }),
+  indexIntegrityGate("scg_diff_effects"),
   safeHandler(async (req, res) => {
     const { before_symbol_version_id, after_symbol_version_id } = req.body
     const { effectEngine } = await import("../analysis-engine/effect-engine")
@@ -1354,6 +1416,7 @@ app.post(
   "/scg_get_concept_family",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID }),
+  indexIntegrityGate("scg_get_concept_family"),
   safeHandler(async (req, res) => {
     const { symbol_version_id } = req.body
     const { conceptFamilyEngine } = await import("../analysis-engine/concept-families")
@@ -1366,6 +1429,7 @@ app.post(
   "/scg_list_concept_families",
   JSON_QUERY,
   validateBody({ snapshot_id: requireUUID }),
+  indexIntegrityGate("scg_list_concept_families"),
   safeHandler(async (req, res) => {
     const { snapshot_id } = req.body
     const { conceptFamilyEngine } = await import("../analysis-engine/concept-families")
@@ -1378,6 +1442,7 @@ app.post(
   "/scg_get_temporal_risk",
   JSON_QUERY,
   validateBody({ symbol_id: requireUUID, snapshot_id: requireUUID }),
+  indexIntegrityGate("scg_get_temporal_risk"),
   safeHandler(async (req, res) => {
     const { symbol_id, snapshot_id } = req.body
     const { temporalEngine } = await import("../analysis-engine/temporal-engine")
@@ -1390,6 +1455,7 @@ app.post(
   "/scg_get_co_change_partners",
   JSON_QUERY,
   validateBody({ symbol_id: requireUUID, repo_id: requireUUID }),
+  indexIntegrityGate("scg_get_co_change_partners"),
   safeHandler(async (req, res) => {
     const { symbol_id, repo_id, min_jaccard } = req.body
     const { temporalEngine } = await import("../analysis-engine/temporal-engine")
@@ -1473,6 +1539,7 @@ app.post(
   "/scg_get_runtime_evidence",
   JSON_QUERY,
   validateBody({ symbol_version_id: requireUUID }),
+  indexIntegrityGate("scg_get_runtime_evidence"),
   safeHandler(async (req, res) => {
     const { symbol_version_id } = req.body
     const { runtimeEvidenceEngine } = await import("../analysis-engine/runtime-evidence")
@@ -1490,6 +1557,7 @@ app.post(
     symbol_id: requireUUID,
     snapshot_id: requireUUID,
   }),
+  indexIntegrityGate("scg_get_tests"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await getTests({
@@ -1513,6 +1581,7 @@ app.post(
     dst_symbol_version_id: requireUUID,
     snapshot_id: requireUUID,
   }),
+  indexIntegrityGate("scg_explain_relation"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await explainRelation({
@@ -1539,6 +1608,7 @@ app.post(
     depth: optionalBoundedInt(1, MAX_GRAPH_DEPTH),
     max_nodes: optionalBoundedInt(1, 500),
   }),
+  indexIntegrityGate("scg_get_neighbors"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const relation_types = Array.isArray(req.body.relation_types)
@@ -1572,6 +1642,7 @@ app.post(
     language_filter: optionalString,
     limit: optionalBoundedInt(1, MAX_LIST_LIMIT),
   }),
+  indexIntegrityGate("scg_find_concept"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await findConcept({
@@ -1598,6 +1669,7 @@ app.post(
     before_symbol_version_id: requireUUID,
     after_symbol_version_id: requireUUID,
   }),
+  indexIntegrityGate("scg_semantic_diff"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await computeSemanticDiff({
@@ -1621,6 +1693,7 @@ app.post(
     after_symbol_version_id: optionalUUID,
     txn_id: optionalUUID,
   }),
+  indexIntegrityGate("scg_contract_diff"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (!req.body.txn_id && (!req.body.before_symbol_version_id || !req.body.after_symbol_version_id)) {
@@ -1650,6 +1723,7 @@ app.post(
     task_description: requireString,
     max_candidates: optionalBoundedInt(1, 20),
   }),
+  indexIntegrityGate("scg_plan_change"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const result = await planChange({

@@ -38,7 +38,7 @@ import { resolveExistingPath, resolvePathWithinBase } from "../path-security"
 import { toPortableRelativePath } from "../workspace-native"
 import type { PoolClient } from "pg"
 import type { SymbolVersionRow } from "../db-driver/core_data"
-import type { AdapterExtractionResult, IngestionResult, ExtractedSymbol } from "../types"
+import type { AdapterExtractionResult, IngestionResult, IngestionErrorCode, ExtractedSymbol } from "../types"
 
 const log = new Logger("ingestor")
 const MAX_CANONICAL_NAME_LENGTH = 255
@@ -213,7 +213,13 @@ export class Ingestor {
     const lockKey = crypto.createHash("md5").update(`ingest:${canonicalRepoPath}:${commitSha}`).digest().readInt32BE(0)
     const ingestLock = await db.tryAdvisoryLock(lockKey)
     if (!ingestLock) {
-      log.warn("Ingestion already in progress for this repo/commit, skipping", {
+      // Refuse loudly. This used to return the success shape with every count
+      // zeroed and no error field, which a caller cannot tell apart from a
+      // repository that legitimately contains nothing — so a concurrent ingest
+      // was recorded as a completed one, and whatever index already existed
+      // was assumed current. The empty repo_id/snapshot_id were the only hint,
+      // and nothing checked them.
+      log.warn("Ingestion already in progress for this repo/commit, refusing", {
         repoPath: canonicalRepoPath,
         commitSha,
       })
@@ -227,6 +233,10 @@ export class Ingestor {
         behavior_hints_extracted: 0,
         contract_hints_extracted: 0,
         duration_ms: Date.now() - startTime,
+        error:
+          `Ingestion is already running for this repository and commit (${commitSha}). ` +
+          `Nothing was indexed by this call — do not treat it as an up-to-date index. Retry once the in-flight ingest finishes.`,
+        error_code: "INGEST_LOCK_HELD",
       }
     }
 
@@ -1167,20 +1177,41 @@ export class Ingestor {
       else contractsByKey.set(h.symbol_key, [h])
     }
 
+    // Compute every profile first, then write them in bulk.
+    //
+    // This loop used to await one INSERT per symbol, and a further INSERT per
+    // contract hint. The work is embarrassingly parallel — independent rows,
+    // a unique conflict key, no ordering requirement — so the serialization
+    // bought nothing and cost one full network + planner round trip per
+    // symbol. On a 23k-symbol repository that is 23k+ sequential round trips
+    // and it dominated ingest wall-clock. Extraction is pure and stays in this
+    // loop; only persistence moved.
+    //
+    // `persist = false` keeps the engines' compute path identical while
+    // suppressing their per-row write; the profiles are then handed to the
+    // chunked bulk upserts, which apply the same ON CONFLICT semantics.
+    const behavioralBatch: Array<Awaited<ReturnType<typeof behavioralEngine.extractBehavioralProfiles>>> = []
+    const contractBatch: Array<Awaited<ReturnType<typeof contractEngine.extractContractProfile>>> = []
+
     for (const { svId, sym } of resolvedEntries) {
-      // Process behavior hints for this symbol.
       // Always create a profile — even for symbols with zero hints.
       // A pure function with empty arrays IS its behavioral profile.
       // Skipping this would cause "profile not found" for pure functions.
       const symHints = hintsByKey.get(sym.stable_key) ?? []
-      await behavioralEngine.extractBehavioralProfiles(svId, symHints)
+      behavioralBatch.push(await behavioralEngine.extractBehavioralProfiles(svId, symHints, false))
 
-      // Process contract hints for this symbol
       const symContracts = contractsByKey.get(sym.stable_key) ?? []
       for (const hint of symContracts) {
-        await contractEngine.extractContractProfile(svId, hint)
+        contractBatch.push(await contractEngine.extractContractProfile(svId, hint, false))
       }
     }
+
+    // A symbol with several contract hints yields several rows for one
+    // symbol_version_id. The per-row path let the last write win; the bulk
+    // writer de-duplicates on the same key to preserve that, rather than
+    // letting one statement hit the same conflict target twice.
+    await coreDataService.bulkUpsertBehavioralProfiles(behavioralBatch)
+    await coreDataService.bulkUpsertContractProfiles(contractBatch)
 
     // Resolve structural relations
     const relCount = await structuralGraphEngine.computeRelationsFromRaw(snapshotId, repoId, extraction.relations)
@@ -1542,6 +1573,9 @@ export class Ingestor {
     deep_contracts_mined: number
     concept_families_built: number
     temporal_co_changes_found: number
+    /** Set only when the run was refused; absent on a real incremental pass. */
+    error?: string
+    error_code?: IngestionErrorCode
   }> {
     const timer = log.startTimer("ingestIncremental", {
       repoId,
@@ -1554,8 +1588,15 @@ export class Ingestor {
     const lockKey = crypto.createHash("md5").update(`ingest-incr:${repoId}:${snapshotId}`).digest().readInt32BE(0)
     const incrementalLock = await db.tryAdvisoryLock(lockKey)
     if (!incrementalLock) {
-      log.warn("Incremental ingestion already in progress for this repo/snapshot, skipping", { repoId, snapshotId })
+      // Same failure shape as the full-ingest lock path: a zeroed success is
+      // indistinguishable from "nothing had changed", so the caller records a
+      // no-op as a completed re-index and the stale graph is trusted.
+      log.warn("Incremental ingestion already in progress for this repo/snapshot, refusing", { repoId, snapshotId })
       return {
+        error:
+          `Incremental ingestion is already running for this repository snapshot. ` +
+          `Nothing was re-indexed by this call — the graph may be stale. Retry once the in-flight pass finishes.`,
+        error_code: "INGEST_LOCK_HELD" as const,
         symbolsUpdated: 0,
         relationsUpdated: 0,
         new_files_indexed: 0,
@@ -1609,14 +1650,28 @@ export class Ingestor {
               invalidatedSvIds.push(row.symbol_version_id)
             }
 
-            // Delete structural relations touching these symbol versions
+            // Delete only the relations this file OWNS — the ones going OUT of
+            // its symbols. Its inbound edges belong to other files and must
+            // survive.
+            //
+            // This previously deleted `src IN (file's symbols) OR dst IN
+            // (file's symbols)`. A relation is re-extracted by the file that
+            // declares its SOURCE, so deleting by `dst` destroyed edges owned
+            // by files that are not being re-indexed on this pass and will not
+            // re-emit them. Editing one file therefore silently erased its
+            // callers: "who calls this?" returned nothing, and the function
+            // read as dead code to anything consuming the graph. The rows only
+            // came back on a full re-ingest.
+            //
+            // Rows whose dst genuinely disappears are not leaked — the symbol
+            // versions themselves are deleted below, and the FK from
+            // structural_relations to symbol_versions removes the dangling
+            // edges with them.
             await db.queryWithClient(
               client,
               `
                         DELETE FROM structural_relations
                         WHERE src_symbol_version_id IN (
-                            SELECT symbol_version_id FROM symbol_versions WHERE file_id = $1
-                        ) OR dst_symbol_version_id IN (
                             SELECT symbol_version_id FROM symbol_versions WHERE file_id = $1
                         )
                     `,
