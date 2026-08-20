@@ -27,7 +27,7 @@ Operational notes:
 ## Requirements
 
 - Node.js 20 or newer.
-- PostgreSQL 14 or newer with `pg_trgm`.
+- PostgreSQL 14 or newer (17 recommended) with `pg_trgm`.
 - Python 3 with `libcst` for Python extraction.
 - Windows users may need Microsoft C++ Build Tools if native npm packages compile locally.
 
@@ -68,12 +68,27 @@ DB_PORT=5432
 DB_NAME=scg_v2
 DB_USER=postgres
 DB_PASSWORD=your-real-password
-SCG_ALLOWED_BASE_PATHS=D:\Repos,D:\Work
+SCG_ALLOWED_BASE_PATHS=C:\Repos,D:\Work
 SCG_MAX_FILES_PER_REPO=20000
 SCG_MAX_FILE_SIZE_BYTES=1048576
 SCG_INGEST_WORKERS=4
 SCG_PYTHON_TIMEOUT_MS=30000
 ```
+
+`.env` does not override a variable that is already set in the process
+environment. If `SCG_ALLOWED_BASE_PATHS` (or any `DB_*`/`SCG_*` name) exists as
+a system or user environment variable, that value wins and editing `.env` has
+no effect. Check before assuming the file is being read:
+
+```powershell
+$env:SCG_ALLOWED_BASE_PATHS
+```
+
+```bash
+echo $SCG_ALLOWED_BASE_PATHS
+```
+
+Either clear the environment variable or set the value there instead.
 
 Run diagnostics at any time:
 
@@ -146,11 +161,27 @@ tool argument.
 In an MCP client, call:
 
 ```text
-scg_health_check
-scg_ingest_repo
+scg_health_check                      → expect status: healthy
+scg_register_repo                     → repo_name + absolute repo_path; returns repo_id
+scg_ingest_repo                       → pass that repo_id
 ```
 
-For `scg_ingest_repo`, pass a repository path under `SCG_ALLOWED_BASE_PATHS`.
+`scg_ingest_repo` also accepts a bare `repo_path` if you would rather skip
+registration. Either way the path must sit under `SCG_ALLOWED_BASE_PATHS`.
+
+On macOS and Linux the same setting takes POSIX paths, for example
+`SCG_ALLOWED_BASE_PATHS=/home/you/repos,/srv/projects`.
+
+Ingestion finishes with a status:
+
+- `complete` — every file was extracted; all query tools answer normally.
+- `partial` — some files failed to extract. Symbols from the files that
+  succeeded are stored, but derived analysis is skipped and query tools report
+  the index as incomplete rather than answering from a fraction of the
+  repository. Re-run the ingest after fixing or excluding the offending files.
+- `failed` — nothing was extracted.
+
+Check any repository's current state with `scg_list_snapshots`.
 
 Recommended first-run ingest settings:
 
@@ -185,7 +216,7 @@ SCG_HOST=0.0.0.0
 SCG_PORT=3100
 SCG_API_KEYS=replace-with-a-strong-32-plus-character-key
 SCG_ADMIN_API_KEYS=replace-with-a-distinct-strong-32-plus-character-admin-key
-SCG_ALLOWED_BASE_PATHS=D:\Repos
+SCG_ALLOWED_BASE_PATHS=/srv/repos
 ```
 
 Do not expose the HTTP server directly to the open internet. Put it behind a reverse proxy with TLS, keep API keys strong, and restrict firewall access to known users or a VPN.

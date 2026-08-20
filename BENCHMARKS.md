@@ -9,8 +9,9 @@ targets, not independently verifiable release evidence or guaranteed field
 performance.
 
 **Hardware note.** All measurements were taken on a typical mid-range
-developer laptop (quad-core x86-64) with a local PostgreSQL 16 instance and
-Node.js 22 — no server hardware, no clustering. Absolute timings and reduction
+developer laptop (quad-core x86-64), no server hardware and no clustering.
+The historical runs below used PostgreSQL 16 and Node.js 22; the 2.6.0 ingest
+figures above used PostgreSQL 17 and Node.js 24. Absolute timings and reduction
 ratios can vary with corpus revision, selected symbols, disk, CPU, database
 configuration, and current engine version.
 
@@ -31,6 +32,32 @@ configuration, and current engine version.
 - A human or agent with good judgment could read fewer files than the
   baseline — or far more when manually tracing transitive dependencies.
   The baselines are defined so the comparison is mechanical and re-runnable.
+
+---
+
+## Current Ingest Throughput (2.6.0)
+
+One full clean ingest, measured on 2026-08-20 against an empty database on the
+hardware described above (PostgreSQL 17, Node.js 24):
+
+| Measure | Value |
+|---|---:|
+| Files indexed | 2,637 |
+| Files failed | 0 |
+| Symbol versions | 29,791 |
+| Structural relations | 34,818 |
+| Snapshot status | `complete` |
+| Wall clock | 5m 55s |
+
+That is roughly **7.4 files per second end to end**, including symbol
+extraction, relation resolution, dispatch resolution, lineage, effect
+signatures, contract mining, and concept families. Ingest cost grows with
+database size — the LSH change in 2.6.0 exists because the previous schema
+slowed down as the index accumulated. Reproduce on your own corpus with
+`npx ts-node scripts/bench-ingest.ts`.
+
+The token-reduction tables below are older, from the versions named in each
+heading. They were not re-run for 2.6.0.
 
 ---
 

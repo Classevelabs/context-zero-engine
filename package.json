@@ -1,6 +1,6 @@
 {
   "name": "contextzero-engine",
-  "version": "2.5.2",
+  "version": "2.6.0",
   "description": "Local code intelligence engine for AI agents with MCP and HTTP interfaces",
   "main": "dist/mcp-interface/index.js",
   "files": [

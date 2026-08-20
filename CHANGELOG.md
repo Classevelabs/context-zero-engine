@@ -5,7 +5,7 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — Ingestion architecture
+## [2.6.0] — Ingestion architecture and write-path integrity
 
 ### Security
 
@@ -72,7 +72,43 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   The GIN index was kept on evidence, not instinct: at snapshot scale the
   planner does use it (16-21ms lookups), and it costs ~17% on writes.
 
+- **Behavioral and contract profiles are written in bulk.** Persistence ran one
+  round-trip per symbol; it now chunks 500 rows per statement, de-duplicating
+  within a chunk so `ON CONFLICT DO UPDATE` cannot touch the same row twice.
+
 ### Fixed
+
+- **A single NUL byte in a source file destroyed the batch it landed in.**
+  PostgreSQL `text` cannot hold `0x00`, so one file containing one drove the
+  whole multi-row `INSERT` to error out — taking every other row in that batch
+  with it. On one workspace this cost **686 files** in a single run, and left the
+  snapshot `partial`, which the read guard then correctly refused to answer
+  from. Parameters are now stripped of NUL in the database driver, inside
+  strings and inside array parameters alike. The driver is the single boundary
+  every write crosses, so no extractor, present or future, can reintroduce it.
+
+- **Re-ingesting a symbol deleted the edges pointing *at* it.** The cleanup
+  before a re-extract removed relations matching the symbol on either end
+  (`src_symbol_version_id ... OR dst_symbol_version_id ...`), so re-indexing one
+  file silently severed inbound edges owned by files that had not changed.
+  Callers disappeared from `scg_get_symbol_relations` and blast radius
+  under-reported. Cleanup now removes only the relations the re-extracted
+  symbol owns.
+
+- **A blocked ingest reported success.** When another ingest held the
+  repository advisory lock, the second call returned a normal result with zero
+  counts — indistinguishable from a repository that genuinely had nothing to
+  index. It now returns an error carrying `error_code: "INGEST_LOCK_HELD"`.
+
+- **Reads could answer from an incomplete snapshot.** A snapshot left `partial`
+  or `failed` still served queries, so a caller received a confidently-shaped
+  answer computed over a fraction of the repository. The read path now checks
+  snapshot status and says the index is incomplete instead of guessing.
+
+- **Snapshots abandoned mid-ingest stayed `indexing` forever.** A crashed or
+  killed ingest left a row no later run would reconcile, and the repository
+  looked permanently busy. Retention now closes out snapshots stuck past
+  `SCG_STUCK_INDEXING_TIMEOUT_MINUTES` (default 180).
 
 - **Kotlin extracted a fifth of the symbols it should have.** Measured across
   1,126 real Kotlin files: 2.1 symbols per file against TypeScript's 10.8.
