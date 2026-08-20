@@ -11,7 +11,7 @@ import { blastRadiusEngine } from "../src/analysis-engine/blast-radius"
 import type { SupportedLanguage } from "../src/adapters/universal"
 
 const contextZeroRoot = path.resolve(__dirname, "..")
-const benchmarksRoot = path.resolve(process.argv[2] || "D:/Lab/new/benchmarks")
+const benchmarksRoot = path.resolve(process.argv[2] || path.join(contextZeroRoot, "benchmarks"))
 const outputPath = path.resolve(
   process.argv[3] || path.join(contextZeroRoot, "MULTILANGUAGE_CONTEXTZERO_BENCHMARK_REPORT.md"),
 )
