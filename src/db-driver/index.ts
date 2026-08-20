@@ -14,6 +14,49 @@ import { getConnectionConfig } from "./config"
 
 const log = new Logger("db-driver")
 
+/**
+ * Strip NUL (0x00) from every string bound to a query.
+ *
+ * PostgreSQL `text` cannot represent 0x00 at all — the wire protocol rejects
+ * the whole statement with `invalid byte sequence for encoding "UTF8": 0x00`.
+ * Source files legitimately contain NUL (minified bundles, generated blobs, a
+ * UTF-16 file read as UTF-8), so one such file used to abort the multi-row
+ * INSERT it happened to land in and take every other file in that batch with
+ * it: a single poison pill cost 686 files on this workspace and left
+ * the snapshot `partial`, which the read guard then correctly refuses to
+ * answer from. Sanitising here rather than in each adapter is deliberate —
+ * this is the one boundary every write crosses, so no future extractor can
+ * reintroduce the failure.
+ *
+ * The character is dropped, not replaced: it carries no meaning in source
+ * text, and substituting a placeholder would corrupt byte offsets that
+ * symbol ranges depend on.
+ */
+const NUL = String.fromCharCode(0)
+
+/** Remove every NUL from a string, leaving all other bytes untouched. */
+function withoutNuls(value: string): string {
+  return value.split(NUL).join("")
+}
+
+function stripNulls(params?: unknown[]): unknown[] | undefined {
+  if (!params) return params
+  let touched = false
+  const clean = params.map((p) => {
+    if (typeof p === "string" && p.includes(NUL)) {
+      touched = true
+      return withoutNuls(p)
+    }
+    if (Array.isArray(p) && p.some((v) => typeof v === "string" && v.includes(NUL))) {
+      touched = true
+      return p.map((v) => (typeof v === "string" ? withoutNuls(v) : v))
+    }
+    return p
+  })
+  if (touched) log.warn("Stripped NUL bytes from query parameters before binding")
+  return clean
+}
+
 // ─── Transient Error Detection ───────────────────────────────────────────────
 
 /** PostgreSQL error codes that indicate transient, retryable failures. */
@@ -291,7 +334,7 @@ class DatabaseDriver {
       async () => {
         const start = Date.now()
         try {
-          const result = await this.pool.query(text, params)
+          const result = await this.pool.query(text, stripNulls(params))
           const duration = Date.now() - start
           this.circuit.recordSuccess()
           if (duration > this.slowQueryMs) {
@@ -321,7 +364,7 @@ class DatabaseDriver {
   public async queryWithClient(client: PoolClient, text: string, params?: unknown[]): Promise<QueryResult> {
     const start = Date.now()
     try {
-      const result = await client.query(text, params)
+      const result = await client.query(text, stripNulls(params))
       const duration = Date.now() - start
       if (duration > this.slowQueryMs) {
         log.warn("Slow query on client", { query: text.substring(0, 200), duration_ms: duration })

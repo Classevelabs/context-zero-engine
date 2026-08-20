@@ -28,7 +28,7 @@ All adapters produce the same normalized output (`AdapterExtractionResult`), ens
 
 ### 3.2 Ingestion Pipeline (`ingestor`)
 - Full and incremental repository scanning with differential parsing.
-- Dispatches to language-specific adapters based on file extension (20+ extensions mapped to 13 languages).
+- Dispatches to language-specific adapters based on file extension (32 extensions mapped to 13 languages).
 - Populates test artifacts by linking test files to the symbols they reference.
 - Orchestrates all 13 analysis engines post-extraction in a single pipeline.
 - V2 engines (dispatch, lineage, effects, deep contracts, concept families, temporal) are non-fatal — wrapped in try/catch to prevent partial failures from aborting ingestion.

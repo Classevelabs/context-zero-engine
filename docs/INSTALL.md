@@ -152,6 +152,21 @@ DB_PASSWORD=your-real-password
 SCG_ALLOWED_BASE_PATHS=/path/to/repos
 ```
 
+`.env` does not override a variable that is already set in the process
+environment. If `SCG_ALLOWED_BASE_PATHS` (or any `DB_*`/`SCG_*` name) exists as
+a system or user environment variable, that value wins and editing `.env` has
+no effect. Check before assuming the file is being read:
+
+```powershell
+$env:SCG_ALLOWED_BASE_PATHS
+```
+
+```bash
+echo $SCG_ALLOWED_BASE_PATHS
+```
+
+Either clear the environment variable or set the value there instead.
+
 Docker install creates and manages PostgreSQL inside the compose stack.
 The compose file sets `DB_SSL_ALLOW_INSECURE_PRIVATE_NETWORK=true` because the app and database communicate over Docker's private bridge network. Do not use that setting for an untrusted remote database.
 

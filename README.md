@@ -41,29 +41,31 @@ these as reproducible targets, not guaranteed field performance. See
 
 | Capability | Description |
 |-----------|-------------|
-| **Context Capsules** | Token-budgeted context packages: source, dependencies, contracts, and effects in one call, with a 5-level degradation ladder. |
-| **Blast Radius** | 5-dimensional impact analysis (structural, behavioral, contract, homolog, historical) with severity and confidence scoring. |
+| **Context Capsules** | Everything you need to understand a symbol in one call — source, dependencies, contracts, effects — inside a token budget you set. When the budget is tight it drops detail in five defined steps rather than truncating. |
+| **Blast Radius** | What breaks if you change this. Scored across five kinds of coupling — structural, behavioral, contract, similar-code, and what has historically changed alongside it — with a severity and a confidence for each. |
 | **Behavioral Profiling** | Functions are classified as pure / read_only / read_write / side_effecting. TS/JS external effects are **type-resolved** through the compiler. The shipped, author-designed fixture suite measured 100% precision and recall; this is regression evidence, not a claim of perfect accuracy on arbitrary repositories (see [BENCHMARKS.md](BENCHMARKS.md)). |
-| **Effect Signatures** | 9 typed effects (reads, writes, opens, throws, calls_external, logs, emits, normalizes, acquires_lock), provenance-labeled (`direct` vs `transitive` with hop counts) and propagated with a bounded, kind-filtered policy. |
+| **Effect Signatures** | What a function actually touches: nine typed effects (reads, writes, opens, throws, calls_external, logs, emits, normalizes, acquires_lock), each labelled as the function's own effect or one inherited through a call chain, with the hop count. |
 | **Contract Extraction** | Input/output types, error contracts, security contracts, guard clauses, derived invariants — mined from the code itself. |
-| **Homolog Detection** | Finds behaviorally equivalent code (not just textual clones) via 7-dimensional evidence scoring with contradiction flags. |
+| **Homolog Detection** | Finds code elsewhere in the repository that does the same job, even when it shares no text with the original. Seven independent signals vote, and disagreement between them is reported rather than averaged away. |
 | **Smart Context** | One call: source + blast radius + callers + tests + contracts. Replaces 8+ separate lookups. |
-| **Dispatch Resolution** | Class hierarchy, virtual call resolution, C3 linearization, field-sensitive points-to analysis. |
-| **Concept Families** | Automatic grouping of related symbols with exemplar identification, outlier detection, and contradiction flagging. |
+| **Dispatch Resolution** | Which implementation a call actually reaches — through inheritance, interfaces, and overrides — rather than just the name at the call site. |
+| **Concept Families** | Groups symbols that solve the same kind of problem, names the clearest example of each group, and flags the members that break the pattern. |
 | **Temporal Intelligence** | Git-derived co-change analysis, temporal risk scoring, churn metrics. |
 | **Symbol Lineage** | Cross-snapshot identity tracking through renames and refactors. |
 | **Transactional Editing** | 9-state change lifecycle with DB-backed rollback and 6-level progressive validation. |
-| **Semantic Search** | Find code by what it does: TF-IDF + MinHash LSH similarity. No external APIs, no embedding service. |
-| **Uncertainty Tracking** | 12-source uncertainty model with per-symbol confidence scoring — the engine tells you what it is *not* sure about. |
+| **Semantic Search** | Find code by what it does rather than what it is called. Runs locally on TF-IDF and MinHash similarity — no external API, no embedding service, no key to buy. |
+| **Uncertainty Tracking** | Every symbol carries a confidence score, tracked back to twelve specific reasons the engine might be wrong. It tells you what it is *not* sure about instead of presenting every answer as equally solid. |
 
-## 15 Languages
+## Languages
 
 TypeScript, JavaScript, Python, C, C++, CUDA-flavored `.cu`/`.cuh`, Go, Rust,
-Java, C#, Ruby, Kotlin, Swift, PHP, Bash.
+Java, C#, Ruby, Kotlin, Swift, PHP, Bash — 32 file extensions across 13
+parsers, since C, C++ and CUDA share the C++ parser.
 
 TypeScript and JavaScript use full AST analysis through the TypeScript
 Compiler API. Python uses LibCST with 60+ behavioral patterns. The remaining
-languages use tree-sitter with language-specific walkers.
+languages use tree-sitter with language-specific walkers. CUDA files are
+indexed for structure; kernel-specific semantics are not modelled separately.
 
 ## How It Works
 
@@ -76,7 +78,7 @@ ContextZero MCP Bridge (61 tools)    REST API (60 routes)
     |                                     |
     +------------------+------------------+
     |
-    +-- Ingestor (15 languages, delta ingestion)
+    +-- Ingestor (13 language parsers, delta ingestion)
     +-- 13 Analysis Engines
     |     Behavioral | Contract | Deep Contract | Blast Radius
     |     Effect | Dispatch | Concept Families | Temporal
@@ -88,7 +90,7 @@ ContextZero MCP Bridge (61 tools)    REST API (60 routes)
     +-- Service Layer (transport-agnostic services)
     +-- Database Driver (circuit breaker, batch loader, advisory locks)
     |
-PostgreSQL 16 (all data local, nothing leaves your machine)
+PostgreSQL (all data local, nothing leaves your machine)
 ```
 
 The `scg_` prefix on tools and environment variables comes from the engine's
@@ -105,7 +107,7 @@ algorithms, engine internals).
 ### Prerequisites
 
 - **Node.js** 20+ (22 recommended)
-- **PostgreSQL** 14+ (16 recommended) with the `pg_trgm` extension
+- **PostgreSQL** 14 or newer (17 recommended) with the `pg_trgm` extension
 - **Python 3** with `libcst` (optional — only for Python source analysis)
 
 ### Bootstrap (recommended)
