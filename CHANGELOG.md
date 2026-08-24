@@ -5,6 +5,67 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] — A self-maintaining index
+
+### Added
+
+- **The index follows the code.** `npm run watch` keeps every registered
+  repository current: changes are folded into the existing snapshot within
+  seconds of hitting disk, with no re-ingest, no scheduled job and no editor
+  plugin. Set `SCG_WATCH=true` to start it alongside the MCP server. It observes
+  the filesystem only, so it behaves identically whether the code is edited by an
+  IDE, a coding agent, a script, or a branch switch. Edits are batched over a
+  quiet period, so a formatter sweep costs one pass rather than hundreds, and
+  each repository is held under an advisory lock so several connected clients
+  cost one watcher rather than a race.
+
+- **Two refinement tiers for incremental indexing.** `refine: "deferred"` (the
+  edit-time default) re-extracts changed files and re-embeds their symbols in
+  seconds; `refine: "full"` also recomputes lineage, dispatch, effects, deep
+  contracts, concept families and the embedding corpus across the snapshot.
+  Deferred work is recorded on the snapshot as `refinement_pending_since` and
+  reported by `scg_snapshot_stats`, and the watcher settles it while the tree is
+  idle. Per-symbol data for changed files is current either way.
+
+- **`scg_incremental_index` identifies its own target.** It now accepts
+  `repo_path` — the repository root or any file inside it — resolves the
+  repository's most recent snapshot when `snapshot_id` is omitted, and takes
+  absolute or repo-relative changed paths.
+
+- **A `partial` snapshot names what is missing.** Failing paths are stored on the
+  snapshot and surfaced through `scg_snapshot_stats` as `files_unindexed` /
+  `unindexed_paths`, and listed in the warning attached to query results, so an
+  incomplete index can be checked against the question being asked and repaired
+  file by file instead of by a full re-ingest.
+
+### Fixed
+
+- **Incremental indexing could drop a file's symbols and still report the
+  snapshot as complete.** Invalidation deletes a changed file's symbol versions
+  before re-extraction; an extraction that then failed was logged and otherwise
+  ignored, leaving the symbols absent from a graph that still described itself as
+  complete. Callers of that file read as uncalled. Every extraction path now
+  records its failures, and the snapshot's status is reconciled at the end of the
+  pass.
+
+- **`index_status` could not recover.** Incremental passes never wrote it, so a
+  snapshot marked `partial` stayed `partial` after the offending file was fixed,
+  and a file that broke during an incremental pass never marked it at all. The
+  status now moves in both directions as files are repaired or broken.
+
+- **Class hierarchy was built twice on every ingest.** `resolveDispatches` builds
+  it as its first step; both the full and incremental paths called
+  `buildClassHierarchy` immediately beforehand, duplicating the whole pass.
+
+- **Embedding dominated the cost of a small change.** An incremental pass rebuilt
+  the entire snapshot's vectors and IDF corpus. Changed symbols are now embedded
+  against the stored corpus, which is what makes edit-time indexing viable at all.
+
+- `SCG_LOG_LEVEL_OVERRIDE` sets the log level for embedded callers. `LOG_LEVEL`
+  is loaded from the env file with `override: true`, so a CLI or watcher could
+  not quiet the engine except by redirecting stderr, which discards real failures
+  along with the noise.
+
 ## [2.6.0] — Ingestion architecture and write-path integrity
 
 ### Security

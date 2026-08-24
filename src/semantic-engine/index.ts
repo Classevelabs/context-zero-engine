@@ -666,6 +666,67 @@ class SemanticEngine {
   }
 
   /**
+   * Embed a specific set of symbol versions against the snapshot's STORED IDF
+   * corpus, instead of rebuilding the corpus from the whole snapshot.
+   *
+   * This is what makes an incremental re-index usable. `batchEmbedSnapshot`
+   * re-tokenizes every symbol in the repository twice — on a 28k-symbol snapshot
+   * that is over two minutes, and running it after a one-file edit meant a
+   * single save cost minutes of work to recompute vectors that had not changed.
+   * Skipping it instead is not an option: the edited symbols would have no
+   * vectors at all, so semantic search would silently stop returning the code
+   * the user just wrote.
+   *
+   * The tradeoff is explicit and bounded: IDF weights drift slightly as the
+   * corpus changes underneath, because term frequencies from the last full pass
+   * are reused. That affects ranking, never presence — an edited symbol is
+   * always findable. A later full pass settles the drift.
+   */
+  async embedSymbolVersions(symbolVersionIds: string[]): Promise<number> {
+    if (symbolVersionIds.length === 0) return 0
+    const done = log.startTimer("embedSymbolVersions", { count: symbolVersionIds.length })
+
+    try {
+      const loader = new BatchLoader()
+      const rows = await loader.loadSymbolVersionsByIds(symbolVersionIds)
+      if (rows.length === 0) {
+        done({ embedded: 0 })
+        return 0
+      }
+
+      const ids = rows.map((row) => row.symbol_version_id)
+      const [behavioral, contracts] = await Promise.all([
+        loader.loadBehavioralProfiles(ids),
+        loader.loadContractProfiles(ids),
+      ])
+
+      let embedded = 0
+      for (const symbol of rows) {
+        const { behaviorHints, contractHint } = this._buildHintsFromProfiles(
+          symbol.canonical_name,
+          behavioral.get(symbol.symbol_version_id),
+          contracts.get(symbol.symbol_version_id),
+        )
+        await this.embedSymbol(
+          symbol.symbol_version_id,
+          symbol.body_source ?? symbol.summary ?? "",
+          symbol.canonical_name,
+          symbol.signature ?? "",
+          behaviorHints,
+          contractHint,
+        )
+        embedded++
+      }
+
+      done({ embedded })
+      return embedded
+    } catch (err) {
+      done({ error: err instanceof Error ? err.message : String(err) })
+      throw err
+    }
+  }
+
+  /**
    * Batch-embed all symbols in a snapshot using two bounded, paginated passes.
    *
    * Pass 1 computes document frequencies without retaining source bodies or

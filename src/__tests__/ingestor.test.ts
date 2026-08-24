@@ -137,9 +137,11 @@ jest.mock("../adapters/ts", () => ({
 
 // Semantic engine
 const mockBatchEmbedSnapshot = jest.fn().mockResolvedValue(0)
+const mockEmbedSymbolVersions = jest.fn().mockResolvedValue(0)
 jest.mock("../semantic-engine", () => ({
   semanticEngine: {
     batchEmbedSnapshot: (...args: any[]) => mockBatchEmbedSnapshot(...args),
+    embedSymbolVersions: (...args: any[]) => mockEmbedSymbolVersions(...args),
   },
 }))
 
@@ -824,7 +826,8 @@ describe("Ingestor — Snapshot status transitions", () => {
 
     await ingestor.ingestRepo("/repo", "test-repo", "abc123")
 
-    expect(mockUpdateSnapshotStatus).toHaveBeenCalledWith("snap-001", "complete")
+    // Third argument is the failure set, replaced wholesale on every full pass.
+    expect(mockUpdateSnapshotStatus).toHaveBeenCalledWith("snap-001", "complete", [])
   })
 
   test('sets snapshot status to "partial" when some files fail', async () => {
@@ -865,7 +868,18 @@ describe("Ingestor — Snapshot status transitions", () => {
     await ingestor.ingestRepo("/repo", "test-repo", "abc123")
 
     // 1 TS file processed + 1 Python file failed => partial
-    expect(mockUpdateSnapshotStatus).toHaveBeenCalledWith("snap-001", expect.stringMatching(/partial|complete/))
+    expect(mockUpdateSnapshotStatus).toHaveBeenCalledWith(
+      "snap-001",
+      expect.stringMatching(/partial|complete/),
+      expect.any(Array),
+    )
+
+    // The path itself must be recorded — a count alone cannot tell a caller
+    // whether the file it is asking about is one of the missing ones.
+    const partialCall = mockUpdateSnapshotStatus.mock.calls.find(
+      (call: unknown[]) => call[1] === "partial",
+    ) as [string, string, string[]] | undefined
+    expect(partialCall?.[2]).toContain("bad.py")
   })
 })
 
@@ -1285,8 +1299,10 @@ describe("Ingestor — V2 engines", () => {
 
     await ingestor.ingestRepo("/repo", "test-repo", "abc123")
 
-    // V2 engines should all be called
-    expect(mockBuildClassHierarchy).toHaveBeenCalled()
+    // V2 engines should all be called. Class hierarchy is NOT asserted here:
+    // resolveDispatches builds it internally, and calling it separately as well
+    // ran the whole pass twice per ingest.
+    expect(mockBuildClassHierarchy).not.toHaveBeenCalled()
     expect(mockResolveDispatches).toHaveBeenCalled()
     expect(mockComputeEffectSignatures).toHaveBeenCalled()
     expect(mockSynthesizeContracts).toHaveBeenCalled()
@@ -1322,7 +1338,7 @@ describe("Ingestor — V2 engines", () => {
     mockReaddir.mockResolvedValueOnce([])
 
     // Make dispatch resolver throw
-    mockBuildClassHierarchy.mockRejectedValue(new Error("dispatch failed"))
+    mockResolveDispatches.mockRejectedValue(new Error("dispatch failed"))
 
     // Should not throw
     const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123")
@@ -1756,9 +1772,82 @@ describe("Ingestor — ingestIncremental", () => {
     const result = await ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts"])
 
     // V2 engines should be called
-    expect(mockBuildClassHierarchy).toHaveBeenCalled()
     expect(mockResolveDispatches).toHaveBeenCalled()
     expect(mockComputeEffectSignatures).toHaveBeenCalled()
+  })
+
+  test("refine=deferred skips repo-wide engines but still embeds changed symbols", async () => {
+    mockQuery.mockImplementation(async (text: string) => {
+      if (typeof text === "string" && text.includes("base_path FROM repositories")) {
+        return { rows: [{ base_path: "/repo" }], rowCount: 1 }
+      }
+      if (typeof text === "string" && text.includes("index_status FROM snapshots")) {
+        return { rows: [{ index_status: "complete" }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    mockAccess.mockRejectedValue(new Error("ENOENT"))
+
+    const result = await ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts"], { refine: "deferred" })
+
+    // The whole point of the fast tier: none of the snapshot-wide passes run.
+    expect(mockResolveDispatches).not.toHaveBeenCalled()
+    expect(mockComputeEffectSignatures).not.toHaveBeenCalled()
+    expect(mockSynthesizeContracts).not.toHaveBeenCalled()
+    expect(mockBuildFamilies).not.toHaveBeenCalled()
+
+    // But embedding is NOT skipped — dropping it would make edited code vanish
+    // from semantic search. It is scoped instead of rebuilt.
+    expect(mockBatchEmbedSnapshot).not.toHaveBeenCalled()
+    expect(mockEmbedSymbolVersions).toHaveBeenCalled()
+
+    expect(result.refine).toBe("deferred")
+  })
+
+  test("refine=deferred records the refinement debt on the snapshot", async () => {
+    const statements: string[] = []
+    mockQuery.mockImplementation(async (text: string) => {
+      if (typeof text === "string") {
+        statements.push(text)
+        if (text.includes("base_path FROM repositories")) {
+          return { rows: [{ base_path: "/repo" }], rowCount: 1 }
+        }
+        if (text.includes("index_status FROM snapshots")) {
+          return { rows: [{ index_status: "complete" }], rowCount: 1 }
+        }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    mockAccess.mockRejectedValue(new Error("ENOENT"))
+
+    await ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts"], { refine: "deferred" })
+
+    // COALESCE, so repeated fast passes keep the ORIGINAL deferral time and the
+    // stamp answers "how long has this been drifting?"
+    expect(
+      statements.some((sql) => sql.includes("refinement_pending_since = COALESCE(refinement_pending_since, NOW())")),
+    ).toBe(true)
+  })
+
+  test("a full incremental pass clears the refinement debt", async () => {
+    const statements: string[] = []
+    mockQuery.mockImplementation(async (text: string) => {
+      if (typeof text === "string") {
+        statements.push(text)
+        if (text.includes("base_path FROM repositories")) {
+          return { rows: [{ base_path: "/repo" }], rowCount: 1 }
+        }
+        if (text.includes("index_status FROM snapshots")) {
+          return { rows: [{ index_status: "complete" }], rowCount: 1 }
+        }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    mockAccess.mockRejectedValue(new Error("ENOENT"))
+
+    await ingestor.ingestIncremental("repo-001", "snap-001", ["src/app.ts"])
+
+    expect(statements.some((sql) => sql.includes("refinement_pending_since = NULL"))).toBe(true)
   })
 
   test("rebuilds semantic vectors and IDF after incremental invalidation", async () => {

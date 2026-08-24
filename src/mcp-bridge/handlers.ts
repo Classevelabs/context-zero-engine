@@ -33,6 +33,7 @@ import {
   searchWorkspaceCode,
   searchWorkspaceSymbols,
 } from "../workspace-native"
+import { findRepositoryContainingPath, resolveLatestIndexedSnapshot, toRepoRelativePaths } from "../incremental-target"
 import * as path from "path"
 // V2 engine imports — lazy-loaded to avoid breaking if files don't exist yet
 import type { CapsuleMode, ValidationMode, TracePack } from "../types"
@@ -269,6 +270,8 @@ export interface IndexIntegrity {
   snapshot_id?: string
   /** true when the status came from the repo's newest snapshot, not an explicit id */
   derived_from_repo?: boolean
+  /** Repo-relative paths that failed extraction — the concrete gap in the graph. */
+  failed_paths?: string[]
 }
 
 export interface IndexIntegrityDecision {
@@ -410,7 +413,12 @@ function worstOf(rows: Record<string, unknown>[]): IndexIntegrity {
     const severity = INDEX_STATUS_SEVERITY[status]
     if (severity > worstSeverity) {
       worstSeverity = severity
-      worst = { status, snapshot_id: typeof row["snapshot_id"] === "string" ? row["snapshot_id"] : undefined }
+      const failed = row["failed_paths"]
+      worst = {
+        status,
+        snapshot_id: typeof row["snapshot_id"] === "string" ? row["snapshot_id"] : undefined,
+        ...(Array.isArray(failed) && failed.length > 0 ? { failed_paths: failed as string[] } : {}),
+      }
     }
   }
   return worst
@@ -429,7 +437,7 @@ export async function resolveIndexIntegrity(ref: IndexIntegrityRef, log?: Integr
   let resolved: IndexIntegrity = { status: "unknown" }
   try {
     if (ref.snapshotId) {
-      const result = await db.query(`SELECT snapshot_id, index_status FROM snapshots WHERE snapshot_id = $1`, [
+      const result = await db.query(`SELECT snapshot_id, index_status, failed_paths FROM snapshots WHERE snapshot_id = $1`, [
         ref.snapshotId,
       ])
       const rows = (result?.rows ?? []) as Record<string, unknown>[]
@@ -438,7 +446,7 @@ export async function resolveIndexIntegrity(ref: IndexIntegrityRef, log?: Integr
       const ids = ref.symbolVersionIds
       const placeholders = ids.map((_, i) => `$${i + 1}`).join(",")
       const result = await db.query(
-        `SELECT sn.snapshot_id, sn.index_status
+        `SELECT sn.snapshot_id, sn.index_status, sn.failed_paths
              FROM symbol_versions sv
              JOIN snapshots sn ON sn.snapshot_id = sv.snapshot_id
              WHERE sv.symbol_version_id IN (${placeholders})`,
@@ -448,7 +456,7 @@ export async function resolveIndexIntegrity(ref: IndexIntegrityRef, log?: Integr
       resolved = rows.length > 0 ? worstOf(rows) : { status: "unknown" }
     } else if (ref.symbolId) {
       const result = await db.query(
-        `SELECT sn.snapshot_id, sn.index_status
+        `SELECT sn.snapshot_id, sn.index_status, sn.failed_paths
              FROM symbol_versions sv
              JOIN snapshots sn ON sn.snapshot_id = sv.snapshot_id
              WHERE sv.symbol_id = $1
@@ -459,7 +467,7 @@ export async function resolveIndexIntegrity(ref: IndexIntegrityRef, log?: Integr
       resolved = rows.length > 0 ? worstOf(rows) : { status: "unknown" }
     } else if (ref.repoId) {
       const result = await db.query(
-        `SELECT snapshot_id, index_status FROM snapshots
+        `SELECT snapshot_id, index_status, failed_paths FROM snapshots
              WHERE repo_id = $1 ORDER BY indexed_at DESC LIMIT 1`,
         [ref.repoId],
       )
@@ -533,6 +541,20 @@ export function decideIndexIntegrity(
     }
   }
 
+  // Name the gap when it is known. "Results may be incomplete" with no scope
+  // condemns the entire repository over what is usually a handful of unparseable
+  // files, so the only safe reading was to distrust everything — and the remedy
+  // on offer was a full re-ingest. Listing the paths makes the claim checkable
+  // (is the file you care about in there?) and points at the targeted repair.
+  const failedPaths = integrity.failed_paths ?? []
+  const scope =
+    failedPaths.length > 0
+      ? ` ${failedPaths.length} file(s) are missing from the graph: ` +
+        `${failedPaths.slice(0, 5).join(", ")}${failedPaths.length > 5 ? ", …" : ""}. ` +
+        `Symbols in any OTHER file are indexed normally. Repair just these with ` +
+        `scg_incremental_index (changed_paths = the list above).`
+      : ` Re-ingest the repository (scg_ingest_repo) before relying on this.`
+
   return {
     block: false,
     annotation: {
@@ -540,8 +562,7 @@ export function decideIndexIntegrity(
       warning:
         `DEGRADED INDEX: ${describeSnapshot(integrity)} has index_status='${integrity.status}'` +
         `${integrity.derived_from_repo ? " (newest snapshot for this repository)" : ""}. Results may be ` +
-        `incomplete — an absent result does NOT prove absence. Re-ingest the repository (scg_ingest_repo) ` +
-        `before relying on this.`,
+        `incomplete — an absent result does NOT prove absence.${scope}`,
     },
   }
 }
@@ -1350,9 +1371,10 @@ async function handleSnapshotStatsImpl(args: Record<string, unknown>, log: McpLo
   // BUG-001 fix: Check if the snapshot actually exists and has data.
   // Ghost snapshots (orphaned after re-ingestion) return empty results
   // instead of an error, which silently misleads clients.
-  const snapshotCheck = await db.query(`SELECT snapshot_id, index_status FROM snapshots WHERE snapshot_id = $1`, [
-    snapshot_id,
-  ])
+  const snapshotCheck = await db.query(
+    `SELECT snapshot_id, index_status, failed_paths, refinement_pending_since FROM snapshots WHERE snapshot_id = $1`,
+    [snapshot_id],
+  )
   if (snapshotCheck.rows.length === 0) {
     return errorResult(`Snapshot not found: ${snapshot_id}`)
   }
@@ -1385,11 +1407,41 @@ async function handleSnapshotStatsImpl(args: Record<string, unknown>, log: McpLo
     }
   }
 
+  // The concrete gap, not just a status word: which files are absent from this
+  // snapshot's graph. This is the diagnostic that answers "does the degraded
+  // status actually affect what I am asking about?"
+  const snapshotRow = firstRow(snapshotCheck) as
+    | { failed_paths?: string[]; refinement_pending_since?: Date | string | null }
+    | undefined
+  const rawFailedPaths = snapshotRow?.failed_paths ?? []
+  const refinementPendingSince = snapshotRow?.refinement_pending_since ?? null
+
   return textResult({
     snapshot_id,
     files,
     symbols,
     relations: parseCountField(firstRow(relationCount)),
+    files_unindexed: rawFailedPaths.length,
+    ...(refinementPendingSince
+      ? {
+          refinement_pending_since:
+            refinementPendingSince instanceof Date ? refinementPendingSince.toISOString() : refinementPendingSince,
+          refinement_note:
+            "Fast incremental passes have run since the last full refinement. Per-symbol data for changed " +
+            "files is current; repository-wide analyses (symbol lineage, concept families, dispatch edges, " +
+            "transitive effects, IDF weighting) may be stale. Settle with scg_ingest_repo, or " +
+            "scg_incremental_index with refine=\"full\".",
+        }
+      : {}),
+    ...(rawFailedPaths.length > 0
+      ? {
+          unindexed_paths: rawFailedPaths.slice(0, 50),
+          unindexed_paths_truncated: rawFailedPaths.length > 50,
+          repair_hint:
+            "Re-index exactly these with scg_incremental_index (changed_paths = unindexed_paths). " +
+            "Symbols in every other file are indexed normally.",
+        }
+      : {}),
     uncertainty: uncertaintyReport,
   })
 }
@@ -2229,12 +2281,19 @@ export async function handleHealthCheck(_args: Record<string, unknown>, _log: Mc
  * affected symbols, re-extracts, re-computes profiles and relations.
  */
 export async function handleIncrementalIndex(args: Record<string, unknown>, log: McpLogger): Promise<CallToolResult> {
-  const repo_id = requireString(args, "repo_id")
-  const snapshot_id = requireString(args, "snapshot_id")
+  const repo_id = optionalString(args, "repo_id")
+  const repo_path = optionalString(args, "repo_path")
+  const snapshot_id = optionalString(args, "snapshot_id")
+  const refine = optionalString(args, "refine")
   const changed_paths = requireArray<string>(args, "changed_paths")
 
-  if (!isUUID(repo_id)) return errorResult("repo_id is required and must be a valid UUID")
-  if (!isUUID(snapshot_id)) return errorResult("snapshot_id is required and must be a valid UUID")
+  if (repo_id && repo_path) return errorResult("Provide either repo_id or repo_path, not both")
+  if (!repo_id && !repo_path) return errorResult("repo_id or repo_path is required")
+  if (repo_id && !isUUID(repo_id)) return errorResult("repo_id must be a valid UUID")
+  if (snapshot_id && !isUUID(snapshot_id)) return errorResult("snapshot_id must be a valid UUID")
+  if (refine && refine !== "full" && refine !== "deferred") {
+    return errorResult('refine must be "full" or "deferred"')
+  }
   if (!Array.isArray(changed_paths) || changed_paths.length === 0) {
     return errorResult("changed_paths is required (non-empty array of strings)")
   }
@@ -2244,15 +2303,66 @@ export async function handleIncrementalIndex(args: Record<string, unknown>, log:
     }
   }
 
+  // Resolve the repository. `repo_path` accepts the repository root OR any path
+  // inside it, because the natural trigger for incremental indexing is "this
+  // file just changed" — the caller knows a file, not a repository UUID. The
+  // longest matching base_path wins so a repo nested inside another resolves to
+  // the innermost one.
+  let resolvedRepoId: string
+  let repoBasePath: string
+  if (repo_id) {
+    const repo = await coreDataService.getRepository(repo_id)
+    const basePath = repo && typeof repo["base_path"] === "string" ? repo["base_path"] : undefined
+    if (!basePath) return errorResult("Repository not found or has no base_path. Register it via scg_register_repo")
+    resolvedRepoId = repo_id
+    repoBasePath = basePath
+  } else {
+    const owner = await findRepositoryContainingPath(repo_path as string)
+    if (!owner) {
+      return errorResult(
+        `No registered repository contains ${repo_path}. Register it via scg_register_repo, or pass repo_id.`,
+      )
+    }
+    resolvedRepoId = owner.repo_id
+    repoBasePath = owner.base_path
+  }
+
+  // Resolve the snapshot. Without this, every caller had to track the current
+  // snapshot_id themselves, and passing a stale one wrote the re-index into a
+  // superseded graph while reporting success.
+  let resolvedSnapshotId: string
+  if (snapshot_id) {
+    resolvedSnapshotId = snapshot_id
+  } else {
+    const found = await resolveLatestIndexedSnapshot(resolvedRepoId)
+    if (!found) {
+      return errorResult("No indexed snapshot for this repository. Run scg_ingest_repo first.")
+    }
+    resolvedSnapshotId = found
+  }
+
+  // Absolute paths are the natural output of an editor/watcher trigger, but the
+  // ingestor's contract is repo-relative. Convert here rather than making every
+  // caller reimplement it — getting it wrong silently re-indexes nothing.
+  let relativePaths: string[]
+  try {
+    relativePaths = toRepoRelativePaths(repoBasePath, changed_paths)
+  } catch (err) {
+    return errorResult(err instanceof Error ? err.message : String(err))
+  }
+
   log.debug("scg_incremental_index", {
-    repo_id,
-    snapshot_id,
-    changed_count: changed_paths.length,
+    repo_id: resolvedRepoId,
+    snapshot_id: resolvedSnapshotId,
+    changed_count: relativePaths.length,
   })
 
-  const result = await ingestor.ingestIncremental(repo_id, snapshot_id, changed_paths)
-  return textResult({ result })
+  const result = await ingestor.ingestIncremental(resolvedRepoId, resolvedSnapshotId, relativePaths, {
+    refine: refine === "deferred" ? "deferred" : "full",
+  })
+  return textResult({ repo_id: resolvedRepoId, snapshot_id: resolvedSnapshotId, result })
 }
+
 
 // ────────── Tool 41: Batch Embed Snapshot ──────────
 

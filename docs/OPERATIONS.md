@@ -176,10 +176,20 @@ Ingestion finishes with a status:
 
 - `complete` — every file was extracted; all query tools answer normally.
 - `partial` — some files failed to extract. Symbols from the files that
-  succeeded are stored, but derived analysis is skipped and query tools report
-  the index as incomplete rather than answering from a fraction of the
-  repository. Re-run the ingest after fixing or excluding the offending files.
+  succeeded are stored, and query tools report the index as incomplete rather
+  than answering from a fraction of the repository.
 - `failed` — nothing was extracted.
+
+A `partial` snapshot names the files it could not index. `scg_snapshot_stats`
+reports them as `files_unindexed` / `unindexed_paths`, and the warning attached
+to query results lists them, so you can tell whether the gap touches what you
+are asking about. Repair just those files:
+
+```text
+scg_incremental_index   → repo_path + changed_paths = the unindexed paths
+```
+
+The snapshot returns to `complete` on its own once every listed path parses.
 
 Check any repository's current state with `scg_list_snapshots`.
 
@@ -199,6 +209,63 @@ SCG_INGEST_WORKERS=2
 ```
 
 Raise the limits after `npm run doctor` passes and the first ingest finishes cleanly.
+
+## Keep The Index Current
+
+An index is only worth consulting if it describes the code as it is now. Left to
+manual re-ingestion it is accurate for a few minutes and quietly wrong for the
+rest of the day, so the engine maintains itself:
+
+```bash
+npm run watch
+```
+
+This watches every registered repository and folds each change into its existing
+snapshot as it happens. It observes the filesystem and nothing else, so it works
+the same whether the code is edited by an IDE, a coding agent, a script, or a
+branch switch.
+
+To have it start with the MCP server instead of running separately:
+
+```dotenv
+SCG_WATCH=true
+```
+
+Several connected clients cost one watcher, not several: each repository is held
+under an advisory lock, so a second watcher is a no-op rather than a race.
+
+### What it does
+
+Edits are batched over a short quiet period and indexed together, so a formatter
+sweep or a branch switch costs one pass rather than hundreds. Each pass
+re-extracts the changed files and re-embeds their symbols in seconds — the code
+you just wrote is searchable immediately.
+
+Repository-wide analyses — symbol lineage, concept families, dispatch edges,
+transitive effects, IDF weighting — are not recomputed on every edit; across a
+large repository that is minutes of work per keystroke. They are deferred, the
+snapshot records that they are owed, and the watcher settles the debt during an
+idle period. `scg_snapshot_stats` reports `refinement_pending_since` whenever
+anything is outstanding.
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `SCG_WATCH` | `false` | Start watching with the MCP server |
+| `SCG_WATCH_DEBOUNCE_MS` | `2000` | Quiet period before a batch is indexed |
+| `SCG_WATCH_REFINE_IDLE_MS` | `900000` | Idle time before refinement is settled; `0` leaves it manual |
+
+### Indexing specific files
+
+To index a known set of paths — a CI step, or repairing the files a `partial`
+snapshot names — call the tool directly:
+
+```text
+scg_incremental_index   → repo_path + changed_paths
+```
+
+Paths may be absolute or repo-relative, `snapshot_id` defaults to the
+repository's most recent, and `refine: "full"` recomputes the repository-wide
+analyses in the same pass.
 
 ## Network Server Mode
 

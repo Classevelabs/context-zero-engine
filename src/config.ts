@@ -189,6 +189,32 @@ export const retention = Object.freeze({
   retentionEnabled: envBool("SCG_RETENTION_ENABLED", true),
 })
 
+// ─── Watch Configuration ────────────────────────────────────────────────────
+
+export const watcher = Object.freeze({
+  /**
+   * Quiet period before a batch of edits is indexed.
+   *
+   * The cost of an incremental pass is dominated by fixed setup rather than by
+   * how many files it carries, so waiting briefly turns a formatter sweep or a
+   * branch switch into one pass instead of hundreds. Long enough to coalesce a
+   * save storm, short enough that the graph is current before anyone asks it a
+   * question about what they just wrote.
+   */
+  debounceMs: envInt("SCG_WATCH_DEBOUNCE_MS", 2_000),
+  /**
+   * Idle time after which the watcher settles outstanding refinement debt.
+   *
+   * Idle-triggered rather than scheduled: a full refinement is minutes of work
+   * across the whole snapshot, and starting one while someone is typing steals
+   * time from the fast passes keeping their edits current. Set to 0 to leave
+   * refinement entirely manual.
+   */
+  refineAfterIdleMs: envInt("SCG_WATCH_REFINE_IDLE_MS", 15 * 60_000),
+  /** Start watching automatically when the MCP bridge starts. */
+  autoStart: envBool("SCG_WATCH", false),
+})
+
 // ─── Startup Validation ─────────────────────────────────────────────────────
 
 const startupErrors: string[] = []

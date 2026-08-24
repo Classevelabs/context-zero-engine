@@ -55,6 +55,7 @@ these as reproducible targets, not guaranteed field performance. See
 | **Transactional Editing** | 9-state change lifecycle with DB-backed rollback and 6-level progressive validation. |
 | **Semantic Search** | Find code by what it does rather than what it is called. Runs locally on TF-IDF and MinHash similarity — no external API, no embedding service, no key to buy. |
 | **Uncertainty Tracking** | Every symbol carries a confidence score, tracked back to twelve specific reasons the engine might be wrong. It tells you what it is *not* sure about instead of presenting every answer as equally solid. |
+| **Self-Maintaining Index** | The graph follows the code. Edits are folded into the existing snapshot within seconds of hitting disk — no re-ingest, no scheduled job, no editor plugin. Repository-wide analysis is deferred under load and settled while you are idle, and whatever is outstanding is reported rather than assumed. |
 
 ## Languages
 
@@ -202,7 +203,20 @@ Three native tools (`scg_native_codebase_overview`,
 `scg_native_symbol_search`, `scg_native_search_code`) work immediately
 without a database — they analyze the filesystem directly.
 
-### 3. Or run it as an HTTP server
+### 3. Keep it current
+
+```bash
+npm run watch
+```
+
+Watches every registered repository and folds each change into its snapshot as
+it happens, so the graph describes the code as it is rather than as it was at
+the last ingest. Set `SCG_WATCH=true` to start it with the MCP server instead.
+
+It watches the filesystem and nothing else — the same behaviour whether the code
+is edited by an IDE, a coding agent, a script, or a branch switch.
+
+### 4. Or run it as an HTTP server
 
 ```bash
 npm run build

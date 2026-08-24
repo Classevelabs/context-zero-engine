@@ -2225,6 +2225,12 @@ describe("handleHealthCheck", () => {
 // ═══════════════════════════════════════════════════════════
 
 describe("handleIncrementalIndex", () => {
+  beforeEach(() => {
+    // The handler now resolves the repository (for its base_path) before
+    // delegating, so every case needs a registered repo behind the id.
+    mockGetRepository.mockResolvedValue({ name: "my-repo", base_path: "/tmp/repo", default_branch: "main" })
+  })
+
   test("indexes incrementally on happy path", async () => {
     mockIngestIncremental.mockResolvedValue({ reindexed: 3 })
     const result = await handleIncrementalIndex(
@@ -2236,6 +2242,39 @@ describe("handleIncrementalIndex", () => {
       log,
     )
     expect(result.isError).toBeUndefined()
+  })
+
+  test("resolves the latest indexed snapshot when snapshot_id is omitted", async () => {
+    mockIngestIncremental.mockResolvedValue({ reindexed: 1 })
+    mockDbQuery.mockResolvedValue({ rows: [{ snapshot_id: VALID_UUID_2 }] })
+
+    const result = await handleIncrementalIndex({ repo_id: VALID_UUID, changed_paths: ["src/a.ts"] }, log)
+
+    expect(result.isError).toBeUndefined()
+    expect(mockIngestIncremental).toHaveBeenCalledWith(VALID_UUID, VALID_UUID_2, ["src/a.ts"], { refine: "full" })
+  })
+
+  test("errors when the repository has no indexed snapshot", async () => {
+    mockDbQuery.mockResolvedValue({ rows: [] })
+
+    const result = await handleIncrementalIndex({ repo_id: VALID_UUID, changed_paths: ["src/a.ts"] }, log)
+
+    expect(result.isError).toBe(true)
+  })
+
+  test("rejects a changed_path outside the repository", async () => {
+    const outside = process.platform === "win32" ? "C:/elsewhere/x.ts" : "/elsewhere/x.ts"
+    const result = await handleIncrementalIndex(
+      { repo_id: VALID_UUID, snapshot_id: VALID_UUID_2, changed_paths: [outside] },
+      log,
+    )
+
+    expect(result.isError).toBe(true)
+  })
+
+  test("requires repo_id or repo_path", async () => {
+    const result = await handleIncrementalIndex({ changed_paths: ["src/a.ts"] }, log)
+    expect(result.isError).toBe(true)
   })
 
   test("returns error for empty changed_paths", async () => {

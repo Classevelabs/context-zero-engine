@@ -23,7 +23,7 @@ import { db } from "../db-driver"
 import { destroyAllCaches } from "../cache"
 import { runPendingMigrations } from "../db-driver/migrate"
 import { transactionalChangeEngine } from "../transactional-editor"
-import { features, logging, retention as retentionConfig, server as serverConfig } from "../config"
+import { features, logging, retention as retentionConfig, server as serverConfig, watcher as watcherConfig } from "../config"
 import { runRetentionPolicy } from "../services/retention-service"
 import { isMutatingMcpTool } from "./security"
 import {
@@ -257,6 +257,7 @@ const SERVER_VERSION = serverConfig.version
 let toolsRegistered = 0
 let healthCheckTimerRef: ReturnType<typeof setInterval> | null = null
 let retentionTimerRef: ReturnType<typeof setInterval> | null = null
+let activeWatcher: import("../watcher").Watcher | null = null
 
 const server = new McpServer(
   { name: SERVER_NAME, version: SERVER_VERSION },
@@ -1241,11 +1242,35 @@ registerTool(
   "scg_incremental_index",
   {
     description:
-      "Incrementally re-index changed files — accepts changed file paths (from git diff), invalidates affected symbols, re-extracts, and re-computes profiles and relations. Much faster than a full re-ingest.",
+      "Incrementally re-index changed files — invalidates affected symbols, re-extracts, and re-computes profiles, relations, and embeddings in place. Seconds instead of a full re-ingest. Identify the repo by repo_id OR by repo_path (the repo root, or any file inside it); snapshot_id defaults to the repository's most recent indexed snapshot. Changed paths may be absolute or repo-relative.",
     inputSchema: {
-      repo_id: z.string().uuid().describe("Repository UUID"),
-      snapshot_id: z.string().uuid().describe("Snapshot UUID"),
-      changed_paths: z.array(z.string().min(1)).min(1).max(5000).describe("Changed file paths (relative to repo root)"),
+      repo_id: z.string().uuid().optional().describe("Repository UUID (or pass repo_path)"),
+      repo_path: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Repository root, or any path inside it — resolved to the registered repo that owns it"),
+      snapshot_id: z
+        .string()
+        .uuid()
+        .optional()
+        .describe("Snapshot UUID. Default: the repository's most recent indexed snapshot"),
+      changed_paths: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(5000)
+        .describe("Changed file paths — absolute or relative to repo root"),
+      refine: z
+        .enum(["full", "deferred"])
+        .optional()
+        .describe(
+          'How much snapshot-wide analysis to recompute. "full" (default) recomputes lineage, dispatch, ' +
+            "effects, deep contracts, concept families and the whole embedding corpus — exact, but costs " +
+            'minutes on a large repo regardless of how little changed. "deferred" re-extracts the changed ' +
+            "files and embeds their symbols against the stored corpus in seconds, leaving repo-wide analyses " +
+            "for a later full pass; the debt is recorded and reported by scg_snapshot_stats. Use deferred for " +
+            "edit-time indexing, full when you need exact cross-repository analysis.",
+        ),
     },
   },
   async (args: Record<string, unknown>) => safeTool(handleIncrementalIndex)(args),
@@ -1628,6 +1653,30 @@ async function main(): Promise<void> {
     })
   }
 
+  // Automatic index maintenance. Off by default because it watches the
+  // filesystem, which is an operator decision rather than something a client
+  // should turn on for someone. When enabled, the first bridge to start takes a
+  // per-repository advisory lock, so several connected clients cost one watcher
+  // rather than several racing to re-index the same snapshot.
+  if (watcherConfig.autoStart) {
+    void (async () => {
+      try {
+        const { Watcher } = await import("../watcher")
+        const instance = new Watcher()
+        const watched = await instance.start()
+        activeWatcher = instance
+        log.info("Watching for changes", {
+          repositories: watched.map((r) => r.name),
+          debounceMs: watcherConfig.debounceMs,
+        })
+      } catch (err) {
+        // A watcher that cannot start must not take the bridge down with it —
+        // every query tool still works against the existing index.
+        log.error("Watcher failed to start", err instanceof Error ? err : new Error(String(err)))
+      }
+    })()
+  }
+
   const transport = new StdioServerTransport()
 
   // Handle transport-level errors
@@ -1675,6 +1724,16 @@ async function shutdown(signal: string): Promise<void> {
   if (retentionTimerRef) {
     clearInterval(retentionTimerRef)
     retentionTimerRef = null
+  }
+  if (activeWatcher) {
+    // Releases the per-repository advisory locks, so the next bridge to start
+    // can take over watching instead of finding them held by a dead session.
+    try {
+      await activeWatcher.stop()
+    } catch (err) {
+      log.error("Error stopping watcher", err instanceof Error ? err : new Error(String(err)))
+    }
+    activeWatcher = null
   }
 
   try {

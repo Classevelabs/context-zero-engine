@@ -185,6 +185,31 @@ export class BatchLoader {
   /** Hard ceiling on unbounded snapshot loads — prevents OOM on huge repos */
   private static readonly MAX_SNAPSHOT_LOAD = 50_000
 
+  /**
+   * Load specific symbol versions by id, with the same joined columns
+   * `loadSymbolVersionsBySnapshot` returns.
+   *
+   * Exists so work that touches a handful of symbols does not have to load an
+   * entire snapshot to find them — the pattern behind incremental re-indexing,
+   * where the changed set is a few rows out of tens of thousands.
+   */
+  public async loadSymbolVersionsByIds(svIds: string[]): Promise<SymbolVersionRow[]> {
+    if (svIds.length === 0) return []
+
+    const queryResult = await db.query(
+      `
+            SELECT sv.*, s.canonical_name, s.kind, s.stable_key, s.repo_id, f.path as file_path
+            FROM symbol_versions sv
+            JOIN symbols s ON s.symbol_id = sv.symbol_id
+            JOIN files f ON f.file_id = sv.file_id
+            WHERE sv.symbol_version_id = ANY($1)
+            ORDER BY sv.symbol_version_id
+        `,
+      [svIds],
+    )
+    return queryResult.rows as SymbolVersionRow[]
+  }
+
   public async loadSymbolVersionsBySnapshot(snapshotId: string): Promise<SymbolVersionRow[]> {
     const cached = this.symbolVersionCache.get(snapshotId)
     if (cached) return cached

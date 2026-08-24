@@ -213,9 +213,35 @@ export class CoreDataService {
     return (result.rows[0] as Record<string, unknown> | undefined) ?? null
   }
 
-  public async updateSnapshotStatus(snapshot_id: string, status: IndexStatus): Promise<void> {
-    await db.query(`UPDATE snapshots SET index_status = $1 WHERE snapshot_id = $2`, [status, snapshot_id])
-    log.debug("Snapshot status updated", { snapshot_id, status })
+  /**
+   * Set a snapshot's index status, and — when the caller knows them — the set
+   * of paths whose extraction failed.
+   *
+   * `failed_paths` is written as a REPLACEMENT, not a merge: the caller passes
+   * the complete current failure set for the snapshot, so a path that parses
+   * cleanly on a later pass drops out and `status` can recover to 'complete'.
+   * Omitting the argument leaves the stored paths untouched, which is what the
+   * intermediate 'indexing' transition wants — it must not erase the previous
+   * pass's failures before the new pass has computed its own.
+   */
+  public async updateSnapshotStatus(snapshot_id: string, status: IndexStatus, failed_paths?: string[]): Promise<void> {
+    if (failed_paths) {
+      await db.query(`UPDATE snapshots SET index_status = $1, failed_paths = $2 WHERE snapshot_id = $3`, [
+        status,
+        failed_paths,
+        snapshot_id,
+      ])
+    } else {
+      await db.query(`UPDATE snapshots SET index_status = $1 WHERE snapshot_id = $2`, [status, snapshot_id])
+    }
+    log.debug("Snapshot status updated", { snapshot_id, status, failed_count: failed_paths?.length })
+  }
+
+  /** Paths whose extraction failed on this snapshot's most recent indexing pass. */
+  public async getSnapshotFailedPaths(snapshot_id: string): Promise<string[]> {
+    const result = await db.query(`SELECT failed_paths FROM snapshots WHERE snapshot_id = $1`, [snapshot_id])
+    const row = result.rows[0] as { failed_paths?: string[] } | undefined
+    return row?.failed_paths ?? []
   }
 
   public async addFile(input: FileInput): Promise<string> {

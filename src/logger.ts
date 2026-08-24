@@ -37,7 +37,13 @@ export class Logger {
     if (minLevel && Logger.VALID_LEVELS.has(minLevel)) {
       this.minLevel = minLevel
     } else {
-      const envLevel = process.env["LOG_LEVEL"]?.toLowerCase()
+      // SCG_LOG_LEVEL_OVERRIDE wins over LOG_LEVEL because LOG_LEVEL cannot be
+      // set by a caller: config loads the env file with `override: true`, so the
+      // file's value replaces whatever the process was started with. A CLI that
+      // embeds the engine — an editor hook, a scripted re-index — has no way to
+      // quiet it otherwise, and its only alternative is redirecting stderr,
+      // which discards genuine failures along with the chatter.
+      const envLevel = (process.env["SCG_LOG_LEVEL_OVERRIDE"] ?? process.env["LOG_LEVEL"])?.toLowerCase()
       if (envLevel && Logger.VALID_LEVELS.has(envLevel)) {
         this.minLevel = envLevel as LogLevel
       } else {

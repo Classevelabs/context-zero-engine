@@ -1,6 +1,6 @@
 {
   "name": "contextzero-engine",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "Local code intelligence engine for AI agents with MCP and HTTP interfaces",
   "main": "dist/mcp-interface/index.js",
   "files": [
@@ -54,7 +54,9 @@
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "package:verify": "npm run build && node scripts/verify-package.mjs",
     "prepack": "npm run build",
-    "release:check": "npm run audit && npm run typecheck && npm run lint && npm run build && npm run test:ci && node scripts/verify-package.mjs"
+    "release:check": "npm run audit && npm run typecheck && npm run lint && npm run build && npm run test:ci && node scripts/verify-package.mjs",
+    "watch": "node dist/watcher/cli.js",
+    "watch:dev": "ts-node src/watcher/cli.ts"
   },
   "keywords": [
     "contextzero",
