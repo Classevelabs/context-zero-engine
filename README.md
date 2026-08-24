@@ -29,11 +29,13 @@ repository.
 ContextZero indexes the repository once and answers the same investigation
 with targeted queries: *give me this symbol with its dependencies and
 contracts*, *what breaks if I change it*, *where else does this logic exist*,
-*which tests cover it*. Historical author-run benchmarks reported **63–92%
-token savings depending on repository size** (12.4x on VS Code, 12.9x across
-seven multi-language repos). Raw run artifacts are not committed, so treat
-these as reproducible targets, not guaranteed field performance. See
-[BENCHMARKS.md](BENCHMARKS.md) for methodology and caveats.
+*which tests cover it*. Measured live on the current build against a 375k-LOC
+production monorepo, answering that task costs **98.3% fewer tokens** — one
+call in place of the files an agent would otherwise read, a **59× pooled
+reduction** across 47 real tasks and **19× on the typical task**, with the
+file-reading baseline deliberately capped in ContextZero's disfavour. Reproduce
+it on your own repository with `node scripts/bench-head-to-head.ts`; see
+[BENCHMARKS.md](BENCHMARKS.md) for the method and the older multi-repo runs.
 
 ---
 

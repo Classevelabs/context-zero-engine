@@ -185,7 +185,7 @@ async function main() {
   const snap = await db.query(
     `
         SELECT s.snapshot_id FROM snapshots s JOIN repositories r ON r.repo_id=s.repo_id
-        WHERE r.name LIKE $1 OR r.name LIKE $2
+        WHERE r.name ILIKE $1 OR r.name ILIKE $2
         ORDER BY s.indexed_at DESC LIMIT 1
     `,
     [`${repoBase}%`, "ContextZero-bench%"],

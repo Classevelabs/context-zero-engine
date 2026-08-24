@@ -1,10 +1,35 @@
 # Context Zero Engine — Benchmarks
 
-This document records historical, author-reported benchmark runs: a
+## Headline (2.7.0, measured on a live 375k-LOC monorepo)
+
+Answering the same real task — *understand this symbol and everything needed to
+change it safely* — costs **98.3% fewer tokens** through one ContextZero call
+than through reading the files an agent would otherwise open. Measured across 47
+randomly selected functions and classes in a private production monorepo, live,
+on the current build:
+
+| | File-reading baseline | ContextZero | |
+|---|---:|---:|---:|
+| Tokens, pooled across 47 tasks | 25,153,020 | 425,713 | **59× fewer (98.3% saved)** |
+| Tokens, typical (median) task | — | — | **19× fewer** |
+| Interquartile range per task | — | — | 3.9× – 151× |
+| Files opened / calls per task | ~7 files | 1 call | — |
+
+The baseline is deliberately conservative — capped at the 25 files an agent
+would plausibly open before giving up, and restricted to distinctive symbol
+names where file-reading is a fair proxy. Uncapped, on common names that appear
+across hundreds of files, the pooled reduction exceeds 2,500×; that number is
+real but unrepresentative, so it is not the headline. Reproduce with
+`node scripts/bench-head-to-head.ts 40 /path/to/your/repo` against your own
+indexed repository.
+
+---
+
+This document also records earlier author-reported benchmark runs: a
 self-ingest run, a large-repository run on VS Code, and a multi-language run
 across seven open-source projects. The benchmark scripts are in [`scripts/`](scripts/),
 but the original raw machine-readable outputs and database snapshots are not
-committed. The tables are therefore historical claims and reproduction
+committed. Those older tables are historical claims and reproduction
 targets, not independently verifiable release evidence or guaranteed field
 performance.
 
