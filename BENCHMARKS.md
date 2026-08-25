@@ -1,200 +1,139 @@
 # Context Zero Engine — Benchmarks
 
-## Headline (2.10.0, measured 2026-08-25)
+## What is being measured
 
-Two numbers have to be true at once. The context has to be small, and it has to
-still carry what the change depends on. A reduction on its own proves nothing —
-returning an empty response is a 100% reduction — so both are measured from the
-same run, on 400 randomly selected functions, methods and classes in a private
-375k-LOC production monorepo, with the capsule pinned to the 8,000-token budget
-the tool actually defaults to.
+An agent has been asked to change one function. Before it can safely, it needs
+three things: **the function itself**, **the helpers that function uses from
+other files**, and **the places that call it**. Collecting those three things is
+the work measured here.
 
-Ground truth comes off disk, not out of the graph: the target's body is re-read
-by line range, the defining file's imports are resolved through the workspace's
-own `package.json` export maps, and a dependency counts when a name the body
-actually uses resolves to a real file in the repository. Both sides draw on the
-same universe of files — the ones the index covers — so neither is credited for
-reach the other never had.
+There are two ways to collect them. Search the repository for the function's
+name and read the files that come back, or ask ContextZero once. Both were run
+against the same **1,000 randomly chosen functions, methods and classes** in a
+private 375,000-line production monorepo (2,944 files, 7.1 million tokens of
+source), on version 2.10.0.
 
-### What it carries, at an identical budget
+## One typical task
 
-The baseline greps for the symbol and reads the matching files best-first,
-charged nothing for the search and nothing for deciding what to open, spending
-exactly the tokens the capsule spent.
-
-| At an identical token budget | ContextZero | Reading the files |
+| | Search and read files | ContextZero |
 |---|---:|---:|
-| Has the implementation | **100%** | 19% |
-| Has the interface | **100%** | 19% |
-| Has a caller, verified against its own source | **75–78%** | 27–32% |
-| Cross-file imports the body uses, delivered | **48–54%** | ~0% |
-| Of those the index has edges for | **58–63%** | — |
-| Checkable facts per 1,000 tokens | **1.26–1.35** | 0.23 |
-| Tasks won / tied / lost | **145–169 / 231–255** | **0** |
+| Requests made | 1 search + 2 file reads | **1** |
+| Lines of code pulled into the context window | 1,245 | **143** |
+| Tokens spent | 11,768 | **2,132** |
 
-The ~0% is not a rigged baseline. The average capsule now costs ~2,900 tokens,
-and at 2,900 tokens a grep-driven agent can afford at most one file — usually a
-test file, not the definition. Grep finds where a name is used; it does not find
-what that name needs.
+**82% fewer tokens for the same question.** Across all 1,000 tasks together,
+26.0 million tokens against 2.9 million — **9.1× fewer**.
 
-### What it costs
+Those are median figures, so half the tasks cost less and half cost more; an
+average would be dragged around by whichever function happened to live next to
+a four-thousand-line file.
 
-| Pooled over 400 tasks | Value |
-|---|---:|
-| Average capsule | **2,637–2,955 tokens** of an 8,000 budget |
-| Reduction vs. grep-and-read (top 25 files) | **9.8–12.9x** |
-| Reduction vs. an oracle reading exactly the right files | **7.1–9.7x** (median 3.5–3.9x) |
-| Capsules exceeding their stated budget | **0–3 of 400**, never by more than a few tokens |
-| Capsule's own `token_estimate` vs. bytes actually shipped | **99.5%** |
-| Capsule compile, mean / p90 | 38 ms / 40 ms |
+## Does the smaller answer still contain the code?
 
-The oracle is the comparison that matters: it is told in advance which files
-carry the dependencies the capsule delivered, pays nothing to search, and pays
-for no dead ends. The capsule beats it seven- to ten-fold pooled and roughly
-four-fold on the median task.
+Spending less means nothing on its own — an empty reply would spend nothing at
+all. So both sides were given **the same number of tokens to spend** (whatever
+the capsule used, the file-reader was allowed to use too) and the answers were
+checked against the source on disk:
 
-### What was fixed to get here
-
-The previous 2.9.0 measurement found the engine spending roughly half of every
-capsule on waste. Those numbers were published in this file rather than hidden;
-this table is the same measurement after the repair, same corpus, same method,
-400 tasks per run.
-
-| Measured on the shipped capsule | 2.9.0 | Now |
+| Given the same tokens, does the answer actually contain… | ContextZero | Search and read files |
 |---|---:|---:|
-| Average capsule size (8,000 budget) | 7,825 tokens | **2,861 tokens** |
-| Capsules blowing their budget | 203 / 400 | **0–3 / 400** |
-| Self-reported size vs. actual | 40.7% | **99.5%** |
-| Context nodes that repeated an earlier node | 28.5% | **0%** |
-| Capsule tokens spent on effect entries | 39.3% | **2.2%** |
-| Of shipped effect entries, cycle-propagated | 98.6% | **0.5%** |
-| Cross-file imports delivered | 43.7% | **48–54%** |
-| Facts per 1,000 tokens | 0.46 | **1.26–1.35** |
-| Reduction vs. oracle | 3.0x | **7.1–9.7x** |
+| the function being changed | **always** | 1 time in 5 |
+| its signature and types | **always** | 1 time in 5 |
+| something that genuinely calls it | **73%** of the time | 29% |
+| the helpers it uses from other files | **about half** of them | almost none |
 
-Four defects, all in the shipping path, none in the ideas:
+Read those two tables together, because that is the whole result:
 
-1. **The effect engine's "cycles" were not cycles.** Symbols skipped by the
-   acyclic propagation pass were clustered by breadth-first search over *both*
-   edge directions — weak connectivity — so two functions that merely shared a
-   caller inside some cycle were fused, and on this monorepo nearly every
-   leftover symbol landed in one giant cluster whose unioned effects were
-   stamped onto every member. 696,940 of the snapshot's 703,997 effect entries
-   (99.0%) were that photocopy, and 6,021 functions were mislabelled maximally
-   side-effecting. The recovery now computes true strongly connected components
-   (iterative Tarjan) and walks them sinks-first, so only genuine mutual
-   recursion shares a fate and cross-component effects arrive with honest hop
-   counts. After re-ingest: **36** cycle entries survive, 153 functions carry
-   the maximal label, and the average non-empty signature holds 2.1 entries
-   instead of 88.
+> Searching and reading files costs about five times more, and four times out of
+> five it does not even include the function you asked about.
 
-2. **Every dependency was pasted twice.** The extractor records both a `calls`
-   and a `references` edge for the same pair — calling a function is also
-   referencing it — and the capsule's loaders selected relation *rows*, not
-   distinct symbols. The same dependency arrived twice at full source and
-   consumed two slots of the load limit. The loaders now select one row per
-   symbol (strongest relation wins: a call outranks a type usage outranks a
-   mention), and a symbol whose source is already in the capsule is never
-   pasted again — a repeat ships as a one-line signature.
+That is not a rigged comparison. The file-reader is given every advantage: the
+search is free, deciding which files to open is free, and it opens the
+best-matching files first. It still loses, for a simple reason — **searching for
+a name finds the places that mention it, not the things it needs.** The helper
+functions live in files that never mention the function you are changing, so no
+amount of searching for that name will surface them.
 
-3. **The capsule could not count its own size.** The budget loop summed the
-   raw text of the pieces it chose and ignored everything else that shipped:
-   JSON structure, the full effect array (attached after budgeting), and a
-   per-node bookkeeping ledger. Capsules reported ~40% of their true size and
-   half of them overshot the budget they claimed to honor. Every piece is now
-   priced at its serialized byte cost — the unit that actually ships — the
-   bookkeeping ledger is persisted to the database instead of being billed to
-   every consumer, and a final measured pass guarantees the total. Related:
-   sizes were previously measured in UTF-16 code units, which under-counts
-   unicode-heavy source by up to half again.
+## A worked example
 
-4. **Effects shipped twice, uncounted.** A formatted effect summary node was
-   added inside the budget and the entire raw entry array was attached outside
-   it. One representation ships now — deduplicated by kind and descriptor,
-   direct observations first, the transitive tail capped at 15 entries by hop
-   count — and it is priced like everything else.
+`commitRecoveryVaultGeneration` — a real function, 99 lines, in the desktop
+package. It uses nine things defined in other files.
 
-The same serialized-cost accounting was applied to `scg_smart_context`, which
-had the milder form of the same disease (source text counted, ten metadata
-fields per entry free, up to 500 omission strings shipped uncounted).
+**Searching and reading:** three files in the whole repository mention it by
+name. At the same budget the reader opens one of them — the test file. It never
+sees the function, and gets none of the nine helpers.
 
-### Correction: the 33.9x headline is withdrawn
+**ContextZero, one request, 7,965 tokens:** the function itself, eight of its
+nine helpers with their real code, the three functions that call it, the test
+that covers it, and its input/output contract.
 
-The 2.9.0 release claimed 33.9x and 97.1% savings. That script reproduces —
-it still prints 35.8x — but the number is an artifact of the machine it ran on,
-not of the engine. The baseline grepped the repository directory as it found
-it, and that directory contained `.claude/worktrees`: duplicate checkouts of
-the same source tree. Measured on the same 40 symbols with the same top-25
-rule, **73.8% of the files that baseline "read" were duplicate copies of files
-it had already read**, inflating the baseline 10.3x (12,398 files on disk,
-2,942 in the index). The current benchmark restricts both sides to the indexed
-universe, which is why today's honest ratios — 9.8–12.9x against grep-and-read
-— are both smaller than the withdrawn number and larger than the 3.7x this file
-briefly reported while the capsule was still carrying its own waste.
+The one it misses is a type-only import. That gap is described below.
 
-## Where it is still weak
+## A second repository
 
-Measured in the same runs, stated as plainly as the wins:
+The same measurement on a different codebase — 2,443 files of mixed scripts,
+release trees, a website and this engine's own source, 600 tasks:
 
-- **Half the missing dependencies have no edge at all.** Of the body-used
-  imports the capsule failed to deliver, 69% have no relation row anywhere in
-  the graph — dominated by namespace-style bindings (`import { Session } …;
-  Session.get(...)`) whose named declaration is not indexed as a symbol, so
-  relation resolution has nothing to attach the reference to. This is now the
-  single largest recall ceiling, it lives in extraction rather than selection,
-  and raising the dependency load limit from 40 to 80 measurably changed
-  nothing — the loader is not the bottleneck.
-- **Budget utilization is ~36%.** Capsules stop at ~2,900 of 8,000 tokens not
-  out of thrift but because the graph has nothing further to offer for the
-  target. Fixing the extraction gap above is what converts the unspent budget
-  into delivered dependencies.
-- **A quarter of capsules name no verified caller** (75–78% do). Test linkage
-  is worse: a linked test ships in ~5% of capsules.
-- **Effect coverage halved and got honest.** 48.5% of capsules carry an effect
-  signature (was 63.7% when the blob padded everyone); what ships is 24.4%
-  read from the function's own body, the rest transitive with hop counts, and
-  0.5% is cycle residue.
-
-### The same engine on a second corpus
-
-A 2,443-file mixed-language working directory — scripts, release trees, a
-website, this engine itself — re-ingested with the same fixed engine, 250
-tasks, same method. Different shape, same behavior:
-
-| | Monorepo (400 tasks) | Mixed corpus (250 tasks) |
+| One typical task | Search and read files | ContextZero |
 |---|---:|---:|
-| Average capsule | ~2,900 tokens | **1,379 tokens** |
-| Reduction vs. grep-and-read | 9.8–12.9x | **29.9x** |
-| Reduction vs. the oracle | 7.1–9.7x | **8.5x** |
-| Cross-file imports delivered | 48–54% | **57%** |
-| Of those the index has edges for | 58–63% | **57%** |
-| Has a verified caller | 75–78% | 17.6% |
-| Capsules over budget | 0–3 / 400 | **0 / 250** |
-| `token_estimate` vs. actual | 99.5% | **99%** |
-| Facts per 1,000 tokens | 1.26–1.35 | **1.71** |
+| Requests | 1 search + 3 file reads | **1** |
+| Lines of code | 1,713 | **47** |
+| Tokens | 16,888 | **733** |
 
-On this corpus overall recall and indexed recall are the same number — the
-current extractor indexes every body-used import here, so what remains is
-purely the selection path. The low caller rate is the corpus, not the engine:
-a directory of scripts and release snapshots genuinely has few callers to find.
+**96% fewer tokens**, 29.7× fewer across the whole run. The function being
+changed is present every time, against 1 time in 21 for file reading.
 
-### Variance
+## What it does not do well yet
 
-Sampling 400 random symbols per run: cross-file recall 47.6% / 49.2% / 50.9% /
-53.8% across four runs; oracle reduction 7.1x / 7.7x / 8.4x / 9.7x. A few
-points of run-to-run movement is expected; single small-sample runs are not
-reliable.
+- **It finds about half the helpers, not all of them.** Of the ones it misses,
+  roughly two thirds are invisible to it: they are imported in a style the
+  indexer does not yet record as a symbol, so there is nothing in the graph to
+  retrieve. That is the single biggest limit today and it is an indexing
+  problem, not a search problem.
+- **It names a caller 73% of the time.** On repositories with little internal
+  calling — a directory of scripts, for instance — that figure drops sharply,
+  because there genuinely are fewer callers to find.
+- **It links a covering test in about 1 task in 20.** Test association is weak
+  and is the least developed part of the graph.
+- **It typically uses only about a third of the budget it is given.** When the
+  graph has nothing more to offer for a symbol, the capsule stops rather than
+  padding. Closing the indexing gap above is what turns that unspent budget into
+  delivered helpers.
 
-### Reproduce
+## How this was measured
+
+- **The corpus.** Both sides draw on exactly the same set of files — the ones
+  the index covers — so neither is credited with reach the other did not have.
+- **The ground truth is read from disk, not from the engine.** The function's
+  body is re-read from its file by line number; the file's import statements are
+  resolved through the repository's own package manifests; a helper counts only
+  when the body actually uses a name that resolves to a real file. Nothing in
+  the scoring comes from the graph being tested.
+- **Imports that leave the repository** (npm packages, Node built-ins) are
+  excluded from both sides. Neither approach can supply them, so counting them
+  would measure the package manager.
+- **Token policy** is `bytes ÷ 4`, applied identically to both sides.
+- **Budget.** The capsule is pinned to 8,000 tokens, the default the tool ships
+  with. It reports its own size to within 0.5% of the bytes it actually sends,
+  and 999 of the 1,000 capsules stayed inside that budget.
+- **Sampling.** Random symbols with a body over 500 characters and a name of at
+  least 12 characters — distinctive names, where searching by name is a fair
+  proxy for what an agent would do. Two independent 1,000-task runs returned
+  9.1× and 9.9× against file reading, and 46.5% and 47.8% helper coverage.
+- **An earlier release quoted 33.9× on this benchmark.** That baseline counted
+  duplicate checkouts of the same source tree that happened to sit inside the
+  benchmark directory, which inflated the file-reading side roughly tenfold.
+  With both sides restricted to the indexed file set, the figures above are what
+  the same comparison produces.
+
+Reproduce on your own repository, once it is indexed:
 
 ```bash
-node scripts/bench-context-quality.mjs 400 /path/to/your/indexed/repo
+node scripts/bench-context-quality.mjs 1000 /path/to/your/repo
 ```
 
-The repository must already be ingested (re-ingest on 2.10.0 or later
-so the effect-propagation fix reaches the stored signatures). The script
-re-reads ground truth from disk, resolves imports through workspace manifests,
-and prints every number above as JSON, including the weak ones.
+The script prints every number on this page as JSON, including the unflattering
+ones.
 
 ---
 

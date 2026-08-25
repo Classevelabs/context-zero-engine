@@ -107,6 +107,7 @@ for (const row of fileRes.rows) {
   corpus.set(relPath, {
     text,
     tokens: tok(Buffer.byteLength(text, "utf-8")),
+    lines: text.split(/\r?\n/).length,
     idents: new Set(text.match(IDENT) || []),
   })
 }
@@ -122,7 +123,7 @@ const referencing = (name) => {
   const out = []
   for (const [p, f] of corpus) {
     if (!f.idents.has(name)) continue
-    out.push({ file: p, tokens: f.tokens, occurrences: (f.text.match(re) || []).length })
+    out.push({ file: p, tokens: f.tokens, lines: f.lines, occurrences: (f.text.match(re) || []).length })
   }
   return out.sort((a, b) => b.occurrences - a.occurrences)
 }
@@ -390,10 +391,24 @@ for (const t of targets.rows) {
     if (c) oracleFiles.add(c.file)
   }
   let oracleTokens = 0
-  for (const f of oracleFiles) oracleTokens += corpus.get(f)?.tokens ?? 0
+  let oracleLines = 0
+  for (const f of oracleFiles) {
+    oracleTokens += corpus.get(f)?.tokens ?? 0
+    oracleLines += corpus.get(f)?.lines ?? 0
+  }
 
   // Naive cost: what the grep-and-read agent actually pays, capped at 25 files.
-  const naiveTokens = ranked.slice(0, 25).reduce((a, f) => a + f.tokens, 0)
+  // Quoted in files and lines as well as tokens — those are the units someone
+  // can picture without converting anything.
+  const naiveSlice = ranked.slice(0, 25)
+  const naiveTokens = naiveSlice.reduce((a, f) => a + f.tokens, 0)
+  const naiveFiles = naiveSlice.length
+  const naiveLines = naiveSlice.reduce((a, f) => a + f.lines, 0)
+
+  // What the capsule actually contains, in lines of real code.
+  const countLines = (text) => (typeof text === "string" && text.length > 0 ? text.split(/\r?\n/).length : 0)
+  const capsuleLines =
+    countLines(capsule.target_symbol?.code) + nodes.reduce((a, n) => a + countLines(n.code), 0)
 
   // Effects are not scored, they are characterised. An effect the analyser
   // read out of this function's own body is worth more than one propagated
@@ -417,7 +432,12 @@ for (const t of targets.rows) {
     name: t.name,
     spent,
     naiveTokens,
+    naiveFiles,
+    naiveLines,
     oracleTokens,
+    oracleLines,
+    oracleFileCount: oracleFiles.size,
+    capsuleLines,
     depsTotal: deps.size,
     depsIndexed: indexedDeps.length,
     czDeps: czDeps.length,
@@ -497,6 +517,27 @@ console.log(
       tasks: rows.length,
       capsule_token_budget: BUDGET,
       min_symbol_name_length: MIN_NAME,
+
+      // The same run, stated in units a reader can picture without converting
+      // anything: how many files, how many lines, how many tokens, for one
+      // typical question. Medians, because an average over file sizes is
+      // dragged around by whichever target happened to sit next to a 4,000-line
+      // file.
+      one_typical_task: {
+        reading_files: {
+          files_opened: Math.round(median((r) => r.naiveFiles)),
+          lines_of_code: Math.round(median((r) => r.naiveLines)),
+          tokens: Math.round(median((r) => r.naiveTokens)),
+        },
+        contextzero: {
+          requests: 1,
+          lines_of_code: Math.round(median((r) => r.capsuleLines)),
+          tokens: Math.round(median((r) => r.spent)),
+        },
+        tokens_saved_pct: +(
+          (1 - median((r) => r.spent) / Math.max(1, median((r) => r.naiveTokens))) * 100
+        ).toFixed(1),
+      },
 
       cost: {
         avg_capsule_tokens: Math.round(avg((r) => r.spent)),

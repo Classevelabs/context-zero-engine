@@ -31,24 +31,28 @@ with targeted queries: *give me this symbol with its dependencies and
 contracts*, *what breaks if I change it*, *where else does this logic exist*,
 *which tests cover it*.
 
-A reduction alone proves nothing, since returning nothing would score 100%. So
-the measurement gives both sides the *same* token budget and scores what
-survives. Across 400 random symbols in a 375k-LOC production monorepo, at the
-8,000-token budget the tool defaults to, ContextZero carries the implementation
-**100% of the time against 19%**, a verified caller **~76% against ~30%**, and
-**about half of the cross-file imports the code actually uses, against ~0%** —
-grep finds where a name is used, not what that name needs. That is **over 5x
-more checkable fact per token**, at **10x fewer tokens** than grepping and
-reading the matching files, or **7–10x fewer** than an oracle told in advance
-exactly which files to open. The capsule reports its own size to within 0.5%
-and stays inside the budget it is given.
+Measured on 1,000 random functions in a 375,000-line production monorepo, one
+typical task looks like this:
 
-An earlier release claimed 33.9x on a baseline inflated by duplicate source
-trees; it is withdrawn, and the follow-up audit found — and fixed — the capsule
-spending ~half its budget on internal waste. [BENCHMARKS.md](BENCHMARKS.md)
-records the measurement, the correction, the repairs, and the places the engine
-is still weak. Reproduce on your own repository with
-`node scripts/bench-context-quality.mjs`.
+| | Search and read files | ContextZero |
+|---|---:|---:|
+| Requests | 1 search + 2 file reads | **1** |
+| Lines of code pulled in | 1,245 | **143** |
+| Tokens spent | 11,768 | **2,132** |
+
+That is **82% fewer tokens** — 9.1× fewer across the whole run. But spending
+less proves nothing on its own, since an empty answer spends nothing at all. So
+both sides were given the *same* tokens to spend and the answers checked against
+the source on disk: ContextZero contains the function being changed **every
+time, against 1 time in 5** for file reading, something that genuinely calls it
+**73% of the time against 29%**, and **about half** the helpers the code uses
+from other files, against almost none.
+
+Searching for a name finds the places that mention it, not the things it needs —
+which is why the cheaper answer is also the more complete one.
+[BENCHMARKS.md](BENCHMARKS.md) has the method, a worked example, a second
+repository, and what the engine still does poorly. Reproduce on your own
+repository with `node scripts/bench-context-quality.mjs`.
 
 ---
 
