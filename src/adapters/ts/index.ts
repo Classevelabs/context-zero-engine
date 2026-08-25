@@ -740,6 +740,62 @@ function extractRelationsFromBody(
     }
   }
 
+  /**
+   * A declaration key, but only for symbols declared at module scope.
+   *
+   * Locals and parameters resolve perfectly well and are worthless as graph
+   * edges: they describe the inside of one function, not how the repository
+   * fits together, and emitting them would bury the real structure in noise.
+   */
+  function resolveModuleScopedDeclarationKey(expr: ts.Expression): string | undefined {
+    try {
+      let symbol = checker.getSymbolAtLocation(expr)
+      if (!symbol) return undefined
+      if (symbol.flags & ts.SymbolFlags.Alias) {
+        try {
+          symbol = checker.getAliasedSymbol(symbol)
+        } catch {
+          /* not an alias */
+        }
+      }
+      const declaration = symbol.declarations?.[0]
+      if (!declaration) return undefined
+      if (
+        ts.isParameter(declaration) ||
+        ts.isBindingElement(declaration) ||
+        ts.isTypeParameterDeclaration(declaration)
+      ) {
+        return undefined
+      }
+      // Walk up to the nearest scope: anything not anchored at the source file
+      // (or a module block) is local to some function and not worth an edge.
+      let scope: ts.Node | undefined = declaration.parent
+      while (scope && !ts.isSourceFile(scope) && !ts.isModuleBlock(scope)) {
+        if (
+          ts.isFunctionDeclaration(scope) ||
+          ts.isFunctionExpression(scope) ||
+          ts.isArrowFunction(scope) ||
+          ts.isMethodDeclaration(scope) ||
+          ts.isBlock(scope)
+        ) {
+          return undefined
+        }
+        scope = scope.parent
+      }
+      const declFile = declaration.getSourceFile()
+      if (declFile.isDeclarationFile || declFile.fileName.includes("node_modules")) return undefined
+      const name = symbol.getName()
+      if (!name || name === "__type" || name === "default") return undefined
+      return `${declFile.fileName}#${name}`
+    } catch {
+      return undefined
+    }
+  }
+
+  // One resolution per distinct name per symbol: an identifier repeated fifty
+  // times is one fact, and the checker is the expensive part of this walk.
+  const seenIdentifiers = new Set<string>()
+
   function walkBody(child: ts.Node): void {
     // Detect call expressions
     if (ts.isCallExpression(child)) {
@@ -811,6 +867,50 @@ function extractRelationsFromBody(
           ...(jsxKey ? { target_key: jsxKey } : {}),
           relation_type: "calls",
         })
+      }
+    }
+
+    // A symbol can be used without being called. A constant read in a
+    // comparison, an enum member, a schema object passed as an argument, a
+    // handler put in a lookup table — none of these are call expressions, JSX
+    // elements or type references, so a walker looking only for those three
+    // records nothing and the symbol reads as unused. Module-level constants
+    // were the clearest casualty: referenced from several files, zero inbound
+    // edges, indistinguishable from dead code.
+    //
+    // Only declarations that live at module scope in this repository count.
+    // Locals and parameters are noise — they say nothing about how the
+    // repository is wired together — and each distinct name is resolved once
+    // per symbol, so the checker is not consulted per occurrence.
+    if (ts.isIdentifier(child) && !seenIdentifiers.has(child.getText(sourceFile))) {
+      const text = child.getText(sourceFile)
+      seenIdentifiers.add(text)
+      const parent = child.parent
+      const isDeclarationName =
+        parent &&
+        (ts.isFunctionDeclaration(parent) ||
+          ts.isClassDeclaration(parent) ||
+          ts.isInterfaceDeclaration(parent) ||
+          ts.isTypeAliasDeclaration(parent) ||
+          ts.isEnumDeclaration(parent) ||
+          ts.isMethodDeclaration(parent) ||
+          ts.isVariableDeclaration(parent) ||
+          ts.isParameter(parent) ||
+          ts.isPropertyAssignment(parent) ||
+          ts.isBindingElement(parent)) &&
+        (parent as { name?: ts.Node }).name === child
+      // Property names and call callees are already covered above.
+      const isPropertyName = parent && ts.isPropertyAccessExpression(parent) && parent.name === child
+      if (!isDeclarationName && !isPropertyName) {
+        const refKey = resolveModuleScopedDeclarationKey(child)
+        if (refKey && refKey !== sourceKey) {
+          relations.push({
+            source_key: sourceKey,
+            target_name: text,
+            target_key: refKey,
+            relation_type: "references",
+          })
+        }
       }
     }
 

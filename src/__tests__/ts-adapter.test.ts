@@ -361,3 +361,63 @@ describe("every symbol contributes its references", () => {
     expect(result.relations.some((r) => r.source_key.includes("go") && r.target_name === "inner")).toBe(true)
   })
 })
+
+describe("symbols used without being called", () => {
+  function extractPair(a: { name: string; source: string }, b: { name: string; source: string }) {
+    const dir = fs.mkdtempSync(path.join(tmpDir, "ref-"))
+    const pa = path.join(dir, a.name)
+    const pb = path.join(dir, b.name)
+    fs.writeFileSync(pa, a.source, "utf-8")
+    fs.writeFileSync(pb, b.source, "utf-8")
+    return extractFromTypeScript([pa, pb])
+  }
+
+  test("a constant read in a comparison is an edge to its declaration", async () => {
+    // Not a call, not JSX, not a type — so a walker looking only for those
+    // recorded nothing, and every module-level constant read as dead code.
+    const result = await extractPair(
+      { name: "c.ts", source: `export const NAV_SETTLE_MS = 250\n` },
+      {
+        name: "u.ts",
+        source:
+          `import { NAV_SETTLE_MS } from "./c"\n` +
+          `export function settled(ms: number): boolean { return ms > NAV_SETTLE_MS }\n`,
+      },
+    )
+    const edge = result.relations.find((r) => r.source_key.includes("settled") && r.target_name === "NAV_SETTLE_MS")
+    expect(edge).toBeDefined()
+    expect(edge?.relation_type).toBe("references")
+    expect(edge?.target_key).toContain("c.ts")
+  })
+
+  test("locals and parameters are not emitted as edges", async () => {
+    // They resolve fine and are worthless: they describe the inside of one
+    // function rather than how the repository is wired, and would bury the
+    // real structure.
+    const result = await extractPair(
+      { name: "c2.ts", source: `export const OUTER = 1\n` },
+      {
+        name: "u2.ts",
+        source:
+          `import { OUTER } from "./c2"\n` +
+          `export function f(param: number): number { const local = 2; return param + local + OUTER }\n`,
+      },
+    )
+    const fromF = result.relations.filter((r) => r.source_key.includes("#f"))
+    expect(fromF.some((r) => r.target_name === "OUTER")).toBe(true)
+    expect(fromF.some((r) => r.target_name === "local")).toBe(false)
+    expect(fromF.some((r) => r.target_name === "param")).toBe(false)
+  })
+
+  test("a repeated identifier yields one edge, not one per occurrence", async () => {
+    const result = await extractPair(
+      { name: "c3.ts", source: `export const K = 3\n` },
+      {
+        name: "u3.ts",
+        source: `import { K } from "./c3"\nexport function g(): number { return K + K + K + K }\n`,
+      },
+    )
+    const edges = result.relations.filter((r) => r.source_key.includes("#g") && r.target_name === "K")
+    expect(edges).toHaveLength(1)
+  })
+})

@@ -31,11 +31,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   before testing the node it was given, stepping over the only relation such a
   symbol has.
 
-  Same corpus, against 2.7.0: symbols with inbound edges 30.1% to 49.4%,
-  symbols emitting edges 28.1% to 52.5%, symbols carrying known effects 926 to
-  9,221, recorded effect facts 40,122 to 799,696. In compiled capsules, a
-  verified caller is present for 75.6% of targets, up from 48.7%, and effects
-  for 68.9%, up from 10.3%.
+- **A symbol used without being called produced no edge.** The walker
+  recognised calls, JSX elements and type references. A constant read in a
+  comparison, an enum member, a schema passed as an argument, a handler placed
+  in a lookup table — none of those are any of the three, so every module-level
+  constant in the repository read as dead code. Identifier references now
+  resolve through the checker, restricted to declarations at module scope:
+  locals and parameters describe the inside of one function rather than how the
+  repository fits together, and would bury the real structure.
+
+- **Capsules presented mentions as callers.** Caller selection accepted `calls`
+  and `references` and ordered them by confidence, which is a constant for
+  statically extracted edges. Once references became plentiful they crowded
+  genuine callers out of the limit. Calls now rank ahead of references, which
+  restored caller precision and brought capsules back inside their token budget.
+
+  Same corpus, against 2.7.0: symbols with inbound edges 30.1% to 72.4%,
+  symbols emitting edges 28.1% to 61.9%, structural relations 27,450 to
+  113,459, symbols carrying known effects 926 to 9,222, recorded effect facts
+  40,122 to 799,699 — while a full ingest got faster, 466s to 350s. In compiled
+  capsules at the default 8k budget, a verified caller is present for 80% of
+  targets, up from 48.7%, and effects for 66.7%, up from 10.3%.
 
 ## [2.8.0] — Call targets resolve to declarations
 

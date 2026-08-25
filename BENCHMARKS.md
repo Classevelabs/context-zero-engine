@@ -1,55 +1,65 @@
 # Context Zero Engine — Benchmarks
 
-## Headline (2.8.0, measured on a live 375k-LOC monorepo)
+## Headline (2.9.0, measured on a live 375k-LOC monorepo)
 
 A token reduction on its own is not evidence of anything — returning an empty
 response is a 100% reduction. The number that matters is how much of what you
-need survives the compression. Both are measured here, from the same run, on 45
-randomly selected functions and classes in a private production monorepo:
+need survives. Both are measured here, from the same run, on 45 randomly
+selected functions and classes in a private production monorepo, with the
+capsule pinned to the 8,000-token budget the tool actually defaults to.
 
 ### What it costs
 
 | | Reading the files | ContextZero |
 |---|---:|---:|
-| Tokens, pooled across 45 tasks | 8,507,574 | 213,695 |
-| Reduction | | **39.8x (97.5% saved)** |
-| Reduction, typical task | | **23.7x** |
+| Tokens, pooled across 45 tasks | 12,319,061 | 363,252 |
+| Reduction | | **33.9x (97.1% saved)** |
 
 ### What survives
 
-Both sides are then given the *same* budget — the tokens the capsule actually
-used — and scored on facts that can be checked exactly.
+Both sides then get the *same* budget and are scored on facts checkable exactly.
 
 | At an identical token budget | ContextZero | Reading the files |
 |---|---:|---:|
-| Facts delivered (of 3) | **2.53** | 0.73 |
-| Has the implementation | **100%** | 17.8% |
-| Has a caller, verified | **53.3%** | 37.8% |
-| Has the interface | **100%** | 17.8% |
-| Tasks won / tied / lost | **39 / 5** | 1 |
+| Facts delivered (of 3) | **2.80** | 1.44 |
+| Has the implementation | **100%** | 48.9% |
+| Has a caller, verified | **80%** | 46.7% |
+| Has the interface | **100%** | 48.9% |
+| Tasks won / tied / lost | **31 / 13** | 1 |
 
-Caller precision is **97.3%**: when a caller is named, its own source is
-verified to reference the target. At the capsule's budget, reading files affords
-**less than one file** on average — usually not even the one containing the
-definition, which is why the implementation is present 100% of the time on one
-side and 17.8% on the other.
+Caller precision is **83.9%**: when a caller is named, its own source is checked
+to reference the target. Reproduce with
+`node scripts/bench-quality.mjs 45 /path/to/your/repo`.
 
-Effects are excluded from the score on purpose. A transitive effect signature
-with hop counts is not something reading one file produces at any budget, so
-counting it would flatter the result rather than inform it.
+### Graph coverage
+
+Completeness of the graph the answers are drawn from, same corpus, against 2.7.0:
+
+| | 2.7.0 | 2.9.0 |
+|---|---:|---:|
+| Symbols with inbound edges | 30.1% | **72.4%** |
+| Symbols emitting edges | 28.1% | **61.9%** |
+| Structural relations | 27,450 | **113,459** |
+| Symbols with known effects | 926 | **9,222** |
+| Recorded effect facts | 40,122 | **799,699** |
+| Full ingest wall clock | 466s | **350s** |
+
+The remaining symbols without inbound edges are largely entry points, exported
+API surface consumed outside the repository, and code reached only by a runtime
+the static graph cannot see. That share is reported rather than closed by
+inventing edges.
 
 **Method and honesty notes.** The baseline is given every advantage: candidate
-files are ranked best-first by how often the symbol occurs, reading the defining
-file earns the implementation and interface outright, and it is charged nothing
-for searching or for deciding what to open. Targets are restricted to
-distinctive names, where file-reading is a fair proxy; on common names the
-uncapped reduction exceeds 2,500x, which is real but unrepresentative and is
-therefore not the headline. Figures come from one repository and 45 sampled
-symbols, so per-run sampling variance of a few points is expected. Reproduce
-with `node scripts/bench-quality.mjs 45 /path/to/your/repo` against your own
-indexed repository.
+files ranked best-first by occurrence count, reading the defining file earns the
+implementation and interface outright, and it is charged nothing for searching
+or for deciding what to open. Targets are restricted to distinctive names, where
+file-reading is a fair proxy; on common names the uncapped reduction exceeds
+2,500x, which is real but unrepresentative and is therefore not the headline.
+Figures come from one repository and 45 sampled symbols, so per-run sampling
+variance of a few points is expected.
 
 ---
+
 
 
 This document also records earlier author-reported benchmark runs: a

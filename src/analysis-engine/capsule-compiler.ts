@@ -736,7 +736,14 @@ export class CapsuleCompiler {
             JOIN files f ON f.file_id = sv.file_id
             WHERE sr.dst_symbol_version_id = $1
             AND sr.relation_type IN ('calls', 'references')
-            ORDER BY sr.confidence DESC
+            -- Callers before referencers. Something that INVOKES this symbol
+            -- answers "what breaks if I change it" directly; something that
+            -- merely mentions it — reads a constant, names a type — is weaker
+            -- evidence. Both were ordered by confidence alone, which is a
+            -- constant for statically extracted edges, so once references
+            -- became plentiful they crowded real callers out of the limit and
+            -- the capsule started presenting mentions as callers.
+            ORDER BY CASE sr.relation_type WHEN 'calls' THEN 0 ELSE 1 END, sr.confidence DESC
             LIMIT 10
         `,
       [svId],

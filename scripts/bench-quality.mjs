@@ -51,6 +51,7 @@ const { db } = await load("dist/db-driver/index.js")
 
 const REPO = path.resolve(process.argv[3] || process.cwd())
 const N = parseInt(process.argv[2] || "40", 10)
+const TOKEN_BUDGET = parseInt(process.env.CZ_BENCH_BUDGET || "8000", 10)
 const tok = (bytes) => Math.round(bytes / 4)
 const SRC = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|cs|rb|kt|swift|php)$/i
 
@@ -115,7 +116,12 @@ for (const target of targets.rows) {
 
   let capsule
   try {
-    capsule = await capsuleCompiler.compile(target.symbol_version_id, snapshotId, "strict")
+    // Pin the budget rather than letting it float. This is the budget the
+    // scg_compile_context_capsule tool defaults to, so it is the configuration
+    // an agent actually runs — and a floating budget quietly hands the
+    // file-reading baseline more room as capsules grow richer, which measures
+    // the benchmark rather than the engine.
+    capsule = await capsuleCompiler.compile(target.symbol_version_id, snapshotId, "strict", TOKEN_BUDGET)
   } catch {
     continue
   }
@@ -187,6 +193,7 @@ console.log(
       repo: path.basename(REPO),
       tasks: rows.length,
       equal_token_budget: true,
+      capsule_token_budget: TOKEN_BUDGET,
       avg_budget_tokens: Math.round(avg((r) => r.budget)),
       tokens_file_reading_total: rows.reduce((a, r) => a + r.traditionalTokens, 0),
       tokens_contextzero_total: rows.reduce((a, r) => a + r.budget, 0),

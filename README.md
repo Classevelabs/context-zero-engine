@@ -31,16 +31,16 @@ with targeted queries: *give me this symbol with its dependencies and
 contracts*, *what breaks if I change it*, *where else does this logic exist*,
 *which tests cover it*.
 
-Measured live against a 375k-LOC production monorepo, that costs **97.5% fewer
-tokens** — a 39.8x pooled reduction across 45 real tasks, 23.7x on the typical
-one. But a reduction alone proves nothing, since returning nothing would score
-100%. So both sides get the *same* budget and are scored on what survives:
-ContextZero delivers **2.53 of 3 checkable facts against 0.73**, carries the
-implementation **100% of the time versus 17.8%**, and wins **39 of 45 tasks**
-while losing one — with the file-reading baseline deliberately handicapped in
-its own favour. Reproduce both numbers on your own repository with
-`node scripts/bench-quality.mjs`; see [BENCHMARKS.md](BENCHMARKS.md) for the
-method, the honesty notes, and the older multi-repo runs.
+Measured live against a 375k-LOC production monorepo, that costs **97.1% fewer
+tokens** — a 33.9x reduction across 45 real tasks. But a reduction alone proves
+nothing, since returning nothing would score 100%. So both sides get the *same*
+budget and are scored on what survives: ContextZero delivers **2.80 of 3
+checkable facts against 1.44**, carries the implementation **100% of the time
+versus 48.9%**, names a verified caller **80% of the time versus 46.7%**, and
+wins **31 of 45 tasks** while losing one — with the file-reading baseline
+deliberately handicapped in its own favour. Reproduce both numbers on your own
+repository with `node scripts/bench-quality.mjs`; see
+[BENCHMARKS.md](BENCHMARKS.md) for the method and the honesty notes.
 
 ---
 
