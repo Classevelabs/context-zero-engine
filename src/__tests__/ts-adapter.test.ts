@@ -421,3 +421,70 @@ describe("symbols used without being called", () => {
     expect(edges).toHaveLength(1)
   })
 })
+
+// ── Test blocks are symbols ──
+
+describe("test blocks are extracted as symbols", () => {
+  const SRC = [
+    'import { target } from "./somewhere"',
+    "",
+    'describe("capsule", () => {',
+    "  beforeEach(() => { target.reset() })",
+    "",
+    '  it("compiles within budget", async () => {',
+    "    const result = target(42)",
+    "    expect(result).toBe(43)",
+    "  })",
+    "",
+    '  describe("nested", () => {',
+    '    test("still works", () => { target(1) })',
+    "  })",
+    "})",
+    "",
+    'it.todo("write this later")',
+    'it.each([[1], [2]])("case %d", (n) => { target(n) })',
+  ].join("\n")
+
+  test("leaf tests and hooks become test_case symbols; suites do not", async () => {
+    const syms = await symbols(SRC)
+    const tests = syms.filter((s: any) => s.kind === "test_case")
+    const names = tests.map((t: any) => t.canonical_name)
+    expect(names).toContain("compiles within budget")
+    expect(names).toContain("still works")
+    expect(names).toContain("beforeEach")
+    expect(names).toContain("case %d")
+    // A suite contributes its title to keys, not a symbol of its own.
+    expect(names).not.toContain("capsule")
+    expect(names).not.toContain("nested")
+    // it.todo has no body: nothing to index.
+    expect(names).not.toContain("write this later")
+  })
+
+  test("suite path lands in the stable key, so repeated titles stay distinct", async () => {
+    const syms = await symbols(SRC)
+    const nested = syms.find((s: any) => s.canonical_name === "still works")
+    expect(nested.stable_key).toContain("capsule > nested > still works")
+  })
+
+  test("a test body produces relations to the code it exercises", async () => {
+    const result = await extract(SRC)
+    const testKeys = new Set(
+      result.symbols.filter((s: any) => s.kind === "test_case").map((s: any) => s.stable_key),
+    )
+    const fromTests = result.relations.filter((r: any) => testKeys.has(r.source_key))
+    expect(fromTests.some((r: any) => r.target_name === "target" || r.target_name.startsWith("target."))).toBe(true)
+  })
+})
+
+describe("module-level constants are variables, not functions", () => {
+  test("a const with a non-function initializer is a variable", async () => {
+    const syms = await symbols('export const TIMEOUT_MS = 5000\nexport const NAMES = ["a", "b"]')
+    expect(syms.find((s: any) => s.canonical_name === "TIMEOUT_MS").kind).toBe("variable")
+    expect(syms.find((s: any) => s.canonical_name === "NAMES").kind).toBe("variable")
+  })
+
+  test("a const holding an arrow function is a function", async () => {
+    const syms = await symbols("export const handler = async () => { return 1 }")
+    expect(syms.find((s: any) => s.canonical_name === "handler").kind).toBe("function")
+  })
+})

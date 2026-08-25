@@ -339,6 +339,46 @@ export async function extractFromTypeScript(
   }
 }
 
+/**
+ * Test blocks. `describe("...", () => { ... })` and `it("...", () => { ... })`
+ * are expression statements, not declarations, so a walker that only extracts
+ * declarations stores nothing for them — which meant nearly all test CONTENT
+ * was invisible: the calls a test makes to the code it exercises produced no
+ * edges, test artifacts had nothing to relate, and a capsule could link a
+ * covering test for barely one symbol in twenty. A leaf test or hook is now a
+ * symbol of its own (kind `test_case`), its body walked for relations like any
+ * function; a suite contributes its title to the keys of the tests inside it
+ * and is not itself a symbol, so nothing inside is attributed twice.
+ */
+const TEST_SUITE_NAMES = new Set(["describe", "suite", "context"])
+const TEST_LEAF_NAMES = new Set(["it", "test", "bench"])
+const TEST_HOOK_NAMES = new Set(["beforeEach", "beforeAll", "afterEach", "afterAll", "before", "after"])
+
+/** Root callee of a test-framework call: `it.each(tbl)("t", fn)` → "it". */
+function testCalleeRoot(expr: ts.Expression): string | undefined {
+  if (ts.isIdentifier(expr)) return expr.text
+  if (ts.isPropertyAccessExpression(expr)) return testCalleeRoot(expr.expression)
+  if (ts.isCallExpression(expr)) return testCalleeRoot(expr.expression)
+  return undefined
+}
+
+/** The function argument holding the test body, if the call carries one. */
+function testBodyFunction(call: ts.CallExpression): ts.ArrowFunction | ts.FunctionExpression | undefined {
+  for (let i = call.arguments.length - 1; i >= 0; i--) {
+    const arg = call.arguments[i]!
+    if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) return arg
+  }
+  return undefined
+}
+
+/** A test title, when it is knowable statically. */
+function testTitle(call: ts.CallExpression): string | undefined {
+  const first = call.arguments[0]
+  if (!first) return undefined
+  if (ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first)) return first.text
+  return undefined
+}
+
 function extractFromSourceFile(
   sourceFile: ts.SourceFile,
   checker: ts.TypeChecker,
@@ -351,7 +391,73 @@ function extractFromSourceFile(
 ): void {
   const relativePath = filePath
 
+  function extractTestBlock(node: ts.ExpressionStatement, call: ts.CallExpression, suitePath?: string): boolean {
+    const root = testCalleeRoot(call.expression)
+    if (!root) return false
+
+    if (TEST_SUITE_NAMES.has(root)) {
+      const bodyFn = testBodyFunction(call)
+      if (!bodyFn || !bodyFn.body) return true // `describe.skip("x")` with no body: swallow, nothing to index
+      const title = testTitle(call) ?? "(dynamic)"
+      const nested = suitePath ? `${suitePath} > ${title}` : title
+      // Only the suite's body is walked; the suite itself is not a symbol.
+      if (ts.isBlock(bodyFn.body)) {
+        for (const statement of bodyFn.body.statements) visitTestScope(statement, nested)
+      }
+      return true
+    }
+
+    if (TEST_LEAF_NAMES.has(root) || TEST_HOOK_NAMES.has(root)) {
+      const bodyFn = testBodyFunction(call)
+      if (!bodyFn) return true // `it.todo("...")`: a name with no body, nothing to index
+      const title = TEST_HOOK_NAMES.has(root) ? root : (testTitle(call) ?? `${root} (dynamic)`)
+      const { line: startLine, character: startCol } = sourceFile.getLineAndCharacterOfPosition(
+        node.getStart(sourceFile),
+      )
+      const { line: endLine, character: endCol } = sourceFile.getLineAndCharacterOfPosition(node.getEnd())
+      // The line disambiguates `it.each` expansions and repeated titles.
+      const stableKey = `${relativePath}#test:${suitePath ? `${suitePath} > ` : ""}${title}@${startLine + 1}`
+      const fullText = getNodeText(node, sourceFile)
+      const bodyText = getNodeText(bodyFn, sourceFile)
+      let normalizedAstHash: string | undefined
+      try {
+        normalizedAstHash = normalizeForComparison(bodyText)
+      } catch {
+        uncertaintyFlags.push("normalization_failure")
+      }
+      symbols.push({
+        stable_key: stableKey,
+        canonical_name: title,
+        kind: "test_case",
+        range_start_line: startLine + 1,
+        range_start_col: startCol + 1,
+        range_end_line: endLine + 1,
+        range_end_col: endCol + 1,
+        signature: `${root}(${JSON.stringify(title)})`,
+        ast_hash: sha256(fullText),
+        body_hash: sha256(bodyText),
+        normalized_ast_hash: normalizedAstHash,
+        visibility: "internal",
+      })
+      extractRelationsFromBody(bodyFn, sourceFile, checker, stableKey, relations)
+      return true
+    }
+
+    return false
+  }
+
+  /** Statements inside a suite body: nested suites, tests, hooks — or shared
+   * setup, which is not a symbol of its own and is left to the tests that use it. */
+  function visitTestScope(statement: ts.Node, suitePath: string): void {
+    if (ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)) {
+      extractTestBlock(statement, statement.expression, suitePath)
+    }
+  }
+
   function visit(node: ts.Node, parentKey?: string): void {
+    if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)) {
+      if (extractTestBlock(node, node.expression)) return
+    }
     // Extract top-level and class-member declarations
     const isTopLevelVariableStatement = ts.isVariableStatement(node) && ts.isSourceFile(node.parent)
     const isExtractable =
@@ -407,7 +513,17 @@ function extractFromSourceFile(
           symbols.push({
             stable_key: declStableKey,
             canonical_name: declName,
-            kind: classifyKind(node, sourceFile),
+            // Classified by the DECLARATION, not the statement. classifyKind
+            // was handed the VariableStatement, which is none of the kinds it
+            // tests for, so every module-level const fell through to
+            // "function" — 20,000 constants on a large monorepo wearing the
+            // wrong label, feeding contract mining and search filters that
+            // select by kind. `const f = () => {}` IS a function; `const N = 5`
+            // is a variable.
+            kind:
+              decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))
+                ? "function"
+                : "variable",
             range_start_line: declStartLine + 1,
             range_start_col: declStartCol + 1,
             range_end_line: declEndLine + 1,

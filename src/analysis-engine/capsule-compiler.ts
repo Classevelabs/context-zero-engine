@@ -965,14 +965,20 @@ export class CapsuleCompiler {
   }
 
   public async loadTestContext(svId: string): Promise<ContextNode[]> {
+    // Real test cases first — a `test_case` symbol is an it/test block whose
+    // body exercises the target, which doubles as a usage example — then the
+    // named helpers that merely live in test files. The test's own source
+    // ships when the budget allows; the budget ladder degrades it to the
+    // title line when it does not.
     const result = await db.query(
       `
             SELECT ta.test_artifact_id, ta.assertion_summary, ta.framework,
-                   sv.symbol_version_id, s.canonical_name
+                   sv.symbol_version_id, sv.body_source, s.canonical_name, s.kind
             FROM test_artifacts ta
             JOIN symbol_versions sv ON sv.symbol_version_id = ta.symbol_version_id
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             WHERE $1 = ANY(ta.related_symbols)
+            ORDER BY CASE s.kind WHEN 'test_case' THEN 0 ELSE 1 END
             LIMIT 5
         `,
       [svId],
@@ -984,13 +990,15 @@ export class CapsuleCompiler {
         assertion_summary: string
         framework: string
         symbol_version_id: string
+        body_source: string | null
         canonical_name: string
+        kind: string
       }[]
     ).map((row) => ({
       type: "test" as const,
       symbol_id: row.symbol_version_id,
       name: row.canonical_name,
-      code: null,
+      code: row.kind === "test_case" ? (row.body_source ?? null) : null,
       summary: `[${row.framework}] ${row.assertion_summary || "test case"}`,
       relevance: 0.85,
     }))

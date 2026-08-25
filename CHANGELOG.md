@@ -5,6 +5,34 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] — A test is code
+
+### Fixed
+
+- **Test content was invisible to the graph.** `describe(...)` and `it(...)`
+  are expression statements, not declarations, so a walker that only extracts
+  declarations stored nothing for them: the calls a test makes to the code it
+  exercises produced no edges, test artifacts had almost nothing to relate,
+  and a capsule could link a covering test for barely one symbol in twenty.
+  A leaf test or hook (`it`, `test`, `bench`, `beforeEach`, …) is now a symbol
+  of its own — kind `test_case`, named by its title, its body walked for
+  relations like any function. A suite (`describe`) contributes its title to
+  the keys of the tests inside it and is not itself a symbol, so nothing is
+  attributed twice; `it.todo` and bodiless suites are swallowed. On the
+  375k-line monorepo this adds 9,317 test-case symbols and 72k relations, and
+  a capsule now links a covering test for 27% of targets, up from 5% — with
+  the test's own source included when the budget allows, which doubles as a
+  usage example.
+- **Every module-level constant wore the label `function`.** classifyKind was
+  handed the VariableStatement, which is none of the kinds it tests for, so
+  20,000 constants on the same monorepo fell through to the default. A
+  declaration whose initializer is a function is a `function`; anything else
+  is a `variable`. Contract mining, dispatch resolution and search filters all
+  select by kind and now see the truth.
+
+Capsules also rank real test cases ahead of test-file helpers when choosing
+which tests to ship.
+
 ## [2.11.0] — The signature is part of what a symbol depends on
 
 ### Fixed

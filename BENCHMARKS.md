@@ -26,8 +26,8 @@ back. On a typical job:
 | | |
 |---|---:|
 | Files it opens | 2 |
-| Lines of code it has to read | 1,245 |
-| **Tokens it pays for** | **11,506** |
+| Lines of code it has to read | 1,290 |
+| **Tokens it pays for** | **11,866** |
 
 ## With ContextZero
 
@@ -36,12 +36,12 @@ It asks once and gets an answer already assembled:
 | | |
 |---|---:|
 | Requests | 1 |
-| Lines of code | 171 |
-| **Tokens it pays for** | **2,439** |
+| Lines of code | 176 |
+| **Tokens it pays for** | **2,630** |
 
-### That is 79% fewer tokens for the same job
+### That is 78% fewer tokens for the same job
 
-Across all 1,000 jobs: **29.4 million tokens down to 3.0 million — 9.8× less.**
+Across all 1,000 jobs: **28.2 million tokens down to 3.3 million — 8.5× less.**
 
 ## The important part: it costs less *without* knowing less
 
@@ -51,9 +51,10 @@ against the real source code on disk.
 
 | Did the answer actually contain… | Without | With ContextZero |
 |---|---:|---:|
-| the function you asked to change | 1 time in 5 | **every time** |
-| the code that calls it | 27% | **74%** |
-| the helpers it uses from other files | almost never | **half of them** |
+| the function you asked to change | 1 time in 4 | **every time** |
+| the code that calls it | 33% | **82%** |
+| the helpers it uses from other files | almost never | **more than half** |
+| a test that covers it | — | **1 job in 4** |
 
 So the cheaper answer is also the more complete one. Not a trade.
 
@@ -87,24 +88,24 @@ release tooling, a website and this engine's own source:
 | One typical job | Without | With ContextZero |
 |---|---:|---:|
 | Files opened | 3 | 1 request |
-| Lines of code | 2,000 | **48** |
-| Tokens | 18,828 | **787** |
+| Lines of code | 2,088 | **43** |
+| Tokens | 20,909 | **706** |
 
-**96% fewer tokens**, and 29× less across the whole run. The function you asked
-about is present every time, against 1 time in 17 by searching.
+**97% fewer tokens**, and 29× less across the whole run. The function you asked
+about is present every time, against 1 time in 15 by searching.
 
 ## What it still does badly
 
-- **It finds about half the helpers, not all of them.** Most of what it misses
-  it simply has no record of — those are gaps in what the indexer captures, and
-  each one that gets closed raises this number directly.
-- **It finds a caller about three times in four.** On code with little internal
+- **It finds just over half the helpers, not all of them.** Most of what it
+  misses it simply has no record of — those are gaps in what the indexer
+  captures, and each one that gets closed raises this number directly.
+- **It finds a caller about four times in five.** On code with little internal
   calling — a folder of scripts — that drops, because there are genuinely fewer
   callers to find.
-- **It links a test to the function in about 1 job in 20.** Test files are
-  written as `describe(...)` and `it(...)` blocks, which the indexer does not
-  record as named code, so most test content is invisible to it. This is the
-  weakest part of the system.
+- **It links a covering test for about 1 job in 4** on the monorepo, where the
+  tests are written as `it(...)` blocks the indexer now records as code. On a
+  repository whose tests live elsewhere or follow other shapes, the figure is
+  lower. This is still the weakest part of the system.
 - **It usually uses only about a third of the space it is allowed.** When there
   is nothing more in the index to add, it stops rather than padding. Closing the
   gaps above is what turns that unused space into more answers.
