@@ -66,10 +66,22 @@ const MIN_TOKEN_BUDGET = 100
 const MAX_TOKEN_BUDGET = 100_000
 const MAX_TARGET_SYMBOLS = 20
 const MAX_CONTEXT_SYMBOLS = 500
-const MAX_OMITTED_DETAILS = 500
+// Omission notes ship in the result too. 25 named entries plus a rollup
+// count is signal; the previous cap of 500 was up to ~5k tokens of names
+// shipped outside the budget accounting.
+const MAX_OMITTED_DETAILS = 25
 
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN)
+  return Math.ceil(Buffer.byteLength(text, "utf-8") / CHARS_PER_TOKEN)
+}
+
+/**
+ * Tokens a value costs the consumer once serialized into the result JSON.
+ * Budgeting raw source text alone let every entry ship ten metadata fields
+ * free, so results overshot the budget they reported honoring.
+ */
+function serializedTokens(value: unknown): number {
+  return Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf-8") / CHARS_PER_TOKEN)
 }
 
 function fitSourceToBudget(source: string, availableTokens: number): string {
@@ -135,9 +147,7 @@ export async function compileSmartContext(
   const targets: TargetSymbol[] = (targetsResult.rows as Record<string, unknown>[]).map((t) => {
     const rawSource = (t.body_source as string | null) ?? "[source unavailable]"
     const source = fitSourceToBudget(rawSource, tokenBudget - usedTokens)
-    const tokens = estimateTokens(source)
-    usedTokens += tokens
-    return {
+    const entry: TargetSymbol = {
       symbol_version_id: (t.symbol_version_id as string) ?? "",
       canonical_name: (t.canonical_name as string) ?? "",
       kind: (t.kind as string) ?? "unknown",
@@ -146,8 +156,11 @@ export async function compileSmartContext(
       start_line: typeof t.range_start_line === "number" ? t.range_start_line : 0,
       end_line: typeof t.range_end_line === "number" ? t.range_end_line : 0,
       source,
-      token_estimate: tokens,
+      token_estimate: 0,
     }
+    entry.token_estimate = serializedTokens(entry)
+    usedTokens += entry.token_estimate
+    return entry
   })
 
   // Step 2: Compute blast radius
@@ -206,16 +219,8 @@ export async function compileSmartContext(
   for (const impact of rankedImpacts) {
     const meta = impactSourceMap.get(impact.symbol_id)
     const source = (meta?.body_source as string | null | undefined) ?? null
-    const tokens = source ? estimateTokens(source) : 0
 
-    if (contextSymbols.length >= MAX_CONTEXT_SYMBOLS || usedTokens + tokens > tokenBudget) {
-      if (omitted.length < MAX_OMITTED_DETAILS) {
-        omitted.push(`${impact.symbol_name} (${impact.severity} ${impact.impact_type})`)
-      }
-      continue
-    }
-
-    contextSymbols.push({
+    const entry: ContextSymbol = {
       symbol_name: impact.symbol_name,
       kind: (meta?.kind as string) || "unknown",
       file_path: impact.file_path,
@@ -225,16 +230,28 @@ export async function compileSmartContext(
       severity: impact.severity,
       evidence: impact.evidence,
       source,
-      token_estimate: tokens,
-    })
-    usedTokens += tokens
+      token_estimate: 0,
+    }
+    // Priced at serialized cost: the evidence string, the path, and the JSON
+    // frame ship exactly like the source does.
+    entry.token_estimate = serializedTokens(entry)
+
+    if (contextSymbols.length >= MAX_CONTEXT_SYMBOLS || usedTokens + entry.token_estimate > tokenBudget) {
+      if (omitted.length < MAX_OMITTED_DETAILS) {
+        omitted.push(`${impact.symbol_name} (${impact.severity} ${impact.impact_type})`)
+      }
+      continue
+    }
+
+    contextSymbols.push(entry)
+    usedTokens += entry.token_estimate
   }
 
   if (rankedImpacts.length - contextSymbols.length > omitted.length) {
     omitted.push(`[${rankedImpacts.length - contextSymbols.length - omitted.length} additional symbols omitted]`)
   }
 
-  return {
+  const result: SmartContextResult = {
     task: taskDescription,
     targets,
     blast_radius: {
@@ -249,4 +266,8 @@ export async function compileSmartContext(
       remaining: Math.max(0, tokenBudget - usedTokens),
     },
   }
+  // Report the measured size of the whole result, not the sum of one field.
+  result.token_usage.used = serializedTokens(result)
+  result.token_usage.remaining = Math.max(0, tokenBudget - result.token_usage.used)
+  return result
 }

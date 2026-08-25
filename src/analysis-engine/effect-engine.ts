@@ -1081,58 +1081,142 @@ export class EffectEngine {
 
     // ── Cycle recovery ──────────────────────────────────────────────
     // Nodes involved in cycles (including self-recursive functions) never
-    // reach in-degree 0, so Kahn's algorithm silently skips them. Detect
-    // unprocessed nodes, cluster them via BFS on the restricted subgraph,
-    // then compute the union of all effects within each cluster and assign
-    // the most impure effect_class to every member.
+    // reach in-degree 0, so Kahn's algorithm silently skips them. The old
+    // recovery clustered the leftovers by BFS over BOTH edge directions —
+    // weak connectivity — so two functions that merely shared a caller inside
+    // some cycle were fused into one cluster. On a large monorepo nearly every
+    // unprocessed symbol landed in a single blob, and the blob's unioned
+    // effects were stamped onto all of them: 99% of stored effect entries were
+    // that photocopy. The correct cluster is the strongly connected component
+    // — only genuine mutual recursion shares a fate. Tarjan emits SCCs sinks
+    // first, so walking them in emission order also lets effects flow from
+    // callee components into caller components with honest hop counts instead
+    // of being smeared.
     const unprocessed = Array.from(signatures.keys()).filter((svId) => !processed.has(svId) && inDegree.has(svId))
     if (unprocessed.length > 0) {
       log.debug("Effect propagation: recovering cycle members", { count: unprocessed.length })
 
-      // Discover connected cycle clusters via BFS on the call graph
-      // restricted to unprocessed nodes
       const unprocessedSet = new Set(unprocessed)
-      const visited = new Set<string>()
 
-      for (const startNode of unprocessed) {
-        if (visited.has(startNode)) continue
+      // Iterative Tarjan over the unprocessed subgraph, forward edges only.
+      const tarjanIndex = new Map<string, number>()
+      const lowlink = new Map<string, number>()
+      const onStack = new Set<string>()
+      const tarjanStack: string[] = []
+      const sccs: string[][] = []
+      let nextIndex = 0
 
-        // BFS to find all nodes in this cycle cluster
-        const cluster: string[] = []
-        const bfsQueue: string[] = [startNode]
-        let bfsIdx = 0
-        while (bfsIdx < bfsQueue.length) {
-          const node = bfsQueue[bfsIdx++]!
-          if (visited.has(node)) continue
-          visited.add(node)
-          cluster.push(node)
-
-          // Follow forward edges (callees) restricted to unprocessed
-          const callees = callGraph.get(node) || []
-          for (const c of callees) {
-            if (unprocessedSet.has(c) && !visited.has(c)) bfsQueue.push(c)
+      for (const root of unprocessed) {
+        if (tarjanIndex.has(root)) continue
+        // Explicit [node, nextChild] frames — recursion would overflow on deep chains.
+        const frames: [string, number][] = [[root, 0]]
+        while (frames.length > 0) {
+          const frame = frames[frames.length - 1]!
+          const node = frame[0]
+          if (frame[1] === 0) {
+            tarjanIndex.set(node, nextIndex)
+            lowlink.set(node, nextIndex)
+            nextIndex++
+            tarjanStack.push(node)
+            onStack.add(node)
           }
-          // Follow reverse edges (callers) restricted to unprocessed
-          const callers = reverseGraph.get(node) || []
-          for (const c of callers) {
-            if (unprocessedSet.has(c) && !visited.has(c)) bfsQueue.push(c)
+          const callees = (callGraph.get(node) || []).filter((c) => unprocessedSet.has(c))
+          let descended = false
+          while (frame[1] < callees.length) {
+            const child = callees[frame[1]]!
+            frame[1]++
+            if (!tarjanIndex.has(child)) {
+              frames.push([child, 0])
+              descended = true
+              break
+            } else if (onStack.has(child)) {
+              lowlink.set(node, Math.min(lowlink.get(node)!, tarjanIndex.get(child)!))
+            }
+          }
+          if (descended) continue
+          frames.pop()
+          const parent = frames[frames.length - 1]
+          if (parent) {
+            lowlink.set(parent[0], Math.min(lowlink.get(parent[0])!, lowlink.get(node)!))
+          }
+          if (lowlink.get(node) === tarjanIndex.get(node)) {
+            const scc: string[] = []
+            for (;;) {
+              const member = tarjanStack.pop()!
+              onStack.delete(member)
+              scc.push(member)
+              if (member === node) break
+            }
+            sccs.push(scc)
           }
         }
+      }
 
-        // Compute the union of all effects and the max effect_class across the cluster
+      log.debug("Effect propagation: cycle clusters", {
+        clusters: sccs.length,
+        largest: sccs.reduce((a, s) => Math.max(a, s.length), 0),
+      })
+
+      // Emission order is reverse-topological on the condensation: every SCC
+      // a component calls into is finalized before the component itself.
+      for (const scc of sccs) {
+        const sccSet = new Set(scc)
+
+        // 1. Pull effects from callees OUTSIDE this SCC — those are final by
+        // now. This is ordinary transitive propagation, same policy and hop
+        // budget as the acyclic phase.
+        for (const member of scc) {
+          const memberSig = signatures.get(member)
+          const memberKeys = effectKeySets.get(member)
+          if (!memberSig || !memberKeys) continue
+          let memberChanged = false
+          for (const calleeId of callGraph.get(member) || []) {
+            if (sccSet.has(calleeId)) continue
+            const calleeSig = signatures.get(calleeId)
+            if (!calleeSig) continue
+            for (const calleeEffect of calleeSig.effects) {
+              if (!TRANSITIVE_EFFECT_KINDS.has(calleeEffect.kind)) continue
+              const hops = (calleeEffect.provenance === "transitive" ? (calleeEffect.hops ?? 1) : 0) + 1
+              if (hops > MAX_EFFECT_HOPS) continue
+              const key = `${calleeEffect.kind}:${calleeEffect.descriptor}`
+              if (memberKeys.has(key)) continue
+              memberSig.effects.push({
+                kind: calleeEffect.kind,
+                descriptor: calleeEffect.descriptor,
+                detail: `[transitive from ${calleeId}] ${calleeEffect.detail}`,
+                provenance: "transitive",
+                origin_symbol_version_id:
+                  calleeEffect.provenance === "transitive" ? calleeEffect.origin_symbol_version_id : calleeId,
+                hops,
+              })
+              memberKeys.add(key)
+              memberChanged = true
+            }
+            if (EFFECT_CLASS_ORDER[calleeSig.effect_class] > EFFECT_CLASS_ORDER[memberSig.effect_class]) {
+              memberSig.effect_class = calleeSig.effect_class
+              memberChanged = true
+            }
+          }
+          if (memberChanged) changedSvIds.add(member)
+        }
+
+        // A singleton SCC is a node that was merely blocked behind a cycle
+        // (or a self-recursive function): nothing to union with itself.
+        if (scc.length === 1) continue
+
+        // 2. Union DIRECT effects within the mutual-recursion cluster.
         const clusterEffectKeys = new Set<string>()
         const clusterEffects: EffectEntry[] = []
         let clusterMaxClass: EffectClass = "pure"
 
-        for (const nodeId of cluster) {
+        for (const nodeId of scc) {
           const sig = signatures.get(nodeId)
           if (!sig) continue
           for (const effect of sig.effects) {
-            // Same policy as acyclic propagation: only transitively meaningful
-            // kinds join the cluster union, and only DIRECT observations do —
-            // unioning already-transitive entries let one member's 4-hop tail
-            // smear across every cycle member (how a license-file helper ended
-            // up "calling Stripe").
+            // Only transitively meaningful kinds join the cluster union, and
+            // only DIRECT observations do — unioning already-transitive
+            // entries let one member's 4-hop tail smear across every cycle
+            // member (how a license-file helper ended up "calling Stripe").
             if (!TRANSITIVE_EFFECT_KINDS.has(effect.kind)) continue
             if (effect.provenance !== "direct") continue
             const key = `${effect.kind}:${effect.descriptor}`
@@ -1147,7 +1231,7 @@ export class EffectEngine {
         }
 
         // Assign the union to every member of the cluster
-        for (const nodeId of cluster) {
+        for (const nodeId of scc) {
           const sig = signatures.get(nodeId)
           if (!sig) continue
           const nodeKeys = effectKeySets.get(nodeId)

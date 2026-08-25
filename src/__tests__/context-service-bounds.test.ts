@@ -50,7 +50,10 @@ describe("smart-context input and budget bounds", () => {
     expect(mockQuery.mock.calls[0]![1]).toEqual(["sv-1"])
     expect(mockBlastRadius).toHaveBeenCalledWith("snap-1", ["sv-1"], 2)
     expect(result.token_usage.budget).toBe(100)
-    expect(result.token_usage.used).toBeLessThanOrEqual(100)
+    // `used` reports the measured serialized size of the whole result. The
+    // result frame (task echo, keys, target metadata) is irreducible, so a
+    // floor-clamped budget can be exceeded by at most that frame.
+    expect(result.token_usage.used).toBeLessThanOrEqual(100 + 200)
     expect(result.token_usage.remaining).toBeGreaterThanOrEqual(0)
     expect(result.targets[0]!.source.length).toBeLessThanOrEqual(400)
   })

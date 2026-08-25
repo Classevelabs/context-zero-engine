@@ -5,6 +5,50 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] — The capsule stops paying for its own waste
+
+An instrumented audit of shipped capsules on a 375k-LOC monorepo found roughly
+half of every capsule spent on photocopied effect entries, duplicate nodes, and
+uncounted bookkeeping. All four causes are fixed; on the same corpus and
+benchmark the average strict capsule fell from 7,825 to ~2,900 tokens while
+delivered cross-file dependencies rose, and quality per token tripled
+(0.46 → ~1.3 checkable facts per 1,000 tokens). See BENCHMARKS.md for the
+full before/after.
+
+### Fixed
+
+- **Effect cycle recovery unioned weakly connected components, not cycles.**
+  Symbols left over after acyclic effect propagation were clustered by BFS over
+  both edge directions, fusing nearly all of them into one blob whose unioned
+  effects were stamped onto every member — 99.0% of all stored effect entries
+  (696,940 of 703,997) were that photocopy, and 6,021 functions were
+  mislabelled `full_side_effect`. Recovery now computes true strongly connected
+  components (iterative Tarjan) and processes them sinks-first, so only genuine
+  mutual recursion shares a fate and cross-component effects propagate with
+  real hop counts. After re-ingest, 36 cycle entries survive and 153 functions
+  carry the maximal label. Re-ingest to regenerate stored signatures.
+- **Capsule loaders returned one row per relation, not per symbol.** A
+  dependency that is both called and referenced arrived twice, was pasted at
+  full source twice, and consumed two slots of the load limit. Dependency and
+  caller queries now select one row per symbol with the strongest relation
+  (calls > inherits/implements > typed_as > references), and a symbol whose
+  source is already in the capsule ships as a one-line signature instead of a
+  second copy.
+- **Capsule budgets bound a subset of the payload.** Budgeting summed raw text
+  of chosen pieces while the shipped JSON also carried the full effect array,
+  a per-node rationale ledger, and structural overhead — `token_estimate`
+  averaged 40.7% of true size and 203 of 400 capsules overshot their budget.
+  Every piece is now priced at serialized byte cost, the rationale ledger is
+  persisted to `capsule_compilations` instead of shipping, effects ship once
+  (deduplicated, direct-first, transitive tail capped at 15) and are counted,
+  `token_estimate` is the measured size of the capsule itself (±0.5%), and a
+  final enforcement pass guarantees the budget. Token math is byte-based; the
+  previous UTF-16 count under-measured unicode-heavy source by up to half.
+- **`scg_smart_context` had the milder form of the same accounting gap.**
+  Entries now charge their serialized cost including metadata, the omission
+  list is capped at 25 named entries plus a rollup, and `token_usage.used`
+  reports the measured size of the whole result.
+
 ## [2.9.0] — Every symbol contributes its references
 
 ### Fixed

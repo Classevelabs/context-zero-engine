@@ -56,6 +56,24 @@ const MAX_TOKEN_BUDGET = 100_000
 const MAX_FALLBACK_SOURCE_BYTES = 2 * 1024 * 1024
 
 /**
+ * Serialized size of the capsule's fixed JSON skeleton — the keys, brackets
+ * and empty arrays that ship regardless of content. Charged up front so the
+ * budget binds the payload the consumer actually receives, not a subset of it.
+ * Exported so tests can assert against the same allowance.
+ */
+export const CAPSULE_SKELETON_TOKENS = 60
+
+/**
+ * Cap on transitive entries in a shipped effect signature. Direct effects all
+ * ship; transitive ones are ordered by hop count and truncated here. Beyond
+ * this point additional entries stop informing and start costing.
+ */
+const MAX_TRANSITIVE_EFFECT_ENTRIES = 15
+
+/** Cap on fetch handles shipped for omitted nodes. */
+const MAX_FETCH_HANDLES = 12
+
+/**
  * Resolution priority order (for reference). When budget is tight, we degrade from
  * full_source down through lower resolutions before omitting entirely:
  *   full_source -> signature_only -> contract_summary -> effect_summary -> name_only
@@ -133,7 +151,25 @@ export class CapsuleCompiler {
         : text.slice(0, maxChars)
     }
     const targetSignature = truncateToTokens(target.signature, effectiveBudget)
-    let usedTokens = this.estimateTokens(targetCode) + this.estimateTokens(targetSignature)
+
+    // Serialized-cost accounting. The old accounting summed the raw text of
+    // the pieces it chose and ignored everything else that shipped — JSON
+    // structure, the effect array, the bookkeeping — so capsules reported
+    // ~40% of their true size and routinely overshot the budget they were
+    // given. Every charge below is the marginal serialized cost of what the
+    // consumer actually receives, so the budget binds the payload.
+    const targetBlock = () => ({
+      symbol_id: target.symbol_id,
+      name: target.canonical_name,
+      code: targetCode,
+      signature: targetSignature,
+      location: {
+        file_path: target.file_path,
+        start_line: target.range_start_line,
+        end_line: target.range_end_line,
+      },
+    })
+    let usedTokens = CAPSULE_SKELETON_TOKENS + this.serializedTokens(targetBlock())
 
     const contextNodes: ContextNode[] = []
     const omissionRationale: string[] = []
@@ -141,11 +177,17 @@ export class CapsuleCompiler {
     const inclusionRationale: InclusionRationale[] = []
     const fetchHandles: FetchHandle[] = []
 
-    // BUG-006 FIX: If the target code alone exceeds the token budget,
-    // truncate it to fit within the budget.
+    // Bookkeeping strings ship too, so they are charged too.
+    const chargeOmission = (message: string) => {
+      omissionRationale.push(message)
+      usedTokens += this.serializedTokens(message) + 1
+    }
+
+    // BUG-006 FIX: If the target alone exceeds the token budget, truncate its
+    // code so the serialized block fits.
     if (usedTokens > effectiveBudget) {
-      const signatureTokens = this.estimateTokens(targetSignature)
-      const availableForCode = effectiveBudget - signatureTokens
+      const overhead = CAPSULE_SKELETON_TOKENS + this.serializedTokens({ ...targetBlock(), code: "" })
+      const availableForCode = effectiveBudget - overhead
       if (availableForCode <= 0) {
         targetCode = ""
       } else {
@@ -153,7 +195,8 @@ export class CapsuleCompiler {
         const truncatedLines: string[] = []
         let runningTokens = 0
         for (const line of codeLines) {
-          const lineTokens = this.estimateTokens(line + "\n")
+          // +1 approximates the escaped newline this line costs in JSON.
+          const lineTokens = this.estimateTokens(line) + 1
           if (runningTokens + lineTokens > availableForCode) {
             break
           }
@@ -161,15 +204,29 @@ export class CapsuleCompiler {
           runningTokens += lineTokens
         }
         targetCode = truncatedLines.join("\n")
-        omissionRationale.push("Target code truncated to fit token budget")
       }
-      usedTokens = this.estimateTokens(targetCode) + signatureTokens
+      // Corrective passes: JSON escaping makes quote- and backslash-heavy
+      // source serialize well past its raw length, so the line cut above can
+      // land over. Measure the real serialized block and shave until it fits.
+      // Reserve room for the truncation note charged just below, so the note
+      // itself cannot tip the capsule over.
+      const codeBudget = effectiveBudget - 16
+      usedTokens = CAPSULE_SKELETON_TOKENS + this.serializedTokens(targetBlock())
+      for (let guard = 0; guard < 10 && usedTokens > codeBudget && targetCode.length > 0; guard++) {
+        const overBy = usedTokens - codeBudget
+        const keepChars = Math.max(0, targetCode.length - (overBy + 8) * CHARS_PER_TOKEN)
+        const roughCut = targetCode.slice(0, keepChars)
+        const lastNewline = roughCut.lastIndexOf("\n")
+        targetCode = lastNewline > 0 ? roughCut.slice(0, lastNewline) : roughCut
+        usedTokens = CAPSULE_SKELETON_TOKENS + this.serializedTokens(targetBlock())
+      }
+      chargeOmission("Target code truncated to fit token budget")
     }
 
     if (target.uncertainty_flags.length > 0) {
-      uncertaintyNotes.push(
-        `Target has ${target.uncertainty_flags.length} uncertainty flags: ${target.uncertainty_flags.join(", ")}`,
-      )
+      const note = `Target has ${target.uncertainty_flags.length} uncertainty flags: ${target.uncertainty_flags.join(", ")}`
+      uncertaintyNotes.push(note)
+      usedTokens += this.serializedTokens(note) + 1
     }
 
     // Progressive inclusion based on mode and budget
@@ -210,135 +267,123 @@ export class CapsuleCompiler {
     }
 
     // Budget-aware node insertion with multi-resolution degradation.
-    // Tries full_source first, then degrades through lower resolutions
-    // before omitting entirely. Records rationale for every decision.
+    // Tries full_source first, then degrades through lower resolutions before
+    // omitting entirely. Every candidate is priced at its SERIALIZED cost —
+    // the tokens the consumer will actually pay for it — and a symbol whose
+    // source is already in the capsule is never pasted a second time: the
+    // repeat ships as a one-line signature that names where it already is.
+    const includedWithCode = new Set<string>()
     const addNodeBudgeted = (node: ContextNode, category: string, rawRow?: SymbolRow): boolean => {
-      const hasCode = Boolean(node.code)
+      const repeat = node.symbol_id !== null && node.symbol_id !== undefined && includedWithCode.has(node.symbol_id)
+      const hasCode = Boolean(node.code) && !repeat
       const fullSourceTokens = this.estimateTokens(node.code || "")
       const summaryTokens = this.estimateTokens(node.summary || "")
-      const signatureTokens = this.estimateTokens((rawRow?.signature ?? node.summary ?? "").split("\n")[0] || "")
-      const nameTokens = this.estimateTokens(node.name)
+      const signatureText = (rawRow?.signature ?? (node.summary ?? "").split("\n")[0] ?? "").trim()
 
-      // For nodes that never had code (e.g., test context, contract summaries),
-      // their summary IS the full content. Include at summary-level resolution
-      // without recording degradation rationale.
-      if (!hasCode && summaryTokens > 0 && usedTokens + summaryTokens <= effectiveBudget) {
-        const enriched: ContextNode = {
-          ...node,
-          resolution: "contract_summary",
-          inclusion_reason: `Included as ${category} — summary content (no source code available)`,
-        }
-        contextNodes.push(enriched)
-        usedTokens += summaryTokens
-        inclusionRationale.push({
-          node_name: node.name,
-          node_type: category,
-          included: true,
-          resolution: "contract_summary",
-          reason: `Direct ${category} — no source code, included at summary level`,
-          tokens_used: summaryTokens,
-          tokens_saved: 0,
-        })
-        return true
+      type Candidate = {
+        enriched: ContextNode
+        resolution: "full_source" | "signature_only" | "contract_summary" | "name_only"
+        reason: string
+        degraded: string | null
       }
+      const candidates: Candidate[] = []
 
-      // Resolution ladder: try each level from full_source down to name_only
-      // full_source: code + summary
-      if (hasCode && usedTokens + fullSourceTokens + summaryTokens <= effectiveBudget) {
-        const enriched: ContextNode = {
-          ...node,
-          resolution: "full_source",
-          inclusion_reason: `Included as ${category} — full source fits budget`,
-        }
-        contextNodes.push(enriched)
-        const tokensUsed = fullSourceTokens + summaryTokens
-        usedTokens += tokensUsed
-        inclusionRationale.push({
-          node_name: node.name,
-          node_type: category,
-          included: true,
+      if (hasCode) {
+        candidates.push({
+          enriched: {
+            ...node,
+            resolution: "full_source",
+            inclusion_reason: `Included as ${category} — full source fits budget`,
+          },
           resolution: "full_source",
           reason: `Direct ${category} via ${rawRow?.relation_type || category} relation`,
-          tokens_used: tokensUsed,
-          tokens_saved: 0,
+          degraded: null,
         })
-        return true
-      }
-
-      // signature_only: drop code, keep signature line as summary
-      if (usedTokens + signatureTokens <= effectiveBudget) {
-        const signatureText = rawRow?.signature ?? (node.summary ?? "").split("\n")[0]
-        const enriched: ContextNode = {
-          ...node,
-          code: null,
-          summary: signatureText || node.summary,
-          resolution: "signature_only",
-          inclusion_reason: `Included as ${category} — degraded to signature (budget)`,
-        }
-        contextNodes.push(enriched)
-        usedTokens += signatureTokens
-        omissionRationale.push(`${category} ${node.name}: code truncated to summary (budget)`)
-        inclusionRationale.push({
-          node_name: node.name,
-          node_type: category,
-          included: true,
-          resolution: "signature_only",
-          reason: `Budget tight — degraded from full_source to signature_only`,
-          tokens_used: signatureTokens,
-          tokens_saved: fullSourceTokens + summaryTokens - signatureTokens,
-        })
-        return true
-      }
-
-      // contract_summary: just input/output/error if we have a summary
-      if (summaryTokens > 0 && usedTokens + summaryTokens <= effectiveBudget) {
-        const enriched: ContextNode = {
-          ...node,
-          code: null,
+      } else if (!node.code && summaryTokens > 0 && !repeat) {
+        // Nodes that never had code (tests, contract summaries): their
+        // summary IS the full content — include at summary level first.
+        candidates.push({
+          enriched: {
+            ...node,
+            resolution: "contract_summary",
+            inclusion_reason: `Included as ${category} — summary content (no source code available)`,
+          },
           resolution: "contract_summary",
-          inclusion_reason: `Included as ${category} — contract summary only (budget)`,
-        }
-        contextNodes.push(enriched)
-        usedTokens += summaryTokens
-        omissionRationale.push(`${category} ${node.name}: degraded to contract summary (budget)`)
-        inclusionRationale.push({
-          node_name: node.name,
-          node_type: category,
-          included: true,
+          reason: `Direct ${category} — no source code, included at summary level`,
+          degraded: null,
+        })
+      }
+
+      if (signatureText) {
+        candidates.push({
+          enriched: {
+            ...node,
+            code: null,
+            summary: signatureText || node.summary,
+            resolution: "signature_only",
+            inclusion_reason: repeat
+              ? `Included as ${category} — source already in this capsule (deduplicated)`
+              : `Included as ${category} — degraded to signature (budget)`,
+          },
+          resolution: "signature_only",
+          reason: repeat
+            ? `${category} whose source is already included above — signature only`
+            : `Budget tight — degraded from full_source to signature_only`,
+          degraded: repeat ? null : `${category} ${node.name}: code truncated to summary (budget)`,
+        })
+      }
+
+      if (summaryTokens > 0) {
+        candidates.push({
+          enriched: {
+            ...node,
+            code: null,
+            resolution: "contract_summary",
+            inclusion_reason: `Included as ${category} — contract summary only (budget)`,
+          },
           resolution: "contract_summary",
           reason: `Budget tight — degraded to contract_summary`,
-          tokens_used: summaryTokens,
-          tokens_saved: fullSourceTokens - summaryTokens,
+          degraded: repeat ? null : `${category} ${node.name}: degraded to contract summary (budget)`,
         })
-        return true
       }
 
-      // name_only: just the name and location, minimal tokens
-      if (usedTokens + nameTokens <= effectiveBudget) {
-        const enriched: ContextNode = {
+      candidates.push({
+        enriched: {
           ...node,
           code: null,
           summary: null,
           resolution: "name_only",
           inclusion_reason: `Included as ${category} — name only (budget)`,
+        },
+        resolution: "name_only",
+        reason: `Budget tight — degraded to name_only`,
+        degraded: repeat ? null : `${category} ${node.name}: degraded to name only (budget)`,
+      })
+
+      for (const candidate of candidates) {
+        const cost = this.serializedTokens(candidate.enriched) + 1
+        if (usedTokens + cost > effectiveBudget) continue
+        contextNodes.push(candidate.enriched)
+        usedTokens += cost
+        if (candidate.resolution === "full_source" && node.symbol_id) {
+          includedWithCode.add(node.symbol_id)
         }
-        contextNodes.push(enriched)
-        usedTokens += nameTokens
-        omissionRationale.push(`${category} ${node.name}: degraded to name only (budget)`)
+        if (candidate.degraded) chargeOmission(candidate.degraded)
         inclusionRationale.push({
           node_name: node.name,
           node_type: category,
           included: true,
-          resolution: "name_only",
-          reason: `Budget tight — degraded to name_only`,
-          tokens_used: nameTokens,
-          tokens_saved: fullSourceTokens + summaryTokens - nameTokens,
+          resolution: candidate.resolution,
+          reason: candidate.reason,
+          tokens_used: cost,
+          tokens_saved:
+            candidate.resolution === "full_source" ? 0 : Math.max(0, fullSourceTokens + summaryTokens - cost),
         })
         return true
       }
 
       // Fully omitted — record rationale and create fetch handle
-      omissionRationale.push(`Omitted ${category} ${node.name}: token budget exceeded`)
+      chargeOmission(`Omitted ${category} ${node.name}: token budget exceeded`)
       inclusionRationale.push({
         node_name: node.name,
         node_type: category,
@@ -350,28 +395,35 @@ export class CapsuleCompiler {
       })
 
       // Create fetch handle so the AI can request this node later
-      if (rawRow) {
-        fetchHandles.push({
-          symbol_id: rawRow.symbol_id || rawRow.symbol_version_id,
-          symbol_version_id: rawRow.symbol_version_id,
-          name: rawRow.canonical_name,
-          file_path: rawRow.file_path || "",
-          start_line: rawRow.range_start_line || 0,
-          end_line: rawRow.range_end_line || 0,
-          why_omitted: `Token budget exceeded (need ~${fullSourceTokens + summaryTokens} tokens, ${effectiveBudget - usedTokens} remaining)`,
-          estimated_tokens: fullSourceTokens + summaryTokens,
-        })
-      } else if (node.symbol_id) {
-        fetchHandles.push({
-          symbol_id: node.symbol_id,
-          symbol_version_id: node.symbol_id,
-          name: node.name,
-          file_path: "",
-          start_line: 0,
-          end_line: 0,
-          why_omitted: `Token budget exceeded (need ~${fullSourceTokens + summaryTokens} tokens, ${effectiveBudget - usedTokens} remaining)`,
-          estimated_tokens: fullSourceTokens + summaryTokens,
-        })
+      const handle: FetchHandle | null = rawRow
+        ? {
+            symbol_id: rawRow.symbol_id || rawRow.symbol_version_id,
+            symbol_version_id: rawRow.symbol_version_id,
+            name: rawRow.canonical_name,
+            file_path: rawRow.file_path || "",
+            start_line: rawRow.range_start_line || 0,
+            end_line: rawRow.range_end_line || 0,
+            why_omitted: `Token budget exceeded (need ~${fullSourceTokens + summaryTokens} tokens, ${Math.max(0, effectiveBudget - usedTokens)} remaining)`,
+            estimated_tokens: fullSourceTokens + summaryTokens,
+          }
+        : node.symbol_id
+          ? {
+              symbol_id: node.symbol_id,
+              symbol_version_id: node.symbol_id,
+              name: node.name,
+              file_path: "",
+              start_line: 0,
+              end_line: 0,
+              why_omitted: `Token budget exceeded (need ~${fullSourceTokens + summaryTokens} tokens, ${Math.max(0, effectiveBudget - usedTokens)} remaining)`,
+              estimated_tokens: fullSourceTokens + summaryTokens,
+            }
+          : null
+      // Handles are the escape hatch for what the budget excluded, but they
+      // ship too: cap the count so a hundred omissions cannot bloat the very
+      // capsule that was too full to hold them.
+      if (handle && fetchHandles.length < MAX_FETCH_HANDLES) {
+        fetchHandles.push(handle)
+        usedTokens += this.serializedTokens(handle) + 1
       }
 
       return false
@@ -410,20 +462,19 @@ export class CapsuleCompiler {
       // 6. Dispatch context — include resolved dispatch targets as context nodes
       for (const dispatch of dispatchEdges) {
         if (dispatch.resolved_target) {
-          const dispatchTokens = this.estimateTokens(
-            `${dispatch.chain} -> ${dispatch.resolved_target}: ${dispatch.target_signature || ""}`,
-          )
+          const dispatchNode: ContextNode = {
+            type: "dispatch_target",
+            symbol_id: null,
+            name: dispatch.resolved_target,
+            code: null,
+            summary: `Dispatch: ${dispatch.chain} -> ${dispatch.resolved_target} (${dispatch.resolution_method}, confidence: ${dispatch.confidence.toFixed(2)})`,
+            relevance: dispatch.confidence,
+            resolution: "contract_summary",
+            inclusion_reason: `Dispatch chain resolution for ${dispatch.chain}`,
+          }
+          const dispatchTokens = this.serializedTokens(dispatchNode) + 1
           if (usedTokens + dispatchTokens <= effectiveBudget) {
-            contextNodes.push({
-              type: "dispatch_target",
-              symbol_id: null,
-              name: dispatch.resolved_target,
-              code: null,
-              summary: `Dispatch: ${dispatch.chain} -> ${dispatch.resolved_target} (${dispatch.resolution_method}, confidence: ${dispatch.confidence.toFixed(2)})`,
-              relevance: dispatch.confidence,
-              resolution: "contract_summary",
-              inclusion_reason: `Dispatch chain resolution for ${dispatch.chain}`,
-            })
+            contextNodes.push(dispatchNode)
             usedTokens += dispatchTokens
             inclusionRationale.push({
               node_name: dispatch.resolved_target,
@@ -440,26 +491,24 @@ export class CapsuleCompiler {
 
       // 7. Concept family context — include exemplar and contradicting members
       for (const family of familyContext) {
-        const familyTokens = this.estimateTokens(
-          `Family: ${family.family_name} [${family.family_type}] exemplar=${family.exemplar_name || "none"} ` +
-            `members=${family.member_count} contradictions=[${family.contradicting_members.join(", ")}]`,
-        )
+        const familyNode: ContextNode = {
+          type: "family_member",
+          symbol_id: null,
+          name: family.family_name,
+          code: null,
+          summary:
+            `Concept family [${family.family_type}]: ${family.member_count} members. ` +
+            (family.exemplar_name ? `Exemplar: ${family.exemplar_name}. ` : "") +
+            (family.contradicting_members.length > 0
+              ? `Contradicting: ${family.contradicting_members.join(", ")}`
+              : "No contradictions"),
+          relevance: 0.75,
+          resolution: "contract_summary",
+          inclusion_reason: `Target belongs to concept family "${family.family_name}"`,
+        }
+        const familyTokens = this.serializedTokens(familyNode) + 1
         if (usedTokens + familyTokens <= effectiveBudget) {
-          contextNodes.push({
-            type: "family_member",
-            symbol_id: null,
-            name: family.family_name,
-            code: null,
-            summary:
-              `Concept family [${family.family_type}]: ${family.member_count} members. ` +
-              (family.exemplar_name ? `Exemplar: ${family.exemplar_name}. ` : "") +
-              (family.contradicting_members.length > 0
-                ? `Contradicting: ${family.contradicting_members.join(", ")}`
-                : "No contradictions"),
-            relevance: 0.75,
-            resolution: "contract_summary",
-            inclusion_reason: `Target belongs to concept family "${family.family_name}"`,
-          })
+          contextNodes.push(familyNode)
           usedTokens += familyTokens
           inclusionRationale.push({
             node_name: family.family_name,
@@ -474,12 +523,40 @@ export class CapsuleCompiler {
       }
     }
 
-    // 8. Effect signature context — add as a context node if we have one
+    // 8. Effect signature — deduplicate, cap, and ship COUNTED. The old code
+    // added a formatted summary node (counted) and then attached the entire
+    // raw entry array to the capsule as well (uncounted): on a cyclic corpus
+    // that array alone was ~40% of the shipped bytes and mostly photocopies.
+    // Now one representation ships, priced like everything else: the full
+    // structured entries when they fit, direct-only when they don't, a
+    // one-line summary as the last resort.
+    let shippedEffects: EffectEntry[] | undefined
     if (effectEntries.length > 0) {
-      const effectSummary = this.formatEffectSignature(effectEntries)
-      const effectTokens = this.estimateTokens(effectSummary)
-      if (usedTokens + effectTokens <= effectiveBudget) {
-        contextNodes.push({
+      const deduped = this.dedupeEffects(effectEntries)
+      const directOnly = deduped.filter((e) => !e.provenance || e.provenance === "direct")
+      const tryShip = (entries: EffectEntry[], label: string): boolean => {
+        if (entries.length === 0) return false
+        const cost = this.serializedTokens(entries) + 2
+        if (usedTokens + cost > effectiveBudget) return false
+        shippedEffects = entries
+        usedTokens += cost
+        inclusionRationale.push({
+          node_name: "Effect Signature",
+          node_type: "effect",
+          included: true,
+          resolution: "effect_summary",
+          reason: label,
+          tokens_used: cost,
+          tokens_saved: 0,
+        })
+        return true
+      }
+      if (
+        !tryShip(deduped, "Typed effect signature (deduplicated)") &&
+        !tryShip(directOnly, "Typed effect signature — direct effects only (budget)")
+      ) {
+        const effectSummary = this.formatEffectSignature(deduped)
+        const effectNode: ContextNode = {
           type: "effect",
           symbol_id: null,
           name: "Effect Signature",
@@ -489,46 +566,50 @@ export class CapsuleCompiler {
           resolution: "effect_summary",
           inclusion_reason: "Typed effect signature for target symbol",
           effect_signature: effectSummary,
-        })
-        usedTokens += effectTokens
-        inclusionRationale.push({
-          node_name: "Effect Signature",
-          node_type: "effect",
-          included: true,
-          resolution: "effect_summary",
-          reason: "Typed effect signature for target and dependencies",
-          tokens_used: effectTokens,
-          tokens_saved: 0,
-        })
+        }
+        const effectTokens = this.serializedTokens(effectNode) + 1
+        if (usedTokens + effectTokens <= effectiveBudget) {
+          contextNodes.push(effectNode)
+          usedTokens += effectTokens
+          inclusionRationale.push({
+            node_name: "Effect Signature",
+            node_type: "effect",
+            included: true,
+            resolution: "effect_summary",
+            reason: "Typed effect signature for target and dependencies (summary line)",
+            tokens_used: effectTokens,
+            tokens_saved: 0,
+          })
+        } else {
+          chargeOmission("Effect signature omitted: token budget exceeded")
+        }
       }
     }
 
     const nodesIncluded = contextNodes.length
     const nodesOmitted = fetchHandles.length
 
+    // What ships is what was priced. Dispatch and family context already ship
+    // as context nodes, so the raw arrays would be the same information paid
+    // for twice; inclusion rationale is bookkeeping and is persisted to the
+    // database below instead of being billed to every consumer.
     const capsule: ContextCapsule = {
-      target_symbol: {
-        symbol_id: target.symbol_id,
-        name: target.canonical_name,
-        code: targetCode,
-        signature: targetSignature,
-        location: {
-          file_path: target.file_path,
-          start_line: target.range_start_line,
-          end_line: target.range_end_line,
-        },
-      },
+      target_symbol: targetBlock(),
       context_nodes: contextNodes,
       omission_rationale: omissionRationale,
       uncertainty_notes: uncertaintyNotes,
       token_estimate: usedTokens,
       // V2 fields
       fetch_handles: fetchHandles.length > 0 ? fetchHandles : undefined,
-      dispatch_context: dispatchEdges.length > 0 ? dispatchEdges : undefined,
-      family_context: familyContext.length > 0 ? familyContext : undefined,
-      effect_signature: effectEntries.length > 0 ? effectEntries : undefined,
-      inclusion_rationale: inclusionRationale.length > 0 ? inclusionRationale : undefined,
+      effect_signature: shippedEffects,
     }
+
+    // token_estimate is the measured serialized size of the capsule itself —
+    // no longer an undercount of a subset. The safety pass trims bookkeeping
+    // (never content) in the rare case rounding pushed the total past budget.
+    capsule.token_estimate = this.serializedTokens(capsule)
+    this.enforceBudget(capsule, effectiveBudget)
+    capsule.token_estimate = this.serializedTokens(capsule)
 
     // Persist compilation metadata for debugging and improvement
     const compilationId = await this.persistCompilation(
@@ -645,7 +726,95 @@ export class CapsuleCompiler {
   }
 
   public estimateTokens(text: string): number {
-    return Math.ceil(text.length / CHARS_PER_TOKEN)
+    return Math.ceil(Buffer.byteLength(text, "utf-8") / CHARS_PER_TOKEN)
+  }
+
+  /**
+   * Tokens a value costs the consumer once serialized into the capsule JSON.
+   * This is the only honest unit for budgeting: raw text lengths ignore keys,
+   * quotes and escapes, which is how capsules came to ship 2.4x their own
+   * token_estimate. Measured in BYTES, not UTF-16 code units — bytes are what
+   * ship, and on unicode-heavy source the two differ by half again as much.
+   */
+  public serializedTokens(value: unknown): number {
+    return Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf-8") / CHARS_PER_TOKEN)
+  }
+
+  /**
+   * Deduplicate effect entries by kind:descriptor — direct observations win
+   * over transitive ones — then cap the transitive tail by hop count. On a
+   * cyclic corpus the stored signature can hold hundreds of near-identical
+   * propagated entries; past the cap they stop informing and start costing.
+   */
+  public dedupeEffects(entries: EffectEntry[]): EffectEntry[] {
+    const byKey = new Map<string, EffectEntry>()
+    for (const entry of entries) {
+      const key = `${entry.kind}:${entry.descriptor}`
+      const existing = byKey.get(key)
+      if (!existing) {
+        byKey.set(key, entry)
+        continue
+      }
+      const entryDirect = !entry.provenance || entry.provenance === "direct"
+      const existingDirect = !existing.provenance || existing.provenance === "direct"
+      if (entryDirect && !existingDirect) byKey.set(key, entry)
+    }
+    const deduped = [...byKey.values()]
+    const direct = deduped.filter((e) => !e.provenance || e.provenance === "direct")
+    const transitive = deduped
+      .filter((e) => e.provenance === "transitive")
+      .sort((a, b) => (a.hops ?? 99) - (b.hops ?? 99))
+    return [...direct, ...transitive.slice(0, MAX_TRANSITIVE_EFFECT_ENTRIES)]
+  }
+
+  /**
+   * Last-resort budget enforcement on the assembled capsule. Content was
+   * priced as it was added, so overshoot here is bookkeeping and rounding;
+   * trim in order of least value — fetch handles, omission notes, transitive
+   * effect entries — and never touch the target or the context nodes.
+   */
+  private enforceBudget(capsule: ContextCapsule, budget: number): void {
+    const over = () => this.serializedTokens(capsule) > budget
+    if (!over()) return
+
+    while (over() && (capsule.fetch_handles?.length ?? 0) > 0) {
+      capsule.fetch_handles!.pop()
+      if (capsule.fetch_handles!.length === 0) capsule.fetch_handles = undefined
+    }
+    if (over() && capsule.omission_rationale.length > 1) {
+      capsule.omission_rationale = [`${capsule.omission_rationale.length} nodes omitted or degraded (budget)`]
+    }
+    if (over() && capsule.uncertainty_notes.length > 0) {
+      capsule.uncertainty_notes = [`${capsule.uncertainty_notes.length} uncertainty notes elided (budget)`]
+    }
+    while (over() && (capsule.effect_signature?.length ?? 0) > 0) {
+      let idx = -1
+      for (let i = capsule.effect_signature!.length - 1; i >= 0; i--) {
+        if (capsule.effect_signature![i]!.provenance === "transitive") {
+          idx = i
+          break
+        }
+      }
+      if (idx < 0) break
+      capsule.effect_signature!.splice(idx, 1)
+      if (capsule.effect_signature!.length === 0) capsule.effect_signature = undefined
+    }
+
+    // Guaranteed fit: if rounding in the per-piece charges still leaves the
+    // capsule over budget, degrade context nodes from the tail — lowest
+    // priority was added last — to signature-level, then drop them. The
+    // target itself is never touched; it was truncated to fit up front.
+    for (let i = capsule.context_nodes.length - 1; over() && i >= 0; i--) {
+      const node = capsule.context_nodes[i]!
+      if (node.code) {
+        node.code = null
+        node.resolution = "signature_only"
+        node.inclusion_reason = `${node.inclusion_reason ?? "Included"} (degraded by final budget pass)`
+      }
+    }
+    while (over() && capsule.context_nodes.length > 0) {
+      capsule.context_nodes.pop()
+    }
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -691,18 +860,44 @@ export class CapsuleCompiler {
   }
 
   public async loadDirectDependencies(svId: string): Promise<{ node: ContextNode; raw: SymbolRow }[]> {
+    // One row per dependency symbol. The extractor records both a `calls`
+    // edge and a `references` edge for the same pair — calling a function is
+    // also referencing it — and without DISTINCT ON the same dependency
+    // arrived twice, was pasted into the capsule twice at full source, and
+    // consumed two slots of the LIMIT. Half the dependency capacity of every
+    // capsule went to photocopies. The strongest relation represents each
+    // pair: a call outranks a type usage outranks a bare mention.
     const result = await db.query(
       `
-            SELECT sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
-                   sv.body_source, sr.relation_type, sr.confidence,
-                   f.path as file_path, sv.range_start_line, sv.range_end_line
-            FROM structural_relations sr
-            JOIN symbol_versions sv ON sv.symbol_version_id = sr.dst_symbol_version_id
-            JOIN symbols s ON s.symbol_id = sv.symbol_id
-            JOIN files f ON f.file_id = sv.file_id
-            WHERE sr.src_symbol_version_id = $1
-            ORDER BY sr.confidence DESC
-            LIMIT 20
+            SELECT * FROM (
+              SELECT DISTINCT ON (sv.symbol_version_id)
+                     sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
+                     sv.body_source, sr.relation_type, sr.confidence,
+                     f.path as file_path, sv.range_start_line, sv.range_end_line
+              FROM structural_relations sr
+              JOIN symbol_versions sv ON sv.symbol_version_id = sr.dst_symbol_version_id
+              JOIN symbols s ON s.symbol_id = sv.symbol_id
+              JOIN files f ON f.file_id = sv.file_id
+              WHERE sr.src_symbol_version_id = $1
+              ORDER BY sv.symbol_version_id,
+                       CASE sr.relation_type
+                         WHEN 'calls' THEN 0
+                         WHEN 'inherits' THEN 1
+                         WHEN 'implements' THEN 1
+                         WHEN 'typed_as' THEN 2
+                         ELSE 3
+                       END,
+                       sr.confidence DESC
+            ) dep
+            ORDER BY CASE dep.relation_type
+                       WHEN 'calls' THEN 0
+                       WHEN 'inherits' THEN 1
+                       WHEN 'implements' THEN 1
+                       WHEN 'typed_as' THEN 2
+                       ELSE 3
+                     END,
+                     dep.confidence DESC
+            LIMIT 80
         `,
       [svId],
     )
@@ -725,25 +920,32 @@ export class CapsuleCompiler {
   }
 
   public async loadCallers(svId: string): Promise<{ node: ContextNode; raw: SymbolRow }[]> {
+    // One row per caller symbol (DISTINCT ON) — a caller that both calls and
+    // references the target used to arrive twice and be pasted twice.
+    // Callers before referencers: something that INVOKES this symbol answers
+    // "what breaks if I change it" directly; something that merely mentions
+    // it — reads a constant, names a type — is weaker evidence. Confidence
+    // alone is a constant for statically extracted edges, so without the
+    // relation ranking, plentiful references crowded real callers out of the
+    // limit and the capsule presented mentions as callers.
     const result = await db.query(
       `
-            SELECT sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
-                   sv.body_source, sr.confidence,
-                   f.path as file_path, sv.range_start_line, sv.range_end_line
-            FROM structural_relations sr
-            JOIN symbol_versions sv ON sv.symbol_version_id = sr.src_symbol_version_id
-            JOIN symbols s ON s.symbol_id = sv.symbol_id
-            JOIN files f ON f.file_id = sv.file_id
-            WHERE sr.dst_symbol_version_id = $1
-            AND sr.relation_type IN ('calls', 'references')
-            -- Callers before referencers. Something that INVOKES this symbol
-            -- answers "what breaks if I change it" directly; something that
-            -- merely mentions it — reads a constant, names a type — is weaker
-            -- evidence. Both were ordered by confidence alone, which is a
-            -- constant for statically extracted edges, so once references
-            -- became plentiful they crowded real callers out of the limit and
-            -- the capsule started presenting mentions as callers.
-            ORDER BY CASE sr.relation_type WHEN 'calls' THEN 0 ELSE 1 END, sr.confidence DESC
+            SELECT * FROM (
+              SELECT DISTINCT ON (sv.symbol_version_id)
+                     sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
+                     sv.body_source, sr.relation_type, sr.confidence,
+                     f.path as file_path, sv.range_start_line, sv.range_end_line
+              FROM structural_relations sr
+              JOIN symbol_versions sv ON sv.symbol_version_id = sr.src_symbol_version_id
+              JOIN symbols s ON s.symbol_id = sv.symbol_id
+              JOIN files f ON f.file_id = sv.file_id
+              WHERE sr.dst_symbol_version_id = $1
+              AND sr.relation_type IN ('calls', 'references')
+              ORDER BY sv.symbol_version_id,
+                       CASE sr.relation_type WHEN 'calls' THEN 0 ELSE 1 END,
+                       sr.confidence DESC
+            ) caller
+            ORDER BY CASE caller.relation_type WHEN 'calls' THEN 0 ELSE 1 END, caller.confidence DESC
             LIMIT 10
         `,
       [svId],
