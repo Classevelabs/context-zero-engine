@@ -68,6 +68,8 @@ const REPO = path.resolve(process.argv[3] || process.cwd())
 const N = parseInt(process.argv[2] || "40", 10)
 const BUDGET = parseInt(process.env.CZ_BENCH_BUDGET || "8000", 10)
 const MIN_NAME = parseInt(process.env.CZ_BENCH_MIN_NAME || "12", 10)
+const DIAGNOSE = process.env.CZ_BENCH_DIAGNOSE === "1"
+const diagnosis = { edgeExistsNotChosen: 0, noEdgeRecorded: 0, samples: [] }
 const tok = (bytes) => Math.round(bytes / 4)
 const IDENT = /[A-Za-z_$][A-Za-z0-9_$]*/g
 const norm = (p) => p.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()
@@ -83,7 +85,10 @@ if (snapRes.rowCount === 0) {
   console.error('No complete snapshot for a repository named like "' + path.basename(REPO) + '".')
   process.exit(1)
 }
-const snapshotId = snapRes.rows[0].snapshot_id
+// CZ_BENCH_SNAPSHOT pins a specific snapshot, so the same ground truth can be
+// pointed at two different graphs — the only way to attribute a change in
+// coverage to the engine rather than to the measurement.
+const snapshotId = process.env.CZ_BENCH_SNAPSHOT || snapRes.rows[0].snapshot_id
 
 const fileRes = await db.query("SELECT path FROM files WHERE snapshot_id = $1", [snapshotId])
 
@@ -276,11 +281,13 @@ const defRes = await db.query(
   [snapshotId],
 )
 const symbolsInFile = new Map() // normalized path -> Set(name)
+const allSymbolNames = new Set() // every name the index knows, anywhere
 for (const r of defRes.rows) {
   const p = norm(r.file_path)
   let set = symbolsInFile.get(p)
   if (!set) symbolsInFile.set(p, (set = new Set()))
   set.add(r.name)
+  allSymbolNames.add(r.name)
 }
 
 const targets = await db.query(
@@ -307,21 +314,37 @@ for (const t of targets.rows) {
   const bodyIdents = new Set(body.match(IDENT) || [])
 
   // Dependencies: imported names this body actually uses, resolved to files.
-  const deps = new Map() // canonical name -> { file, indexed }
+  //
+  // When the body reaches THROUGH an import — `Provider.defaultLayer`, whether
+  // `Provider` arrived as `import * as Provider` or as a named import of a
+  // module that re-exports itself — what the code depends on is the member,
+  // not the namespace. Showing someone `Provider` teaches them nothing;
+  // showing them `defaultLayer` is the thing they need to read. So a dotted
+  // use is scored on the member. A bare use is scored on the binding itself.
+  const deps = new Map() // required name -> { file, indexed }
   for (const [local, info] of importBindings(defFile.text, defRel)) {
     if (!bodyIdents.has(local)) continue
     const known = symbolsInFile.get(info.file) || new Set()
-    if (info.namespace) {
-      // `ns.member` — credit the members the body actually reaches for.
-      const re = new RegExp("\\b" + local + "\\.([A-Za-z_$][\\w$]*)", "g")
-      let m
-      while ((m = re.exec(body)) !== null) {
-        deps.set(m[1], { file: info.file, indexed: known.has(m[1]) })
-      }
-      continue
+
+    const memberRe = new RegExp("\\b" + local + "\\s*\\.\\s*([A-Za-z_$][\\w$]*)", "g")
+    let m
+    let sawMember = false
+    while ((m = memberRe.exec(body)) !== null) {
+      sawMember = true
+      const member = m[1]
+      if (member === t.name) continue
+      // A member of a re-exporting wrapper is declared in the file the wrapper
+      // points at, so "is it indexed at all" is asked of the whole snapshot.
+      deps.set(member, { file: info.file, indexed: known.has(member) || allSymbolNames.has(member) })
     }
-    if (info.imported === local && local === t.name) continue
-    deps.set(info.imported, { file: info.file, indexed: known.has(info.imported) })
+
+    // Used on its own as well as (or instead of) through a dot.
+    const bareRe = new RegExp("\\b" + local + "\\b(?!\\s*\\.)")
+    if (!sawMember || bareRe.test(body)) {
+      if (info.namespace) continue
+      if (info.imported === local && local === t.name) continue
+      deps.set(info.imported, { file: info.file, indexed: known.has(info.imported) })
+    }
   }
   deps.delete(t.name)
 
@@ -348,6 +371,34 @@ for (const t of targets.rows) {
   const indexedDeps = depNames.filter((d) => deps.get(d).indexed)
   const czDeps = depNames.filter((d) => delivered.get(d) === true)
   const czIndexedDeps = indexedDeps.filter((d) => delivered.get(d) === true)
+
+  // CZ_BENCH_DIAGNOSE splits every miss into the two causes that need
+  // different fixes: the graph never recorded an edge to that helper
+  // (extraction), or it did and the capsule did not choose it (selection).
+  if (DIAGNOSE) {
+    for (const d of indexedDeps) {
+      if (delivered.get(d) === true) continue
+      const edge = await db.query(
+        "SELECT 1 FROM structural_relations sr" +
+          " JOIN symbol_versions dv ON dv.symbol_version_id = sr.dst_symbol_version_id" +
+          " JOIN symbols ds USING(symbol_id)" +
+          " WHERE sr.src_symbol_version_id = $1 AND ds.canonical_name = $2 LIMIT 1",
+        [t.symbol_version_id, d],
+      )
+      if (edge.rowCount > 0) diagnosis.edgeExistsNotChosen++
+      else {
+        diagnosis.noEdgeRecorded++
+        if (diagnosis.samples.length < 25) {
+          const usage = new RegExp("([A-Za-z_$][\w$]*)\s*\.\s*" + d + "\b").exec(body)
+          diagnosis.samples.push({
+            target: t.name,
+            missing: d,
+            reachedVia: usage ? usage[1] + "." + d : "bare identifier",
+          })
+        }
+      }
+    }
+  }
 
   // How the capsule spent its room. A node repeated under the same name and
   // type is paid for twice and read once, so it is measured as waste.
@@ -558,6 +609,13 @@ console.log(
         contextzero_recall_overall_pct: ratio((r) => r.czDeps, (r) => r.depsTotal),
         contextzero_recall_of_indexed_pct: ratio((r) => r.czIndexedDeps, (r) => r.depsIndexed),
         file_reading_recall_overall_pct: ratio((r) => r.baseDeps, (r) => r.depsTotal),
+        ...(DIAGNOSE
+          ? {
+              missed_because_no_edge_recorded: diagnosis.noEdgeRecorded,
+              missed_though_edge_exists: diagnosis.edgeExistsNotChosen,
+              no_edge_samples: diagnosis.samples,
+            }
+          : {}),
         contextzero_beats_files: rows.filter((r) => r.czDeps > r.baseDeps).length,
         tied: rows.filter((r) => r.czDeps === r.baseDeps).length,
         file_reading_beats_contextzero: rows.filter((r) => r.czDeps < r.baseDeps).length,

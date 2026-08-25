@@ -1,139 +1,141 @@
 # Context Zero Engine — Benchmarks
 
-## What is being measured
+## What was measured
 
-An agent has been asked to change one function. Before it can safely, it needs
-three things: **the function itself**, **the helpers that function uses from
-other files**, and **the places that call it**. Collecting those three things is
-the work measured here.
+An AI coding assistant is told: **"change this function."**
 
-There are two ways to collect them. Search the repository for the function's
-name and read the files that come back, or ask ContextZero once. Both were run
-against the same **1,000 randomly chosen functions, methods and classes** in a
-private 375,000-line production monorepo (2,944 files, 7.1 million tokens of
-source), on version 2.10.0.
+To do that without breaking things, it has to see three things:
 
-## One typical task
+1. the function itself
+2. the code that function uses from other files
+3. the code that calls the function
 
-| | Search and read files | ContextZero |
+Getting those three things is the job. We measured what that job costs, **1,000
+times**, on a real 375,000-line codebase (2,944 files), picking the functions at
+random.
+
+> A **token** is the unit AI providers charge for — roughly four characters of
+> code. Fewer tokens means a cheaper, faster request that leaves more room for
+> the assistant to actually think.
+
+## Without ContextZero
+
+The assistant searches for the function's name and opens the files that come
+back. On a typical job:
+
+| | |
+|---|---:|
+| Files it opens | 2 |
+| Lines of code it has to read | 1,245 |
+| **Tokens it pays for** | **11,506** |
+
+## With ContextZero
+
+It asks once and gets an answer already assembled:
+
+| | |
+|---|---:|
+| Requests | 1 |
+| Lines of code | 171 |
+| **Tokens it pays for** | **2,439** |
+
+### That is 79% fewer tokens for the same job
+
+Across all 1,000 jobs: **29.4 million tokens down to 3.0 million — 9.8× less.**
+
+## The important part: it costs less *without* knowing less
+
+Cheap is easy. Returning nothing would be free. So both sides were given **the
+same number of tokens to spend**, and we checked what actually came back
+against the real source code on disk.
+
+| Did the answer actually contain… | Without | With ContextZero |
 |---|---:|---:|
-| Requests made | 1 search + 2 file reads | **1** |
-| Lines of code pulled into the context window | 1,245 | **143** |
-| Tokens spent | 11,768 | **2,132** |
+| the function you asked to change | 1 time in 5 | **every time** |
+| the code that calls it | 27% | **74%** |
+| the helpers it uses from other files | almost never | **half of them** |
 
-**82% fewer tokens for the same question.** Across all 1,000 tasks together,
-26.0 million tokens against 2.9 million — **9.1× fewer**.
+So the cheaper answer is also the more complete one. Not a trade.
 
-Those are median figures, so half the tasks cost less and half cost more; an
-average would be dragged around by whichever function happened to live next to
-a four-thousand-line file.
+**Why searching does so badly:** searching for a name finds the places that
+*mention* it. The helper functions live in files that never mention it, so no
+amount of searching will surface them. And at that budget you can afford about
+two files — which are usually the wrong two.
 
-## Does the smaller answer still contain the code?
+The comparison is deliberately generous to searching: the search costs nothing,
+choosing which files to open costs nothing, and it opens the best-matching files
+first. It still loses.
 
-Spending less means nothing on its own — an empty reply would spend nothing at
-all. So both sides were given **the same number of tokens to spend** (whatever
-the capsule used, the file-reader was allowed to use too) and the answers were
-checked against the source on disk:
+## A real example
 
-| Given the same tokens, does the answer actually contain… | ContextZero | Search and read files |
+`commitRecoveryVaultGeneration` — an actual 99-line function that uses nine
+things defined in other files.
+
+**Searching:** only three files in the entire codebase mention it. Within the
+budget the assistant opens one — the test file. It never sees the function, and
+gets none of the nine helpers.
+
+**ContextZero, one request:** the function, eight of its nine helpers with their
+real code, the three functions that call it, the test that covers it, and its
+input/output contract.
+
+## A second codebase
+
+The same measurement on a different repository — 2,443 files of scripts,
+release tooling, a website and this engine's own source:
+
+| One typical job | Without | With ContextZero |
 |---|---:|---:|
-| the function being changed | **always** | 1 time in 5 |
-| its signature and types | **always** | 1 time in 5 |
-| something that genuinely calls it | **73%** of the time | 29% |
-| the helpers it uses from other files | **about half** of them | almost none |
+| Files opened | 3 | 1 request |
+| Lines of code | 2,000 | **48** |
+| Tokens | 18,828 | **787** |
 
-Read those two tables together, because that is the whole result:
+**96% fewer tokens**, and 29× less across the whole run. The function you asked
+about is present every time, against 1 time in 17 by searching.
 
-> Searching and reading files costs about five times more, and four times out of
-> five it does not even include the function you asked about.
+## What it still does badly
 
-That is not a rigged comparison. The file-reader is given every advantage: the
-search is free, deciding which files to open is free, and it opens the
-best-matching files first. It still loses, for a simple reason — **searching for
-a name finds the places that mention it, not the things it needs.** The helper
-functions live in files that never mention the function you are changing, so no
-amount of searching for that name will surface them.
+- **It finds about half the helpers, not all of them.** Most of what it misses
+  it simply has no record of — those are gaps in what the indexer captures, and
+  each one that gets closed raises this number directly.
+- **It finds a caller about three times in four.** On code with little internal
+  calling — a folder of scripts — that drops, because there are genuinely fewer
+  callers to find.
+- **It links a test to the function in about 1 job in 20.** Test files are
+  written as `describe(...)` and `it(...)` blocks, which the indexer does not
+  record as named code, so most test content is invisible to it. This is the
+  weakest part of the system.
+- **It usually uses only about a third of the space it is allowed.** When there
+  is nothing more in the index to add, it stops rather than padding. Closing the
+  gaps above is what turns that unused space into more answers.
 
-## A worked example
+## How it was measured
 
-`commitRecoveryVaultGeneration` — a real function, 99 lines, in the desktop
-package. It uses nine things defined in other files.
+- **Same files for both sides.** Neither side is credited with reach the other
+  did not have.
+- **The answers were checked against the source on disk**, not against the
+  engine's own database. The function's body is re-read from its file; its
+  imports are resolved through the repository's own package files; a helper
+  counts only if the code genuinely uses it.
+- **Imports from outside the repository** (npm packages, Node built-ins) are
+  excluded from both sides — neither approach can supply them.
+- **Typical figures are medians**, so half the jobs cost less and half cost
+  more. An average would be dragged around by whichever function happened to sit
+  next to a very large file.
+- **Repeatability.** Two independent 1,000-job runs agreed within a point on
+  cost and within two points on helper coverage.
+- **An earlier release quoted 33.9×.** That measurement counted duplicate copies
+  of the same source tree that happened to sit in the benchmark folder, which
+  made searching look about ten times more expensive than it is. The figures
+  here come from both sides reading the same set of files.
 
-**Searching and reading:** three files in the whole repository mention it by
-name. At the same budget the reader opens one of them — the test file. It never
-sees the function, and gets none of the nine helpers.
-
-**ContextZero, one request, 7,965 tokens:** the function itself, eight of its
-nine helpers with their real code, the three functions that call it, the test
-that covers it, and its input/output contract.
-
-The one it misses is a type-only import. That gap is described below.
-
-## A second repository
-
-The same measurement on a different codebase — 2,443 files of mixed scripts,
-release trees, a website and this engine's own source, 600 tasks:
-
-| One typical task | Search and read files | ContextZero |
-|---|---:|---:|
-| Requests | 1 search + 3 file reads | **1** |
-| Lines of code | 1,713 | **47** |
-| Tokens | 16,888 | **733** |
-
-**96% fewer tokens**, 29.7× fewer across the whole run. The function being
-changed is present every time, against 1 time in 21 for file reading.
-
-## What it does not do well yet
-
-- **It finds about half the helpers, not all of them.** Of the ones it misses,
-  roughly two thirds are invisible to it: they are imported in a style the
-  indexer does not yet record as a symbol, so there is nothing in the graph to
-  retrieve. That is the single biggest limit today and it is an indexing
-  problem, not a search problem.
-- **It names a caller 73% of the time.** On repositories with little internal
-  calling — a directory of scripts, for instance — that figure drops sharply,
-  because there genuinely are fewer callers to find.
-- **It links a covering test in about 1 task in 20.** Test association is weak
-  and is the least developed part of the graph.
-- **It typically uses only about a third of the budget it is given.** When the
-  graph has nothing more to offer for a symbol, the capsule stops rather than
-  padding. Closing the indexing gap above is what turns that unspent budget into
-  delivered helpers.
-
-## How this was measured
-
-- **The corpus.** Both sides draw on exactly the same set of files — the ones
-  the index covers — so neither is credited with reach the other did not have.
-- **The ground truth is read from disk, not from the engine.** The function's
-  body is re-read from its file by line number; the file's import statements are
-  resolved through the repository's own package manifests; a helper counts only
-  when the body actually uses a name that resolves to a real file. Nothing in
-  the scoring comes from the graph being tested.
-- **Imports that leave the repository** (npm packages, Node built-ins) are
-  excluded from both sides. Neither approach can supply them, so counting them
-  would measure the package manager.
-- **Token policy** is `bytes ÷ 4`, applied identically to both sides.
-- **Budget.** The capsule is pinned to 8,000 tokens, the default the tool ships
-  with. It reports its own size to within 0.5% of the bytes it actually sends,
-  and 999 of the 1,000 capsules stayed inside that budget.
-- **Sampling.** Random symbols with a body over 500 characters and a name of at
-  least 12 characters — distinctive names, where searching by name is a fair
-  proxy for what an agent would do. Two independent 1,000-task runs returned
-  9.1× and 9.9× against file reading, and 46.5% and 47.8% helper coverage.
-- **An earlier release quoted 33.9× on this benchmark.** That baseline counted
-  duplicate checkouts of the same source tree that happened to sit inside the
-  benchmark directory, which inflated the file-reading side roughly tenfold.
-  With both sides restricted to the indexed file set, the figures above are what
-  the same comparison produces.
-
-Reproduce on your own repository, once it is indexed:
+Run it on your own repository once it is indexed:
 
 ```bash
 node scripts/bench-context-quality.mjs 1000 /path/to/your/repo
 ```
 
-The script prints every number on this page as JSON, including the unflattering
-ones.
+It prints every number on this page, including the unflattering ones.
 
 ---
 

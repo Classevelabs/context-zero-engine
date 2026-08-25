@@ -5,6 +5,43 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] — The signature is part of what a symbol depends on
+
+### Fixed
+
+- **A type used only in a signature produced no edge at all.** Relation
+  extraction walked a function's body and nothing else, so
+  `function handle(evt: GlobalEvent): AgentInstance` recorded no dependency on
+  either type. Type-only imports are the common shape for that, so those
+  symbols read as depending on nothing and their capsules arrived without the
+  types they take and return. Parameters, type parameters and the return type
+  are now walked alongside the body — which also picks up parameter default
+  values, ordinary expressions that were equally invisible. Structural
+  relations on a 375k-line monorepo: 115,220 to 131,850.
+- **A dependency reached through a module namespace was invisible.** With
+  `export * as Provider from "./provider"`, the receiver in `Provider.helper`
+  resolves to the source file itself and carries a quoted path for a name, so
+  it could never match a symbol; worse, that unmatched name fell through to
+  name matching and could land on an unrelated symbol elsewhere. Namespace
+  receivers are now rejected outright, and the member reached through them is
+  resolved to its own declaration, which is the thing the calling code actually
+  depends on.
+
+Measured on the same 1,000 randomly sampled functions with the same
+disk-derived ground truth, pointing the benchmark at the old graph and the new
+one: cross-file helpers delivered rose from 44.1% to 53.6%, and from 48.9% to
+57.6% of those the index has any record of.
+
+### Changed
+
+- Benchmarks are stated in files, lines of code and tokens — what a job costs —
+  rather than in ratios and coverage percentages. `bench-context-quality.mjs`
+  reports those units directly, and `CZ_BENCH_SNAPSHOT` pins a snapshot so the
+  same ground truth can be pointed at two graphs, which is the only way to
+  attribute a change to the engine rather than to the measurement.
+  `CZ_BENCH_DIAGNOSE=1` splits every miss into "no edge was recorded" and
+  "an edge exists and was not chosen", because those need different fixes.
+
 ## [2.10.0] — The capsule stops paying for its own waste
 
 An instrumented audit of shipped capsules on a 375k-LOC monorepo found roughly

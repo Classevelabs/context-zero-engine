@@ -670,9 +670,23 @@ function relationWalkRoots(node: ts.Node): ts.Node[] {
     ts.isFunctionExpression(node) ||
     ts.isArrowFunction(node)
   ) {
+    // The signature is part of what a symbol depends on. A function declared
+    // `(evt: GlobalEvent): AgentInstance` uses both of those types as surely as
+    // if it named them in the body, and whoever changes either one changes this
+    // function — but walking only the body meant a type used ONLY in a
+    // parameter or return position produced no edge whatsoever. Type-only
+    // imports are the common case for that shape, so the symbol read as
+    // depending on nothing and its capsule arrived without the type it takes.
+    //
+    // Parameters also carry default-value initializers, which are ordinary
+    // expressions and reference ordinary things.
+    const roots: ts.Node[] = [...node.parameters]
+    if (node.typeParameters) roots.push(...node.typeParameters)
+    if (node.type) roots.push(node.type)
     // An arrow with an expression body (`() => load()`) has a body that is not
     // a block; it still holds the calls and must be walked.
-    return node.body ? [node.body] : []
+    if (node.body) roots.push(node.body)
+    return roots
   }
   if (ts.isClassDeclaration(node)) {
     return node.members.filter((m) => ts.isPropertyDeclaration(m) && m.initializer).map((m) => m)
@@ -728,12 +742,22 @@ function extractRelationsFromBody(
       }
       const declaration = symbol.declarations?.[0]
       if (!declaration) return undefined
+      // A module namespace — `import { Provider } from "./provider"` where the
+      // module re-exports itself as `export * as Provider from "./provider"` —
+      // resolves to the SOURCE FILE, and its symbol name is the quoted module
+      // path. Keying on that produced a target no symbol could ever match, and
+      // worse, the accompanying target_name fell through to name matching and
+      // could land on an unrelated symbol that happened to share the name.
+      // The member reached through such a namespace is resolved instead, in
+      // the property-access branch below.
+      if (ts.isSourceFile(declaration)) return undefined
       const declFile = declaration.getSourceFile()
       // Anything inside node_modules or a .d.ts is outside the indexed corpus;
       // emitting a key for it would only produce targets that never resolve.
       if (declFile.isDeclarationFile || declFile.fileName.includes("node_modules")) return undefined
       const name = symbol.getName()
       if (!name || name === "__type" || name === "default") return undefined
+      if (name.startsWith('"') || name.startsWith("'")) return undefined
       return `${declFile.fileName}#${name}`
     } catch {
       return undefined
@@ -760,6 +784,9 @@ function extractRelationsFromBody(
       }
       const declaration = symbol.declarations?.[0]
       if (!declaration) return undefined
+      // See resolveDeclarationKey: a module namespace resolves to the source
+      // file itself and carries a quoted path for a name.
+      if (ts.isSourceFile(declaration)) return undefined
       if (
         ts.isParameter(declaration) ||
         ts.isBindingElement(declaration) ||
@@ -792,9 +819,64 @@ function extractRelationsFromBody(
     }
   }
 
+  /**
+   * A member reached through a dotted expression — `Provider.defaultLayer`,
+   * `Session.get`, `Config.load` — resolved to the declaration it names.
+   *
+   * This is where the modern module-namespace style lives. A file that does
+   * `export * as Provider from "./provider"` gives consumers one object whose
+   * members are the module's exports, and the receiver of `Provider.x` is the
+   * module, not a symbol: it cannot be an edge. Only the member can. Without
+   * this, every dependency reached that way was invisible — the symbol read as
+   * using nothing, and a capsule for it arrived without the code it needs.
+   *
+   * Restricted to real declarations. An object-literal property (`config.port`
+   * where config is a local literal) resolves too, but it describes the inside
+   * of this file rather than how the repository is wired, and admitting it
+   * would bury the structure in noise.
+   */
+  function resolveMemberDeclarationKey(name: ts.MemberName): string | undefined {
+    try {
+      let symbol = checker.getSymbolAtLocation(name)
+      if (!symbol) return undefined
+      if (symbol.flags & ts.SymbolFlags.Alias) {
+        try {
+          symbol = checker.getAliasedSymbol(symbol)
+        } catch {
+          /* not an alias after all */
+        }
+      }
+      const declaration = symbol.declarations?.[0]
+      if (!declaration) return undefined
+      const isRealDeclaration =
+        ts.isFunctionDeclaration(declaration) ||
+        ts.isClassDeclaration(declaration) ||
+        ts.isInterfaceDeclaration(declaration) ||
+        ts.isTypeAliasDeclaration(declaration) ||
+        ts.isEnumDeclaration(declaration) ||
+        ts.isEnumMember(declaration) ||
+        ts.isMethodDeclaration(declaration) ||
+        ts.isMethodSignature(declaration) ||
+        ts.isPropertyDeclaration(declaration) ||
+        ts.isGetAccessorDeclaration(declaration) ||
+        ts.isSetAccessorDeclaration(declaration) ||
+        ts.isVariableDeclaration(declaration)
+      if (!isRealDeclaration) return undefined
+      const declFile = declaration.getSourceFile()
+      if (declFile.isDeclarationFile || declFile.fileName.includes("node_modules")) return undefined
+      const symbolName = symbol.getName()
+      if (!symbolName || symbolName === "__type" || symbolName === "default") return undefined
+      if (symbolName.startsWith('"') || symbolName.startsWith("'")) return undefined
+      return `${declFile.fileName}#${symbolName}`
+    } catch {
+      return undefined
+    }
+  }
+
   // One resolution per distinct name per symbol: an identifier repeated fifty
   // times is one fact, and the checker is the expensive part of this walk.
   const seenIdentifiers = new Set<string>()
+  const seenMembers = new Set<string>()
 
   function walkBody(child: ts.Node): void {
     // Detect call expressions
@@ -840,6 +922,25 @@ function extractRelationsFromBody(
           ...(targetKey ? { target_key: targetKey } : {}),
           relation_type: "calls",
         })
+      }
+    }
+
+    // A dotted member that is not being called — `Layer.provide(Provider.defaultLayer)`
+    // passes it, `const x = Config.timeout` reads it — is still a use of the
+    // thing it names. The call branch above already handles the callee case.
+    if (ts.isPropertyAccessExpression(child)) {
+      const isCallee = ts.isCallExpression(child.parent) && child.parent.expression === child
+      if (!isCallee) {
+        const memberKey = resolveMemberDeclarationKey(child.name)
+        if (memberKey && memberKey !== sourceKey && !seenMembers.has(memberKey)) {
+          seenMembers.add(memberKey)
+          relations.push({
+            source_key: sourceKey,
+            target_name: child.name.getText(sourceFile),
+            target_key: memberKey,
+            relation_type: "references",
+          })
+        }
       }
     }
 

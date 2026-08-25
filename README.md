@@ -31,28 +31,26 @@ with targeted queries: *give me this symbol with its dependencies and
 contracts*, *what breaks if I change it*, *where else does this logic exist*,
 *which tests cover it*.
 
-Measured on 1,000 random functions in a 375,000-line production monorepo, one
-typical task looks like this:
+An AI assistant asked to change one function has to see three things: the
+function, the code it uses from other files, and the code that calls it.
+Measured 1,000 times on a real 375,000-line codebase, that job costs:
 
-| | Search and read files | ContextZero |
+| | Searching and reading files | ContextZero |
 |---|---:|---:|
-| Requests | 1 search + 2 file reads | **1** |
-| Lines of code pulled in | 1,245 | **143** |
-| Tokens spent | 11,768 | **2,132** |
+| Files opened | 2 | 1 request |
+| Lines of code to read | 1,245 | **171** |
+| Tokens paid for | 11,506 | **2,439** |
 
-That is **82% fewer tokens** — 9.1× fewer across the whole run. But spending
-less proves nothing on its own, since an empty answer spends nothing at all. So
-both sides were given the *same* tokens to spend and the answers checked against
-the source on disk: ContextZero contains the function being changed **every
-time, against 1 time in 5** for file reading, something that genuinely calls it
-**73% of the time against 29%**, and **about half** the helpers the code uses
-from other files, against almost none.
+**79% fewer tokens** — 9.8× fewer across the whole run. And it costs less
+*without* knowing less: given the same tokens to spend, searching contains the
+function you asked about only **1 time in 5**, while ContextZero has it **every
+time**; it finds a caller **74% of the time against 27%**, and **half** the
+helpers the code uses from other files, against almost none.
 
-Searching for a name finds the places that mention it, not the things it needs —
-which is why the cheaper answer is also the more complete one.
+Searching for a name finds the places that mention it, not the things it needs.
 [BENCHMARKS.md](BENCHMARKS.md) has the method, a worked example, a second
-repository, and what the engine still does poorly. Reproduce on your own
-repository with `node scripts/bench-context-quality.mjs`.
+codebase, and what the engine still does badly. Reproduce on your own repository
+with `node scripts/bench-context-quality.mjs`.
 
 ---
 
