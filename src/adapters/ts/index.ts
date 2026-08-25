@@ -438,6 +438,11 @@ function extractFromSourceFile(
                 line: resolved.line,
               })
             }
+            extractRelationsFromBody(decl.initializer, sourceFile, checker, declStableKey, relations)
+          } else if (decl.initializer) {
+            // A non-function initializer still references things — a config
+            // object naming handlers, a lookup table of components.
+            extractRelationsFromBody(decl.initializer, sourceFile, checker, declStableKey, relations)
           }
         }
       } else if ("name" in node && node.name) {
@@ -504,10 +509,10 @@ function extractFromSourceFile(
           extractContractHint(node, sourceFile, checker, stableKey, contractHints, uncertaintyFlags)
         }
 
-        // Extract relations from function/method bodies
-        if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) {
-          extractRelationsFromBody(node, sourceFile, checker, stableKey, relations)
-        }
+        // Every indexed symbol contributes the references it contains. A
+        // symbol that is stored but emits nothing is indistinguishable from one
+        // that genuinely references nothing.
+        extractRelationsFromBody(node, sourceFile, checker, stableKey, relations)
 
         // Recurse into class body for methods
         if (ts.isClassDeclaration(node)) {
@@ -641,8 +646,42 @@ function extractContractHint(
   }
 }
 
+/**
+ * The parts of a symbol's declaration whose contents belong to that symbol.
+ *
+ * Restricting relation extraction to `FunctionDeclaration | MethodDeclaration`
+ * left most of a modern TypeScript codebase contributing no edges at all:
+ * `const Foo = () => {...}` is the dominant style for components and handlers,
+ * and interfaces and type aliases reference other types constantly. Those
+ * symbols were indexed, so they looked present, while emitting nothing — which
+ * is the worst combination, because the gap is invisible.
+ *
+ * A class walks only its property initializers: its methods are symbols in
+ * their own right and attribute their own calls, so walking the whole class
+ * would credit the class with everything its methods do.
+ */
+function relationWalkRoots(node: ts.Node): ts.Node[] {
+  if (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node)
+  ) {
+    // An arrow with an expression body (`() => load()`) has a body that is not
+    // a block; it still holds the calls and must be walked.
+    return node.body ? [node.body] : []
+  }
+  if (ts.isClassDeclaration(node)) {
+    return node.members.filter((m) => ts.isPropertyDeclaration(m) && m.initializer).map((m) => m)
+  }
+  return [node]
+}
+
 function extractRelationsFromBody(
-  node: ts.FunctionDeclaration | ts.MethodDeclaration,
+  node: ts.Node,
   sourceFile: ts.SourceFile,
   checker: ts.TypeChecker,
   sourceKey: string,
@@ -792,7 +831,11 @@ function extractRelationsFromBody(
     ts.forEachChild(child, walkBody)
   }
 
-  if (node.body) {
-    ts.forEachChild(node.body, walkBody)
+  for (const root of relationWalkRoots(node)) {
+    // walkBody on the root itself, not on its children: a concise arrow body
+    // (`() => load()`) IS the call expression, so descending first would step
+    // straight over the only relation the symbol has. walkBody recurses, so
+    // block bodies are unaffected.
+    walkBody(root)
   }
 }

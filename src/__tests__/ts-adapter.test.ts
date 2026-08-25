@@ -303,3 +303,61 @@ describe("JSX component usage is a call", () => {
     expect(result.relations.some((r) => r.target_name === "span")).toBe(false)
   })
 })
+
+describe("every symbol contributes its references", () => {
+  function extractOne(name: string, source: string) {
+    const dir = fs.mkdtempSync(path.join(tmpDir, "cov-"))
+    const p = path.join(dir, name)
+    fs.writeFileSync(p, source, "utf-8")
+    return extractFromTypeScript([p])
+  }
+
+  test("an arrow function assigned to a const emits its calls", async () => {
+    // The dominant style in modern TypeScript. Restricting extraction to
+    // declared functions left these symbols indexed but silent, which is worse
+    // than missing: they look present and contribute nothing.
+    const result = await extractOne(
+      "arrow.ts",
+      `function helper(): number { return 1 }\nexport const run = () => helper()\n`,
+    )
+    const fromArrow = result.relations.filter((r) => r.source_key.includes("#run"))
+    expect(fromArrow.some((r) => r.target_name === "helper")).toBe(true)
+  })
+
+  test("an arrow with an expression body still emits calls", async () => {
+    const result = await extractOne(
+      "expr.ts",
+      `function load(): number { return 2 }\nexport const get = () => load()\n`,
+    )
+    expect(result.relations.some((r) => r.source_key.includes("#get") && r.target_name === "load")).toBe(true)
+  })
+
+  test("a class property initializer emits its calls", async () => {
+    const result = await extractOne(
+      "prop.ts",
+      `function make(): number { return 3 }\nexport class Holder { value = make() }\n`,
+    )
+    expect(result.relations.some((r) => r.target_name === "make")).toBe(true)
+  })
+
+  test("an interface emits the types it references", async () => {
+    const result = await extractOne(
+      "iface.ts",
+      `export interface Inner { a: number }\nexport interface Outer { inner: Inner }\n`,
+    )
+    const fromOuter = result.relations.filter((r) => r.source_key.includes("#Outer"))
+    expect(fromOuter.some((r) => r.target_name === "Inner" && r.relation_type === "typed_as")).toBe(true)
+  })
+
+  test("a class is not credited with the calls made by its own methods", async () => {
+    // Methods are symbols in their own right; walking the whole class would
+    // attribute everything they do to the class as well.
+    const result = await extractOne(
+      "cls.ts",
+      `function inner(): number { return 4 }\nexport class C { go(): number { return inner() } }\n`,
+    )
+    const classEdges = result.relations.filter((r) => /#C$/.test(r.source_key) && r.target_name === "inner")
+    expect(classEdges).toHaveLength(0)
+    expect(result.relations.some((r) => r.source_key.includes("go") && r.target_name === "inner")).toBe(true)
+  })
+})

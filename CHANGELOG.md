@@ -5,6 +5,38 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] — Every symbol contributes its references
+
+### Fixed
+
+- **Most symbols were indexed but emitted nothing.** Relation extraction ran
+  only for `FunctionDeclaration` and `MethodDeclaration`. Everything else —
+  arrow functions assigned to a const, function expressions, constructors,
+  accessors, class property initializers, interfaces, type aliases — was stored
+  as a symbol and contributed no edges at all. `const Foo = () => {...}` is the
+  dominant style for components and handlers in modern TypeScript, so on a
+  375k-line monorepo 13,205 of 20,244 symbols classified as functions emitted
+  nothing, and every one of 5,184 type aliases and 853 interfaces emitted
+  nothing. A symbol that is present but silent is worse than one that is
+  missing, because the gap does not show.
+
+  Extraction now runs for every symbol-bearing node, walking the part of the
+  declaration that belongs to that symbol: a function's body, a variable's
+  initializer, a class's property initializers — not its methods, which are
+  symbols in their own right and would otherwise have their calls attributed
+  twice.
+
+- **A concise arrow body was walked past.** `() => load()` has the call as its
+  body rather than inside a block, and the walker descended into children
+  before testing the node it was given, stepping over the only relation such a
+  symbol has.
+
+  Same corpus, against 2.7.0: symbols with inbound edges 30.1% to 49.4%,
+  symbols emitting edges 28.1% to 52.5%, symbols carrying known effects 926 to
+  9,221, recorded effect facts 40,122 to 799,696. In compiled capsules, a
+  verified caller is present for 75.6% of targets, up from 48.7%, and effects
+  for 68.9%, up from 10.3%.
+
 ## [2.8.0] — Call targets resolve to declarations
 
 ### Fixed
