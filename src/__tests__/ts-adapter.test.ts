@@ -206,3 +206,100 @@ describe("Symbol Extraction", () => {
     expect(fn!.body_hash).toMatch(/^[0-9a-f]{64}$/)
   })
 })
+
+describe("call targets resolve to a declaration, not a name", () => {
+  function extractMulti(files: { name: string; source: string }[]) {
+    const dir = fs.mkdtempSync(path.join(tmpDir, "multi-"))
+    const paths = files.map((f) => {
+      const p = path.join(dir, f.name)
+      fs.writeFileSync(p, f.source, "utf-8")
+      return p
+    })
+    return extractFromTypeScript(paths)
+  }
+
+  test("a method call carries the declaration site of the method it reaches", async () => {
+    // `db.query(...)` names only `query`. Any real repository has several
+    // symbols called `query`, so the name alone cannot say which one runs.
+    const result = await extractMulti([
+      { name: "db.ts", source: `export class Db { query(sql: string): number { return sql.length } }\n` },
+      {
+        name: "use.ts",
+        source: `import { Db } from "./db"\nconst db = new Db()\nexport function runIt(): number { return db.query("select 1") }\n`,
+      },
+    ])
+
+    const call = result.relations.find((r) => r.target_name === "query" && r.source_key.includes("runIt"))
+    expect(call).toBeDefined()
+    expect(call?.target_key).toBeDefined()
+    expect(call?.target_key).toContain("db.ts")
+    expect(call?.target_key).toContain("#query")
+  })
+
+  test("two same-named methods resolve to different declarations", async () => {
+    // The case that silently collapsed: one name, two symbols. Without a
+    // declaration key both calls land on whichever was indexed last, so one
+    // symbol collects callers it never had and the other looks dead.
+    const result = await extractMulti([
+      { name: "a.ts", source: `export class A { run(): number { return 1 } }\n` },
+      { name: "b.ts", source: `export class B { run(): number { return 2 } }\n` },
+      {
+        name: "caller.ts",
+        source:
+          `import { A } from "./a"\nimport { B } from "./b"\n` +
+          `export function callA(): number { return new A().run() }\n` +
+          `export function callB(): number { return new B().run() }\n`,
+      },
+    ])
+
+    const fromA = result.relations.find((r) => r.source_key.includes("callA") && r.target_name === "run")
+    const fromB = result.relations.find((r) => r.source_key.includes("callB") && r.target_name === "run")
+
+    expect(fromA?.target_key).toContain("a.ts")
+    expect(fromB?.target_key).toContain("b.ts")
+    expect(fromA?.target_key).not.toEqual(fromB?.target_key)
+  })
+
+  test("calls leaving the program carry no declaration key", async () => {
+    // A key pointing outside the indexed corpus would only ever fail to
+    // resolve; absence is the honest answer.
+    const result = await extractMulti([
+      { name: "ext.ts", source: `export function f(): string { return JSON.stringify({ a: 1 }) }\n` },
+    ])
+    const call = result.relations.find((r) => r.target_name === "stringify")
+    if (call) expect(call.target_key).toBeUndefined()
+  })
+})
+
+describe("JSX component usage is a call", () => {
+  test("rendering a component records an edge to its declaration", async () => {
+    // `<Header />` runs Header. Without this the component graph is empty and
+    // every component in the repository reads as uncalled.
+    const dir = fs.mkdtempSync(path.join(tmpDir, "jsx-"))
+    const header = path.join(dir, "header.tsx")
+    const page = path.join(dir, "page.tsx")
+    fs.writeFileSync(header, `export function Header() { return null }\n`, "utf-8")
+    fs.writeFileSync(
+      page,
+      `import { Header } from "./header"\nexport function Page() { return <Header /> }\n`,
+      "utf-8",
+    )
+
+    const result = await extractFromTypeScript([header, page])
+    const edge = result.relations.find((r) => r.target_name === "Header" && r.source_key.includes("Page"))
+
+    expect(edge).toBeDefined()
+    expect(edge?.relation_type).toBe("calls")
+    expect(edge?.target_key).toContain("header.tsx")
+  })
+
+  test("intrinsic HTML elements are not treated as symbols", async () => {
+    const dir = fs.mkdtempSync(path.join(tmpDir, "jsx2-"))
+    const p = path.join(dir, "d.tsx")
+    fs.writeFileSync(p, `export function D() { return <div><span /></div> }\n`, "utf-8")
+
+    const result = await extractFromTypeScript([p])
+    expect(result.relations.some((r) => r.target_name === "div")).toBe(false)
+    expect(result.relations.some((r) => r.target_name === "span")).toBe(false)
+  })
+})

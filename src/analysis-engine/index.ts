@@ -43,11 +43,35 @@ export class StructuralGraphEngine {
     // two maps below are built.
     const svRows = await coreDataService.getSymbolIdentitiesForSnapshot(snapshotId)
     const svByKey = new Map<string, string>()
-    const svByCanonical = new Map<string, string>()
+    // Canonical names map to EVERY symbol carrying them, not to one.
+    //
+    // This was a Map<name, id>, so the last symbol indexed under a given name
+    // replaced all the others. A repository of any size has many `query`,
+    // `run`, `handle`, `createSnapshot` — and a monorepo that vendors a
+    // dependency has two of everything. Every call to any of them was
+    // therefore attributed to one arbitrary symbol: that symbol accumulated
+    // callers it never had, and all the genuine targets showed none at all,
+    // which is why most of the graph looked uncalled.
+    const svByCanonical = new Map<string, string[]>()
 
     for (const sv of svRows) {
       svByKey.set(sv.stable_key, sv.symbol_version_id)
-      svByCanonical.set(sv.canonical_name, sv.symbol_version_id)
+      const bucket = svByCanonical.get(sv.canonical_name)
+      if (bucket) bucket.push(sv.symbol_version_id)
+      else svByCanonical.set(sv.canonical_name, [sv.symbol_version_id])
+    }
+
+    /**
+     * Resolve a name when — and only when — it identifies one symbol.
+     *
+     * An ambiguous name is not a weaker signal, it is a different fact: it says
+     * "one of these several", and picking one is a guess presented as a
+     * measurement. Better to record no edge than a confident wrong one; the
+     * adapter's exact declaration key is what resolves these cases.
+     */
+    const resolveUnique = (name: string): string | undefined => {
+      const bucket = svByCanonical.get(name)
+      return bucket && bucket.length === 1 ? bucket[0] : undefined
     }
 
     // First pass: collect all target names that can't be resolved from in-memory maps
@@ -55,7 +79,10 @@ export class StructuralGraphEngine {
     for (const rel of rawRelations) {
       const srcSvId = svByKey.get(rel.source_key)
       if (!srcSvId) continue
-      const dstSvId = svByKey.get(rel.target_name) || svByCanonical.get(rel.target_name)
+      const dstSvId =
+        (rel.target_key ? svByKey.get(rel.target_key) : undefined) ||
+        svByKey.get(rel.target_name) ||
+        resolveUnique(rel.target_name)
       if (!dstSvId) {
         unresolvedTargets.add(rel.target_name)
       }
@@ -63,7 +90,7 @@ export class StructuralGraphEngine {
 
     // Batch-resolve all unresolved targets in chunked queries (avoids N+1)
     const CHUNK_SIZE = 5000
-    const resolvedFromDb = new Map<string, string>()
+    const resolvedFromDb = new Map<string, string | null>()
     if (unresolvedTargets.size > 0) {
       const targetNames = Array.from(unresolvedTargets)
       for (let i = 0; i < targetNames.length; i += CHUNK_SIZE) {
@@ -71,7 +98,7 @@ export class StructuralGraphEngine {
         const placeholders = chunk.map((_, j) => `$${j + 3}`).join(",")
         const dbResult = await db.query(
           `
-                    SELECT DISTINCT ON (s.canonical_name) sv.symbol_version_id, s.canonical_name
+                    SELECT sv.symbol_version_id, s.canonical_name
                     FROM symbol_versions sv
                     JOIN symbols s ON s.symbol_id = sv.symbol_id
                     WHERE s.repo_id = $1 AND sv.snapshot_id = $2
@@ -80,8 +107,12 @@ export class StructuralGraphEngine {
                 `,
           [repoId, snapshotId, ...chunk],
         )
+        // Count candidates per name; a name matching several symbols stays
+        // unresolved rather than being pinned to whichever row sorted first.
         for (const row of dbResult.rows as { symbol_version_id: string; canonical_name: string }[]) {
-          resolvedFromDb.set(row.canonical_name, row.symbol_version_id)
+          const seen = resolvedFromDb.get(row.canonical_name)
+          if (seen === undefined) resolvedFromDb.set(row.canonical_name, row.symbol_version_id)
+          else if (seen !== null && seen !== row.symbol_version_id) resolvedFromDb.set(row.canonical_name, null)
         }
       }
       log.debug("Batch-resolved unresolved relation targets", {
@@ -103,9 +134,15 @@ export class StructuralGraphEngine {
         continue
       }
 
-      // Target resolution: stable_key → canonical name → batch-resolved DB
+      // Exact declaration key first — it is the only source that can tell two
+      // same-named symbols apart. Name matching remains as a fallback for
+      // adapters that cannot resolve declarations, and only when unambiguous.
       const dstSvId =
-        svByKey.get(rel.target_name) || svByCanonical.get(rel.target_name) || resolvedFromDb.get(rel.target_name)
+        (rel.target_key ? svByKey.get(rel.target_key) : undefined) ||
+        svByKey.get(rel.target_name) ||
+        resolveUnique(rel.target_name) ||
+        resolvedFromDb.get(rel.target_name) ||
+        undefined
 
       if (!dstSvId) {
         targetFailures++

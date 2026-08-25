@@ -5,6 +5,51 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] — Call targets resolve to declarations
+
+### Fixed
+
+- **Most of the call graph pointed at the wrong symbol, or at nothing.** Call
+  targets were resolved by name, and a name does not identify a symbol: a call
+  written `db.query(...)` carries only `query`, and any repository of size has
+  many symbols called `query`, `run` or `handle` — a monorepo that vendors a
+  dependency has two of everything. The resolver held one symbol per name and
+  the database fallback selected `DISTINCT ON (canonical_name)`, so every such
+  call was attributed to one arbitrary symbol. That symbol accumulated callers
+  it never had, and the genuine targets showed none: on a 375k-line monorepo
+  only 30% of symbols had any inbound edge, and functions with dozens of real
+  call sites read as dead code.
+
+  Adapters that can resolve a declaration exactly now report it. The TypeScript
+  adapter follows the receiver's type and any import alias through the compiler
+  to the declaration itself, so `db.query` resolves to the method on that class
+  rather than to whichever `query` was indexed last. Name matching remains for
+  adapters without type resolution, but only when the name is unambiguous — an
+  ambiguous name now records nothing rather than a confident wrong edge.
+
+- **Rendering a component was not treated as calling it.** `<Header />` runs
+  `Header`, but it is a JSX element rather than a call expression, so a walker
+  looking only for calls recorded nothing. Every component in a user interface
+  therefore read as uncalled, and "what breaks if I change this?" answered
+  nothing for the part of a repository people actually see. Component usage is
+  now an edge to the component's declaration; intrinsic elements (`div`,
+  `span`) are correctly not treated as symbols.
+
+- **Effect signatures were mostly empty as a consequence.** Transitive effect
+  propagation walks the call graph, so a graph that could not resolve its own
+  edges had no path to propagate along. With targets resolving correctly, the
+  same corpus went from 926 symbols carrying known effects to 4,907, and from
+  40,122 recorded effect facts to 332,035.
+
+### Added
+
+- `scripts/bench-quality.mjs` — measures what a token reduction actually costs
+  in completeness. Both sides receive the same budget, and are scored on facts
+  that can be checked exactly: the implementation, a caller whose own source is
+  verified to reference the target, and the interface. A reduction figure on its
+  own is not evidence — returning nothing is a 100% reduction — so cost and
+  completeness are now reported together from one run.
+
 ## [2.7.0] — A self-maintaining index
 
 ### Added

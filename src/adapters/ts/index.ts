@@ -665,19 +665,60 @@ function extractRelationsFromBody(
     return expr.getText(sourceFile)
   }
 
+  /**
+   * The declaration a call actually reaches, as a `<file>#<name>` key.
+   *
+   * This is the difference between knowing that something named `query` was
+   * called and knowing WHICH `query`. The checker follows the receiver's type
+   * and any import alias to the declaration itself, so `db.query(...)` resolves
+   * to the method on that class rather than to whichever symbol named `query`
+   * happened to be indexed last. Returns undefined for calls that leave the
+   * program — node built-ins, untyped dynamic dispatch — where there is no
+   * declaration in this repository to point at.
+   */
+  function resolveDeclarationKey(expr: ts.Expression): string | undefined {
+    try {
+      let symbol = checker.getSymbolAtLocation(expr)
+      if (!symbol) return undefined
+      if (symbol.flags & ts.SymbolFlags.Alias) {
+        try {
+          symbol = checker.getAliasedSymbol(symbol)
+        } catch {
+          /* not an alias after all */
+        }
+      }
+      const declaration = symbol.declarations?.[0]
+      if (!declaration) return undefined
+      const declFile = declaration.getSourceFile()
+      // Anything inside node_modules or a .d.ts is outside the indexed corpus;
+      // emitting a key for it would only produce targets that never resolve.
+      if (declFile.isDeclarationFile || declFile.fileName.includes("node_modules")) return undefined
+      const name = symbol.getName()
+      if (!name || name === "__type" || name === "default") return undefined
+      return `${declFile.fileName}#${name}`
+    } catch {
+      return undefined
+    }
+  }
+
   function walkBody(child: ts.Node): void {
     // Detect call expressions
     if (ts.isCallExpression(child)) {
       let targetName: string | undefined
       let fullChain: string | undefined
+      let targetKey: string | undefined
 
       if (ts.isIdentifier(child.expression)) {
         targetName = child.expression.getText(sourceFile)
+        targetKey = resolveDeclarationKey(child.expression)
       } else if (ts.isPropertyAccessExpression(child.expression)) {
         // Extract FULL chain (e.g. this.service.repo.find)
         fullChain = extractFullChain(child.expression)
         // Also extract just the method name for backward compatibility
         targetName = child.expression.name.getText(sourceFile)
+        // Resolve against the property itself, not the receiver: `a.b.find`
+        // must reach the declaration of `find`, not of `a`.
+        targetKey = resolveDeclarationKey(child.expression.name)
       }
 
       // Emit full chain relation (primary — enables dispatch resolution)
@@ -685,6 +726,7 @@ function extractRelationsFromBody(
         relations.push({
           source_key: sourceKey,
           target_name: fullChain,
+          ...(targetKey ? { target_key: targetKey } : {}),
           relation_type: "calls",
         })
         // Also emit bare method name (enables matching without type inference)
@@ -692,6 +734,7 @@ function extractRelationsFromBody(
           relations.push({
             source_key: sourceKey,
             target_name: targetName,
+            ...(targetKey ? { target_key: targetKey } : {}),
             relation_type: "calls",
           })
         }
@@ -699,6 +742,34 @@ function extractRelationsFromBody(
         relations.push({
           source_key: sourceKey,
           target_name: targetName,
+          ...(targetKey ? { target_key: targetKey } : {}),
+          relation_type: "calls",
+        })
+      }
+    }
+
+    // Rendering a component invokes it. `<Header />` is a call to `Header` in
+    // every sense that matters here — it runs the function, its props are the
+    // arguments, and changing the component's contract breaks the call site —
+    // but it is a JsxElement rather than a CallExpression, so a walker looking
+    // only for calls records nothing. In a codebase with a UI that silently
+    // erases the entire component graph: every component reads as uncalled, and
+    // "what breaks if I change this?" answers nothing for the half of the
+    // repository a user actually sees.
+    if (ts.isJsxSelfClosingElement(child) || ts.isJsxOpeningElement(child)) {
+      const tag = child.tagName
+      const tagText = tag.getText(sourceFile)
+      // Lowercase tags are intrinsic elements (`div`, `span`) — HTML, not a
+      // symbol declared anywhere in this repository.
+      if (tagText && /^[A-Z]/.test(tagText)) {
+        // A tag name may also be a namespaced name (`<svg:rect/>`), which is not
+        // an expression and has no declaration to resolve.
+        const resolvable = ts.isPropertyAccessExpression(tag) ? tag.name : ts.isIdentifier(tag) ? tag : undefined
+        const jsxKey = resolvable ? resolveDeclarationKey(resolvable) : undefined
+        relations.push({
+          source_key: sourceKey,
+          target_name: tagText,
+          ...(jsxKey ? { target_key: jsxKey } : {}),
           relation_type: "calls",
         })
       }
@@ -707,9 +778,13 @@ function extractRelationsFromBody(
     // Detect type references
     if (ts.isTypeReferenceNode(child)) {
       const typeName = child.typeName.getText(sourceFile)
+      const typeKey = resolveDeclarationKey(
+        ts.isQualifiedName(child.typeName) ? child.typeName.right : child.typeName,
+      )
       relations.push({
         source_key: sourceKey,
         target_name: typeName,
+        ...(typeKey ? { target_key: typeKey } : {}),
         relation_type: "typed_as",
       })
     }

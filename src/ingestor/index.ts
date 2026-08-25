@@ -939,6 +939,10 @@ export class Ingestor {
     }
     for (const rel of extraction.relations) {
       rel.source_key = normalizeKey(rel.source_key)
+      // Declaration keys arrive absolute from the adapter and must land in the
+      // same portable form as the symbols they point at, or an exact target
+      // resolves to nothing and silently falls back to name matching.
+      if (rel.target_key) rel.target_key = normalizeKey(rel.target_key)
     }
     for (const hint of extraction.behavior_hints) {
       hint.symbol_key = normalizeKey(hint.symbol_key)

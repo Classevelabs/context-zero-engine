@@ -1,29 +1,56 @@
 # Context Zero Engine — Benchmarks
 
-## Headline (2.7.0, measured on a live 375k-LOC monorepo)
+## Headline (2.8.0, measured on a live 375k-LOC monorepo)
 
-Answering the same real task — *understand this symbol and everything needed to
-change it safely* — costs **98.3% fewer tokens** through one ContextZero call
-than through reading the files an agent would otherwise open. Measured across 47
-randomly selected functions and classes in a private production monorepo, live,
-on the current build:
+A token reduction on its own is not evidence of anything — returning an empty
+response is a 100% reduction. The number that matters is how much of what you
+need survives the compression. Both are measured here, from the same run, on 45
+randomly selected functions and classes in a private production monorepo:
 
-| | File-reading baseline | ContextZero | |
-|---|---:|---:|---:|
-| Tokens, pooled across 47 tasks | 25,153,020 | 425,713 | **59× fewer (98.3% saved)** |
-| Tokens, typical (median) task | — | — | **19× fewer** |
-| Interquartile range per task | — | — | 3.9× – 151× |
-| Files opened / calls per task | ~7 files | 1 call | — |
+### What it costs
 
-The baseline is deliberately conservative — capped at the 25 files an agent
-would plausibly open before giving up, and restricted to distinctive symbol
-names where file-reading is a fair proxy. Uncapped, on common names that appear
-across hundreds of files, the pooled reduction exceeds 2,500×; that number is
-real but unrepresentative, so it is not the headline. Reproduce with
-`node scripts/bench-head-to-head.ts 40 /path/to/your/repo` against your own
+| | Reading the files | ContextZero |
+|---|---:|---:|
+| Tokens, pooled across 45 tasks | 8,507,574 | 213,695 |
+| Reduction | | **39.8x (97.5% saved)** |
+| Reduction, typical task | | **23.7x** |
+
+### What survives
+
+Both sides are then given the *same* budget — the tokens the capsule actually
+used — and scored on facts that can be checked exactly.
+
+| At an identical token budget | ContextZero | Reading the files |
+|---|---:|---:|
+| Facts delivered (of 3) | **2.53** | 0.73 |
+| Has the implementation | **100%** | 17.8% |
+| Has a caller, verified | **53.3%** | 37.8% |
+| Has the interface | **100%** | 17.8% |
+| Tasks won / tied / lost | **39 / 5** | 1 |
+
+Caller precision is **97.3%**: when a caller is named, its own source is
+verified to reference the target. At the capsule's budget, reading files affords
+**less than one file** on average — usually not even the one containing the
+definition, which is why the implementation is present 100% of the time on one
+side and 17.8% on the other.
+
+Effects are excluded from the score on purpose. A transitive effect signature
+with hop counts is not something reading one file produces at any budget, so
+counting it would flatter the result rather than inform it.
+
+**Method and honesty notes.** The baseline is given every advantage: candidate
+files are ranked best-first by how often the symbol occurs, reading the defining
+file earns the implementation and interface outright, and it is charged nothing
+for searching or for deciding what to open. Targets are restricted to
+distinctive names, where file-reading is a fair proxy; on common names the
+uncapped reduction exceeds 2,500x, which is real but unrepresentative and is
+therefore not the headline. Figures come from one repository and 45 sampled
+symbols, so per-run sampling variance of a few points is expected. Reproduce
+with `node scripts/bench-quality.mjs 45 /path/to/your/repo` against your own
 indexed repository.
 
 ---
+
 
 This document also records earlier author-reported benchmark runs: a
 self-ingest run, a large-repository run on VS Code, and a multi-language run

@@ -394,6 +394,18 @@ export interface ExtractedSymbol {
 export interface ExtractedRelation {
   source_key: string
   target_name: string
+  /**
+   * The target's declaration site, as `<path>#<name>` — the same key shape as
+   * `source_key`.
+   *
+   * `target_name` alone cannot identify a symbol. A call written `db.query(...)`
+   * carries the name `query`, and a repository of any size has many symbols
+   * called `query`; resolving by name picks one of them and attributes every
+   * such call to it, which both invents edges and leaves the real targets
+   * looking uncalled. When an adapter can resolve the declaration exactly — the
+   * TypeScript checker can — it sets this, and resolution becomes unambiguous.
+   */
+  target_key?: string
   relation_type: StructuralRelationType
 }
 
