@@ -188,29 +188,52 @@ configuration, and current engine version.
 
 ---
 
-## Current Ingest Throughput (2.6.0)
+## Ingest Throughput (2.13.0)
 
-One full clean ingest, measured on 2026-08-20 against an empty database on the
-hardware described above (PostgreSQL 17, Node.js 24):
+Every figure in this section names the corpus it was measured on. A throughput
+number without one cannot be reproduced by anybody, including us.
+
+### Engine self-ingest — 2026-08-26
+
+The corpus is **this repository**, at commit `0ce5348`. Reproduce it by cloning
+this checkout and running:
+
+```
+BENCH_REPO_PATH=<path to this repo> npx ts-node scripts/bench-ingest.ts
+```
 
 | Measure | Value |
 |---|---:|
-| Files indexed | 2,637 |
+| Corpus | this repository @ `0ce5348` |
+| Files indexed | 148 |
 | Files failed | 0 |
-| Symbol versions | 29,791 |
-| Structural relations | 34,818 |
+| Symbols extracted | 3,872 |
+| Structural relations | 16,627 |
 | Snapshot status | `complete` |
-| Wall clock | 5m 55s |
+| Wall clock | 4m 40s |
 
-That is roughly **7.4 files per second end to end**, including symbol
-extraction, relation resolution, dispatch resolution, lineage, effect
-signatures, contract mining, and concept families. Ingest cost grows with
-database size — the LSH change in 2.6.0 exists because the previous schema
-slowed down as the index accumulated. Reproduce on your own corpus with
-`npx ts-node scripts/bench-ingest.ts`.
+Measured on PostgreSQL 17 / Node.js 24, on the hardware described above,
+against an **already-populated** database (8.2 GB, two unrelated repositories
+resident) rather than an empty one. Ingest cost grows with database size, so
+**this wall clock is not comparable to a clean-database figure** — the counts
+are, the timing is not. Anyone reproducing it on an empty database should
+expect it to be faster.
+
+### Withdrawn: the 2026-08-20 clean-ingest figure
+
+Earlier revisions of this file reported a clean ingest of 2,637 files / 29,791
+symbol versions / 34,818 structural relations in 5m 55s — about 7.4 files per
+second — measured 2026-08-20 against an empty database.
+
+**That measurement did not record which repository was ingested.** The database
+has since been rebuilt, so the corpus can no longer be identified from the
+snapshot history and the run cannot be reproduced by us or by anyone else. It
+is withdrawn: it must not be quoted, and it must not be used as release-gate
+evidence. It is described here rather than deleted so that anyone who saw the
+old number knows what happened to it.
 
 The token-reduction tables below are older, from the versions named in each
-heading. They were not re-run for 2.6.0.
+heading. They were not re-run for 2.13.0.
 
 ---
 

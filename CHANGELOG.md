@@ -5,6 +5,32 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Module-level destructured declarations are indexed.** `export const { query,
+  transaction } = db` declares real, importable names. The TypeScript adapter
+  skipped the whole declaration and recorded a `destructuring_binding_skipped`
+  flag, so those names had no symbol: nothing for an import to resolve against,
+  nothing for an edge to land on, and every consumer of `query` read as
+  depending on nothing. Each binding element with a concrete name is now its own
+  symbol, nested patterns included; the shared initializer is walked once, under
+  the first binding, so its calls are not attributed to every name in the
+  pattern. Measured effect on this repository's own ingest: +6 symbols, +34
+  relations (0.16%).
+
+### Documentation
+
+- **BENCHMARKS.md: the unnamed clean-ingest figure is withdrawn.** The
+  2026-08-20 run (2,637 files, 29,791 symbol versions, 34,818 relations, 5m 55s,
+  ~7.4 files/sec) never recorded which repository it ingested, and the database
+  has since been rebuilt, so the corpus cannot be identified and the run cannot
+  be reproduced. It is replaced by a named, reproducible engine self-ingest and
+  documented as withdrawn rather than deleted.
+
+---
+
 ## [2.13.0] — Resolve the way the compiler resolves
 
 Cross-file helper delivery on the 375k-line benchmark monorepo rose from
