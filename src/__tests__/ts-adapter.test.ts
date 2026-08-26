@@ -490,3 +490,47 @@ describe("module-level constants are variables, not functions", () => {
     expect(syms.find((s: any) => s.canonical_name === "handler").kind).toBe("function")
   })
 })
+
+// ── Destructured exports are symbols ──
+
+describe("module-level destructured declarations are indexed", () => {
+  const SRC = [
+    "const db = { query: (s: string) => s, transaction: (f: () => void) => f, retire: () => 1 }",
+    "export const { query, transaction: tx } = db",
+    "const DEFAULT_RETRIES = 3",
+    "export const { retire = DEFAULT_RETRIES } = db",
+    "",
+    "export function usesQuery() {",
+    "  return query(\"select 1\")",
+    "}",
+  ].join("\n")
+
+  test("each named binding becomes a variable symbol", async () => {
+    const syms = await symbols(SRC)
+    const names = syms.map((s: any) => s.canonical_name)
+    expect(names).toContain("query")
+    expect(names).toContain("tx")
+    expect(names).toContain("retire")
+    expect(syms.find((s: any) => s.canonical_name === "query").kind).toBe("variable")
+    expect(syms.find((s: any) => s.canonical_name === "tx").kind).toBe("variable")
+  })
+
+  test("a call to a destructured export resolves to the binding's key", async () => {
+    const result = await extract(SRC)
+    const call = result.relations.find(
+      (r: any) => r.source_key.includes("#usesQuery") && r.target_name === "query" && r.relation_type === "calls",
+    )
+    expect(call?.target_key).toBeDefined()
+    expect(call?.target_key).toContain("#query")
+  })
+
+  test("the shared initializer is walked once, under the first binding", async () => {
+    const result = await extract(SRC)
+    const fromBindings = result.relations.filter(
+      (r: any) => r.target_name === "db" && (r.source_key.endsWith("#query") || r.source_key.endsWith("#tx")),
+    )
+    // `db` is referenced from the first binding's key only, not once per binding.
+    expect(fromBindings.length).toBe(1)
+    expect(fromBindings[0].source_key.endsWith("#query")).toBe(true)
+  })
+})

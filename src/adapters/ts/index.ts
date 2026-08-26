@@ -572,7 +572,71 @@ function extractFromSourceFile(
       if (isTopLevelVariableStatement) {
         for (const decl of node.declarationList.declarations) {
           if (!ts.isIdentifier(decl.name)) {
-            uncertaintyFlags.push("destructuring_binding_skipped")
+            // A module-level destructuring declaration — `export const { query,
+            // transaction } = db` — declares real, importable names. Skipping
+            // it left those names with no symbol at all: nothing to import-
+            // resolve against, nothing for an edge to land on, and every
+            // consumer of `query` read as depending on nothing. Each binding
+            // element with a concrete name is a symbol in its own right; the
+            // shared initializer's references are walked once, under the first
+            // binding, so they are not attributed N times.
+            if (ts.isObjectBindingPattern(decl.name) || ts.isArrayBindingPattern(decl.name)) {
+              let firstBindingKey: string | undefined
+              const walkPattern = (pattern: ts.BindingPattern): void => {
+                for (const element of pattern.elements) {
+                  if (!ts.isBindingElement(element)) continue // array holes
+                  if (ts.isObjectBindingPattern(element.name) || ts.isArrayBindingPattern(element.name)) {
+                    walkPattern(element.name)
+                    continue
+                  }
+                  if (!ts.isIdentifier(element.name)) continue
+                  const bindingName = element.name.text
+                  if (!bindingName) continue
+                  const bindingKey = parentKey
+                    ? `${relativePath}#${parentKey}.${bindingName}`
+                    : `${relativePath}#${bindingName}`
+                  const { line: bStartLine, character: bStartCol } = sourceFile.getLineAndCharacterOfPosition(
+                    element.getStart(sourceFile),
+                  )
+                  const { line: bEndLine, character: bEndCol } = sourceFile.getLineAndCharacterOfPosition(
+                    element.getEnd(),
+                  )
+                  const bindingText = getNodeText(element, sourceFile)
+                  let bindingNormalized: string | undefined
+                  try {
+                    bindingNormalized = normalizeForComparison(bindingText)
+                  } catch {
+                    uncertaintyFlags.push("normalization_failure")
+                  }
+                  symbols.push({
+                    stable_key: bindingKey,
+                    canonical_name: bindingName,
+                    kind: "variable",
+                    range_start_line: bStartLine + 1,
+                    range_start_col: bStartCol + 1,
+                    range_end_line: bEndLine + 1,
+                    range_end_col: bEndCol + 1,
+                    signature: bindingName,
+                    ast_hash: sha256(bindingText),
+                    body_hash: sha256(bindingText),
+                    normalized_ast_hash: bindingNormalized,
+                    visibility: getVisibility(node),
+                  })
+                  if (!firstBindingKey) firstBindingKey = bindingKey
+                  // A per-element default (`{ retries = DEFAULT_RETRIES }`) is
+                  // this binding's own expression.
+                  if (element.initializer) {
+                    extractRelationsFromBody(element.initializer, sourceFile, checker, bindingKey, relations)
+                  }
+                }
+              }
+              walkPattern(decl.name)
+              if (firstBindingKey && decl.initializer) {
+                extractRelationsFromBody(decl.initializer, sourceFile, checker, firstBindingKey, relations)
+              }
+            } else {
+              uncertaintyFlags.push("destructuring_binding_skipped")
+            }
             continue
           }
           const declName = decl.name.text
@@ -998,11 +1062,11 @@ function extractRelationsFromBody(
       // See resolveDeclarationKey: a module namespace resolves to the source
       // file itself and carries a quoted path for a name.
       if (ts.isSourceFile(declaration)) return undefined
-      if (
-        ts.isParameter(declaration) ||
-        ts.isBindingElement(declaration) ||
-        ts.isTypeParameterDeclaration(declaration)
-      ) {
+      // Parameters and type parameters are always local. A binding element is
+      // NOT excluded here: `export const { query } = db` at module scope is an
+      // indexed symbol now, and the scope walk below already rejects the
+      // function-local destructuring this exclusion was written for.
+      if (ts.isParameter(declaration) || ts.isTypeParameterDeclaration(declaration)) {
         return undefined
       }
       // Walk up to the nearest scope: anything not anchored at the source file
@@ -1071,7 +1135,11 @@ function extractRelationsFromBody(
         ts.isPropertyDeclaration(declaration) ||
         ts.isGetAccessorDeclaration(declaration) ||
         ts.isSetAccessorDeclaration(declaration) ||
-        ts.isVariableDeclaration(declaration)
+        ts.isVariableDeclaration(declaration) ||
+        // `export const { query } = db` — the member reached through a
+        // namespace can be a module-level binding element, indexed since the
+        // destructured-export fix.
+        ts.isBindingElement(declaration)
       if (!isRealDeclaration) return undefined
       const declFile = declaration.getSourceFile()
       if (declFile.isDeclarationFile || declFile.fileName.includes("node_modules")) return undefined
