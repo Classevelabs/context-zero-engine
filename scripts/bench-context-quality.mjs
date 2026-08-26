@@ -69,7 +69,7 @@ const N = parseInt(process.argv[2] || "40", 10)
 const BUDGET = parseInt(process.env.CZ_BENCH_BUDGET || "8000", 10)
 const MIN_NAME = parseInt(process.env.CZ_BENCH_MIN_NAME || "12", 10)
 const DIAGNOSE = process.env.CZ_BENCH_DIAGNOSE === "1"
-const diagnosis = { edgeExistsNotChosen: 0, noEdgeRecorded: 0, samples: [] }
+const diagnosis = { edgeExistsNotChosen: 0, noEdgeRecorded: 0, samples: [], notChosen: [] }
 const tok = (bytes) => Math.round(bytes / 4)
 const IDENT = /[A-Za-z_$][A-Za-z0-9_$]*/g
 const norm = (p) => p.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()
@@ -360,10 +360,17 @@ for (const t of targets.rows) {
   if (spent < 50) continue
 
   const nodes = capsule.context_nodes || []
-  const delivered = new Map() // name -> a real body came with it
+  const delivered = new Map() // name -> the symbol's complete source came with it
   for (const n of nodes) {
     if (!n.name) continue
-    const hasCode = typeof n.code === "string" && n.code.length > 40
+    // "Delivered" means the capsule shipped the symbol's WHOLE source — its
+    // own resolution marker, not a length proxy. A 30-character constant is
+    // complete delivery (`export const CHAT_PAGE_SIZE = 25` IS the knowledge);
+    // a long signature stub is not delivery at any length. Nodes from engines
+    // without resolution markers fall back to carrying non-trivial code.
+    const hasCode =
+      n.resolution === "full_source" ||
+      (n.resolution === undefined && typeof n.code === "string" && n.code.length > 40)
     delivered.set(n.name, (delivered.get(n.name) || false) || hasCode)
   }
 
@@ -385,7 +392,18 @@ for (const t of targets.rows) {
           " WHERE sr.src_symbol_version_id = $1 AND ds.canonical_name = $2 LIMIT 1",
         [t.symbol_version_id, d],
       )
-      if (edge.rowCount > 0) diagnosis.edgeExistsNotChosen++
+      if (edge.rowCount > 0) {
+        diagnosis.edgeExistsNotChosen++
+        if (diagnosis.notChosen.length < 20) {
+          diagnosis.notChosen.push({
+            target: t.name,
+            dep: d,
+            target_deps_total: deps.size,
+            capsule_tokens: spent,
+            nodes_shipped: nodes.length,
+          })
+        }
+      }
       else {
         diagnosis.noEdgeRecorded++
         if (diagnosis.samples.length < 25) {
@@ -614,6 +632,7 @@ console.log(
               missed_because_no_edge_recorded: diagnosis.noEdgeRecorded,
               missed_though_edge_exists: diagnosis.edgeExistsNotChosen,
               no_edge_samples: diagnosis.samples,
+              not_chosen_samples: diagnosis.notChosen,
             }
           : {}),
         contextzero_beats_files: rows.filter((r) => r.czDeps > r.baseDeps).length,

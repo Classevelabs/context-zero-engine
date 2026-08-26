@@ -233,7 +233,9 @@ describe("call targets resolve to a declaration, not a name", () => {
     expect(call).toBeDefined()
     expect(call?.target_key).toBeDefined()
     expect(call?.target_key).toContain("db.ts")
-    expect(call?.target_key).toContain("#query")
+    // Class members are keyed the way the extractor indexes them —
+    // `Class.member` — so the edge can resolve to the method itself.
+    expect(call?.target_key).toContain("#Db.query")
   })
 
   test("two same-named methods resolve to different declarations", async () => {

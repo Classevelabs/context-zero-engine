@@ -38,15 +38,15 @@ Measured 1,000 times on a real 375,000-line codebase, that job costs:
 | | Searching and reading files | ContextZero |
 |---|---:|---:|
 | Files opened | 2 | 1 request |
-| Lines of code to read | 1,290 | **176** |
-| Tokens paid for | 11,866 | **2,630** |
+| Lines of code to read | 1,318 | **199** |
+| Tokens paid for | 12,800 | **2,946** |
 
-**78% fewer tokens** — 8.5× fewer across the whole run. And it costs less
+**77% fewer tokens** — 8.3× fewer across the whole run. And it costs less
 *without* knowing less: given the same tokens to spend, searching contains the
 function you asked about only **1 time in 4**, while ContextZero has it **every
-time**; it finds the code that calls it **82% of the time against 33%**, more
-than **half** the helpers the code uses from other files against almost none,
-and a covering test for **1 job in 4**.
+time**; it finds the code that calls it **85% of the time against 36%**, **7 in
+10** of the helpers the code uses from other files against almost none, and a
+covering test for **3 jobs in 10**.
 
 Searching for a name finds the places that mention it, not the things it needs.
 [BENCHMARKS.md](BENCHMARKS.md) has the method, a worked example, a second

@@ -5,6 +5,39 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] — Resolve the way the compiler resolves
+
+Cross-file helper delivery on the 375k-line benchmark monorepo rose from
+54% to 69% overall — 75% of everything the index has any record of — and on
+the mixed second corpus from 45% to 72%. Three causes, all in how references
+were resolved to declarations:
+
+### Fixed
+
+- **One tsconfig governed a whole monorepo.** Extraction built its programs
+  from the repository-root tsconfig, but path aliases like `@/*` live in the
+  per-package tsconfigs — so every `@/context/layout` import in every package
+  was unresolvable, the checker returned nothing for any name that arrived
+  through one, and the reference produced no edge. Files are now grouped by
+  the tsconfig that governs them — the nearest one walking up from each file,
+  the way the compiler, the editor and the bundler all resolve — and each
+  group gets a program built with its own options. Structural relations on
+  the benchmark monorepo: 131,850 → 228,202.
+- **A method reached through an instance could not resolve.** Class members
+  are indexed as `Class.member`, but keys were built from the bare symbol
+  name, so `db.query(...)` emitted `file#query`, matched nothing, fell back
+  to name matching, and was dropped as ambiguous. Keys now carry the class
+  qualifier the index uses.
+- **The benchmark's "delivered" check under-credited small constants.** It
+  required 40 characters of code, so a fully delivered one-line constant
+  scored as a miss. Delivery is now the capsule's own resolution marker:
+  full source shipped, at any length; a stub at no length.
+
+Measured limit, stated as found: doubling the token budget does not raise
+helper coverage — the remaining misses are functions whose helpers cannot
+physically fit beside them and declaration shapes the indexer does not yet
+record, not selection or budget.
+
 ## [2.12.0] — A test is code
 
 ### Fixed

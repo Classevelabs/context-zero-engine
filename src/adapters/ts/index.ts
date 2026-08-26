@@ -153,13 +153,31 @@ function classifyKind(node: ts.Node, sourceFile: ts.SourceFile): string {
 /** Maximum files per TypeScript compiler batch to prevent OOM in large monorepos */
 const BATCH_SIZE = 500
 
+const DEFAULT_COMPILER_OPTIONS: ts.CompilerOptions = {
+  target: ts.ScriptTarget.ES2022,
+  module: ts.ModuleKind.CommonJS,
+  strict: true,
+  esModuleInterop: true,
+  noEmit: true,
+}
+
 /**
  * Extract all symbols, relations, behavior hints, and contract hints
  * from a set of TypeScript files.
  *
- * For repos with more than BATCH_SIZE files, processes files in batches
- * using a shared CompilerHost so cross-file type resolution still works
- * (the host caches parsed source files between batches).
+ * Files are grouped by the tsconfig that GOVERNS them — the nearest
+ * tsconfig.json walking up from each file — and each group gets a program
+ * built with that config's own options. One config for a whole monorepo is
+ * how most of the dependency graph silently vanished: path aliases like
+ * `@/*` live in the per-package tsconfigs, so under the root config every
+ * `@/context/layout` import was unresolvable, the checker returned nothing
+ * for any name that arrived through one, and the reference produced no edge.
+ * The compiler, the editor and the bundler all resolve per-package;
+ * extraction now does the same.
+ *
+ * Within a group, repos larger than BATCH_SIZE are processed in batches with
+ * a shared CompilerHost so cross-file type resolution still works while
+ * memory stays bounded.
  */
 export async function extractFromTypeScript(
   filePaths: string[],
@@ -168,34 +186,81 @@ export async function extractFromTypeScript(
   const timer = log.startTimer("extractFromTypeScript", { fileCount: filePaths.length })
   const uncertaintyFlags: string[] = []
 
-  // Load compiler options
-  let compilerOptions: ts.CompilerOptions = {
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.CommonJS,
-    strict: true,
-    esModuleInterop: true,
-    noEmit: true,
-  }
-
-  if (tsconfigPath) {
-    // A malformed/unresolvable tsconfig (bad `extends`, JSON5 quirks) must not
-    // take down extraction for the whole repo — fall back to default options.
+  /** Parse a tsconfig into options; malformed configs must not take down the
+   * repo — fall back to defaults with an uncertainty flag. Cached per path. */
+  const optionsCache = new Map<string, ts.CompilerOptions>()
+  const loadOptions = (configPath: string | undefined): ts.CompilerOptions => {
+    if (!configPath) return DEFAULT_COMPILER_OPTIONS
+    const cached = optionsCache.get(configPath)
+    if (cached) return cached
+    let options: ts.CompilerOptions = DEFAULT_COMPILER_OPTIONS
     try {
-      const configFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile)
+      const configFile = ts.readConfigFile(configPath, ts.sys.readFile)
       if (!configFile.error) {
-        const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(tsconfigPath))
-        compilerOptions = parsed.options
+        const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(configPath))
+        options = parsed.options
       } else {
         uncertaintyFlags.push("incomplete_type_info")
-        log.warn("Failed to read tsconfig", { path: tsconfigPath })
+        log.warn("Failed to read tsconfig", { path: configPath })
       }
     } catch (err) {
       uncertaintyFlags.push("incomplete_type_info")
       log.warn("tsconfig parse threw — using default compiler options", {
-        path: tsconfigPath,
+        path: configPath,
         error: err instanceof Error ? err.message : String(err),
       })
     }
+    optionsCache.set(configPath, options)
+    return options
+  }
+
+  /** Nearest tsconfig.json walking up from a file, cached per directory.
+   * Falls back to the explicitly provided config, then to defaults. */
+  const nearestCache = new Map<string, string | undefined>()
+  const nearestTsconfig = (filePath: string): string | undefined => {
+    let dir = path.dirname(path.resolve(filePath))
+    const walked: string[] = []
+    while (true) {
+      const known = nearestCache.get(dir)
+      if (known !== undefined || nearestCache.has(dir)) {
+        for (const d of walked) nearestCache.set(d, known)
+        return known
+      }
+      walked.push(dir)
+      const candidate = path.join(dir, "tsconfig.json")
+      let found: string | undefined
+      try {
+        if (ts.sys.fileExists(candidate)) found = candidate
+      } catch {
+        /* unreadable directory: keep walking */
+      }
+      if (found) {
+        for (const d of walked) nearestCache.set(d, found)
+        return found
+      }
+      const parent = path.dirname(dir)
+      if (parent === dir) {
+        for (const d of walked) nearestCache.set(d, tsconfigPath)
+        return tsconfigPath
+      }
+      dir = parent
+    }
+  }
+
+  // Group files by governing tsconfig. Insertion order keeps the run
+  // deterministic; the key "" is the defaults group.
+  const groups = new Map<string, string[]>()
+  for (const filePath of filePaths) {
+    const config = nearestTsconfig(filePath) ?? ""
+    let group = groups.get(config)
+    if (!group) groups.set(config, (group = []))
+    group.push(filePath)
+  }
+  if (groups.size > 1) {
+    log.info("Per-package tsconfig grouping", {
+      groups: groups.size,
+      files: filePaths.length,
+    })
   }
 
   const symbols: ExtractedSymbol[] = []
@@ -251,7 +316,7 @@ export async function extractFromTypeScript(
    * retry each file as its own single-file program so one poison file (or a
    * transient resource failure) costs one file, not the entire repository.
    */
-  const extractPerFileFallback = async (paths: string[], options: ts.CompilerOptions = compilerOptions): Promise<void> => {
+  const extractPerFileFallback = async (paths: string[], options: ts.CompilerOptions): Promise<void> => {
     for (const filePath of paths) {
       try {
         const program = ts.createProgram([filePath], options)
@@ -268,56 +333,61 @@ export async function extractFromTypeScript(
     }
   }
 
-  if (filePaths.length <= BATCH_SIZE) {
-    // Small repo: single-program approach (no overhead)
-    try {
-      const program = ts.createProgram(filePaths, compilerOptions)
-      await extractProgramFiles(filePaths, program, program.getTypeChecker())
-    } catch (err) {
-      log.error(
-        "Program-level extraction failed — retrying per file",
-        err instanceof Error ? err : new Error(String(err)),
-      )
-      await extractPerFileFallback(filePaths)
-    }
-  } else {
-    // Large monorepo: batched extraction with shared CompilerHost
-    // The shared host caches parsed files so cross-file type resolution
-    // still works across batches while avoiding holding all ASTs in memory.
-    const host = ts.createCompilerHost(compilerOptions)
-    const totalBatches = Math.ceil(filePaths.length / BATCH_SIZE)
-    log.info("Batched extraction enabled", { files: filePaths.length, batchSize: BATCH_SIZE, totalBatches })
+  for (const [configPath, groupFiles] of groups) {
+    const compilerOptions = loadOptions(configPath || undefined)
 
-    for (let batchIdx = 0; batchIdx < filePaths.length; batchIdx += BATCH_SIZE) {
-      const batch = filePaths.slice(batchIdx, batchIdx + BATCH_SIZE)
-      const batchNum = Math.floor(batchIdx / BATCH_SIZE) + 1
-      log.debug("Processing batch", { batch: batchNum, totalBatches, files: batch.length })
-
+    if (groupFiles.length <= BATCH_SIZE) {
+      // Small group: single-program approach (no overhead)
       try {
-        const program = ts.createProgram(batch, compilerOptions, host)
-        await extractProgramFiles(batch, program, program.getTypeChecker())
+        const program = ts.createProgram(groupFiles, compilerOptions)
+        await extractProgramFiles(groupFiles, program, program.getTypeChecker())
       } catch (err) {
         log.error(
-          `Batch ${batchNum}/${totalBatches} extraction failed — retrying batch per file`,
+          "Program-level extraction failed — retrying per file",
           err instanceof Error ? err : new Error(String(err)),
         )
-        await extractPerFileFallback(batch)
+        await extractPerFileFallback(groupFiles, compilerOptions)
       }
-      await yieldLoop()
-    }
-  }
+    } else {
+      // Large group: batched extraction with shared CompilerHost
+      // The shared host caches parsed files so cross-file type resolution
+      // still works across batches while avoiding holding all ASTs in memory.
+      const host = ts.createCompilerHost(compilerOptions)
+      const totalBatches = Math.ceil(groupFiles.length / BATCH_SIZE)
+      log.info("Batched extraction enabled", { files: groupFiles.length, batchSize: BATCH_SIZE, totalBatches })
 
-  // JS retry: repos whose tsconfig lacks allowJs get their .js/.mjs files
-  // refused by the program ("source file not found"). Those aren't broken
-  // files — re-extract each with allowJs forced so scripts still index.
-  const jsRefused = failedFiles.filter((f) => /\.(m|c)?jsx?$/i.test(f))
-  if (jsRefused.length > 0 && compilerOptions.allowJs !== true) {
-    for (const f of jsRefused) {
-      const idx = failedFiles.indexOf(f)
-      if (idx >= 0) failedFiles.splice(idx, 1)
+      for (let batchIdx = 0; batchIdx < groupFiles.length; batchIdx += BATCH_SIZE) {
+        const batch = groupFiles.slice(batchIdx, batchIdx + BATCH_SIZE)
+        const batchNum = Math.floor(batchIdx / BATCH_SIZE) + 1
+        log.debug("Processing batch", { batch: batchNum, totalBatches, files: batch.length })
+
+        try {
+          const program = ts.createProgram(batch, compilerOptions, host)
+          await extractProgramFiles(batch, program, program.getTypeChecker())
+        } catch (err) {
+          log.error(
+            `Batch ${batchNum}/${totalBatches} extraction failed — retrying batch per file`,
+            err instanceof Error ? err : new Error(String(err)),
+          )
+          await extractPerFileFallback(batch, compilerOptions)
+        }
+        await yieldLoop()
+      }
     }
-    log.info("Retrying JS files with allowJs forced", { count: jsRefused.length })
-    await extractPerFileFallback(jsRefused, { ...compilerOptions, allowJs: true, checkJs: false })
+
+    // JS retry: groups whose tsconfig lacks allowJs get their .js/.mjs files
+    // refused by the program ("source file not found"). Those aren't broken
+    // files — re-extract each with allowJs forced so scripts still index.
+    const groupSet = new Set(groupFiles)
+    const jsRefused = failedFiles.filter((f) => groupSet.has(f) && /\.(m|c)?jsx?$/i.test(f))
+    if (jsRefused.length > 0 && compilerOptions.allowJs !== true) {
+      for (const f of jsRefused) {
+        const idx = failedFiles.indexOf(f)
+        if (idx >= 0) failedFiles.splice(idx, 1)
+      }
+      log.info("Retrying JS files with allowJs forced", { count: jsRefused.length })
+      await extractPerFileFallback(jsRefused, { ...compilerOptions, allowJs: true, checkJs: false })
+    }
   }
 
   timer({
@@ -353,6 +423,31 @@ export async function extractFromTypeScript(
 const TEST_SUITE_NAMES = new Set(["describe", "suite", "context"])
 const TEST_LEAF_NAMES = new Set(["it", "test", "bench"])
 const TEST_HOOK_NAMES = new Set(["beforeEach", "beforeAll", "afterEach", "afterAll", "before", "after"])
+
+/**
+ * The name a declaration is INDEXED under. Class members are stored as
+ * `Class.member` — that is the stable key the extractor writes — but the
+ * checker hands back the bare member symbol, so a key built from the symbol
+ * name alone (`file#query`) could never match the indexed `file#Database.query`.
+ * Resolution then fell to name matching, where `query` is ambiguous in any
+ * repository of size, and the edge was dropped: every dependency reached as a
+ * method on an imported instance — `db.query`, `log.info` — was invisible.
+ */
+function indexedNameFor(declaration: ts.Declaration, symbolName: string): string {
+  const parent = declaration.parent
+  if (
+    (ts.isMethodDeclaration(declaration) ||
+      ts.isPropertyDeclaration(declaration) ||
+      ts.isGetAccessorDeclaration(declaration) ||
+      ts.isSetAccessorDeclaration(declaration)) &&
+    parent &&
+    ts.isClassDeclaration(parent) &&
+    parent.name
+  ) {
+    return `${parent.name.text}.${symbolName}`
+  }
+  return symbolName
+}
 
 /** Root callee of a test-framework call: `it.each(tbl)("t", fn)` → "it". */
 function testCalleeRoot(expr: ts.Expression): string | undefined {
@@ -874,7 +969,7 @@ function extractRelationsFromBody(
       const name = symbol.getName()
       if (!name || name === "__type" || name === "default") return undefined
       if (name.startsWith('"') || name.startsWith("'")) return undefined
-      return `${declFile.fileName}#${name}`
+      return `${declFile.fileName}#${indexedNameFor(declaration, name)}`
     } catch {
       return undefined
     }
@@ -929,7 +1024,7 @@ function extractRelationsFromBody(
       if (declFile.isDeclarationFile || declFile.fileName.includes("node_modules")) return undefined
       const name = symbol.getName()
       if (!name || name === "__type" || name === "default") return undefined
-      return `${declFile.fileName}#${name}`
+      return `${declFile.fileName}#${indexedNameFor(declaration, name)}`
     } catch {
       return undefined
     }
@@ -983,7 +1078,7 @@ function extractRelationsFromBody(
       const symbolName = symbol.getName()
       if (!symbolName || symbolName === "__type" || symbolName === "default") return undefined
       if (symbolName.startsWith('"') || symbolName.startsWith("'")) return undefined
-      return `${declFile.fileName}#${symbolName}`
+      return `${declFile.fileName}#${indexedNameFor(declaration, symbolName)}`
     } catch {
       return undefined
     }
