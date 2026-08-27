@@ -1,0 +1,112 @@
+# The README tells people to install this with `docker compose up -d`, and
+# until now nothing had ever run that. A documented install path that no gate
+# executes is a claim, not a feature: the image can stop building, or build and
+# refuse to serve, and the first person to find out is a stranger following the
+# README. This runs exactly the three commands the README prints, then proves
+# the server it produces actually answers.
+#
+# Free to run: this repository is public, so Actions minutes are not metered
+# against the organisation's allowance.
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - '.env.docker.example'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'db/**'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.dockerignore'
+      - '.env.docker.example'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'db/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose-up:
+    name: The README's install path serves traffic
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Step one and two of the README, with throwaway credentials. The
+      # compose file refuses to start when any of these is unset, so filling
+      # them here is the same act the README asks a human to perform.
+      - name: cp .env.docker.example .env, and set the three required values
+        run: |
+          cp .env.docker.example .env
+          {
+            echo "DB_PASSWORD=$(openssl rand -hex 24)"
+            echo "SCG_API_KEYS=$(openssl rand -hex 32)"
+            echo "SCG_ADMIN_API_KEYS=$(openssl rand -hex 32)"
+          } >> .env
+
+      - name: docker compose up -d
+        run: docker compose up -d --build
+
+      # The image declares a HEALTHCHECK, so Docker itself is the judge of
+      # whether the server came up. Waiting on that rather than on a bare port
+      # also proves migrations applied: the server fails fast if they do not.
+      - name: Wait for the container to report healthy
+        run: |
+          for i in $(seq 1 60); do
+            state=$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q scg)" 2>/dev/null || echo starting)
+            echo "attempt $i: $state"
+            [ "$state" = healthy ] && exit 0
+            [ "$state" = unhealthy ] && { echo "::error::the container went unhealthy"; exit 1; }
+            sleep 5
+          done
+          echo "::error::the container never reported healthy"
+          exit 1
+
+      - name: The published port answers
+        run: |
+          code=$(curl -s -o /tmp/health.json -w "%{http_code}" --max-time 20 http://localhost:3100/health)
+          echo "GET /health -> $code"; cat /tmp/health.json; echo
+          [ "$code" = "200" ] || { echo "::error::/health returned $code"; exit 1; }
+
+      # A server that answers /health but rejects the key you just set, or
+      # accepts callers who set no key at all, is broken for the person who
+      # installed it — in opposite directions. Assert both, and use a route
+      # that reads the database so a passing call also proves migrations ran.
+      - name: Auth is enforced, and the key from .env is the key it accepts
+        run: |
+          key=$(grep '^SCG_API_KEYS=' .env | cut -d= -f2)
+
+          anon=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://localhost:3100/scg_cache_stats)
+          echo "GET /scg_cache_stats with no key -> $anon"
+          case "$anon" in
+            401|403) ;;
+            *) echo "::error::an unauthenticated caller got $anon from a protected route"; exit 1 ;;
+          esac
+
+          code=$(curl -s -o /tmp/repos.json -w "%{http_code}" --max-time 20             -X POST -H "X-API-Key: $key" -H "Content-Type: application/json"             -d '{"limit":1}' http://localhost:3100/scg_list_repos)
+          echo "POST /scg_list_repos with the key -> $code"; head -c 300 /tmp/repos.json; echo
+          [ "$code" = "200" ] || { echo "::error::the server rejected the key .env told the user to set, or the database is not reachable ($code)"; exit 1; }
+
+      - name: Container logs
+        if: always()
+        run: docker compose logs --no-color --tail 120
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v
