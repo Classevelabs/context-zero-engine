@@ -54,11 +54,19 @@ jobs:
       - name: cp .env.docker.example .env, and set the three required values
         run: |
           cp .env.docker.example .env
-          {
-            echo "DB_PASSWORD=$(openssl rand -hex 24)"
-            echo "SCG_API_KEYS=$(openssl rand -hex 32)"
-            echo "SCG_ADMIN_API_KEYS=$(openssl rand -hex 32)"
-          } >> .env
+          # Replace the placeholders in place, which is what the README asks a
+          # human to do. Appending instead would leave two lines per key: compose
+          # takes the last, but anything reading the file back gets both.
+          set_var() { sed -i "s|^$1=.*|$1=$2|" .env; }
+          set_var DB_PASSWORD        "$(openssl rand -hex 24)"
+          set_var SCG_API_KEYS       "$(openssl rand -hex 32)"
+          set_var SCG_ADMIN_API_KEYS "$(openssl rand -hex 32)"
+          for k in DB_PASSWORD SCG_API_KEYS SCG_ADMIN_API_KEYS; do
+            n=$(grep -c "^$k=" .env)
+            [ "$n" = 1 ] || { echo "::error::$k appears $n times in .env"; exit 1; }
+            grep -q "^$k=replace-with" .env && { echo "::error::$k still holds its placeholder"; exit 1; }
+          done
+          echo "three values set, one line each"
 
       - name: docker compose up -d
         run: docker compose up -d --build
@@ -86,11 +94,13 @@ jobs:
 
       # A server that answers /health but rejects the key you just set, or
       # accepts callers who set no key at all, is broken for the person who
-      # installed it — in opposite directions. Assert both, and use a route
-      # that reads the database so a passing call also proves migrations ran.
-      - name: Auth is enforced, and the key from .env is the key it accepts
+      # installed it — in opposite directions. Assert both. The authenticated
+      # form of /ready additionally reports how many migrations are recorded,
+      # so a passing call proves the exact thing that used to be broken: the
+      # ledger is populated, not silently empty behind a pre-seeded schema.
+      - name: Auth is enforced, the key from .env works, and migrations are recorded
         run: |
-          key=$(grep '^SCG_API_KEYS=' .env | cut -d= -f2)
+          key=$(grep '^SCG_API_KEYS=' .env | cut -d= -f2-)
 
           anon=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 http://localhost:3100/scg_cache_stats)
           echo "GET /scg_cache_stats with no key -> $anon"
@@ -99,9 +109,21 @@ jobs:
             *) echo "::error::an unauthenticated caller got $anon from a protected route"; exit 1 ;;
           esac
 
+          code=$(curl -s -o /tmp/ready.json -w "%{http_code}" --max-time 20             -H "X-API-Key: $key" http://localhost:3100/ready)
+          echo "GET /ready with the key -> $code"; cat /tmp/ready.json; echo
+          [ "$code" = "200" ] || { echo "::error::/ready returned $code for an authenticated caller"; exit 1; }
+
+          migrations=$(jq -r '.migrations // 0' /tmp/ready.json)
+          echo "migrations recorded: $migrations"
+          [ "$migrations" -gt 0 ] 2>/dev/null || {
+            echo "::error::the server reports $migrations applied migrations — either the key was refused (no migrations field) or the ledger is empty"
+            exit 1; }
+
+          # A route that reads a table, to prove the schema those migrations
+          # created is actually queryable.
           code=$(curl -s -o /tmp/repos.json -w "%{http_code}" --max-time 20             -X POST -H "X-API-Key: $key" -H "Content-Type: application/json"             -d '{"limit":1}' http://localhost:3100/scg_list_repos)
-          echo "POST /scg_list_repos with the key -> $code"; head -c 300 /tmp/repos.json; echo
-          [ "$code" = "200" ] || { echo "::error::the server rejected the key .env told the user to set, or the database is not reachable ($code)"; exit 1; }
+          echo "POST /scg_list_repos with the key -> $code"; cat /tmp/repos.json; echo
+          [ "$code" = "200" ] || { echo "::error::listing repositories returned $code"; exit 1; }
 
       - name: Container logs
         if: always()
