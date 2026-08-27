@@ -21,11 +21,20 @@ if (result.status !== 0) {
   process.exit(result.status ?? 1)
 }
 
+// npm <=11 reports an array of packed tarballs; npm 12 reports an object keyed
+// by package name. Read both, or this gate crashes on the newer client and
+// reads as a broken package boundary when the boundary is intact.
 let report
 try {
-  report = JSON.parse(result.stdout)[0]
+  const parsed = JSON.parse(result.stdout)
+  report = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0]
 } catch {
   console.error("Unable to parse npm pack JSON output.")
+  process.stderr.write(result.stdout)
+  process.exit(1)
+}
+if (!report || !Array.isArray(report.files)) {
+  console.error("npm pack JSON carried no file list; cannot verify the package boundary.")
   process.stderr.write(result.stdout)
   process.exit(1)
 }
