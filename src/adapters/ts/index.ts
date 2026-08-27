@@ -220,7 +220,7 @@ export async function extractFromTypeScript(
   const nearestTsconfig = (filePath: string): string | undefined => {
     let dir = path.dirname(path.resolve(filePath))
     const walked: string[] = []
-    while (true) {
+    for (;;) {
       const known = nearestCache.get(dir)
       if (known !== undefined || nearestCache.has(dir)) {
         for (const d of walked) nearestCache.set(d, known)
