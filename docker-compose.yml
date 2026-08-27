@@ -11,7 +11,13 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      # db/schema.sql is NOT mounted into docker-entrypoint-initdb.d. It is a
+      # generated dump of the migrations ("Do not hand-edit"), so seeding with
+      # it created every table while leaving the migration ledger empty — the
+      # server then tried to apply 001_initial_schema.sql, hit `relation
+      # "repositories" already exists`, and refused to start, crash-looping on
+      # a first-time `docker compose up -d`. The server's own migration runner
+      # builds a fresh database, extension included, and records what it ran.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d scg_v2"]
       interval: 5s
