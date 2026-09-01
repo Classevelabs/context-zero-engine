@@ -19,6 +19,7 @@ import * as fsp from "fs/promises"
 import * as crypto from "crypto"
 import express, { Request, Response, NextFunction } from "express"
 import { Logger } from "../logger"
+import { networkBindAuthError } from "../bind-guard"
 import { db } from "../db-driver"
 import { destroyAllCaches } from "../cache"
 import { coreDataService } from "../db-driver/core_data"
@@ -1986,15 +1987,6 @@ const DEFAULT_PORT = 3100
 const PORT = serverConfig.port > 0 && serverConfig.port <= 65_535 ? serverConfig.port : DEFAULT_PORT
 const HOST = serverConfig.host
 
-// Only a genuine loopback bind is reachable solely from this machine. Anything
-// else (0.0.0.0, ::, a routable IP, or a hostname) can be reached from another
-// host and therefore must present authentication before we accept traffic —
-// the same fail-closed posture used for migrations and transactional recovery.
-function isLoopbackBindHost(host: string): boolean {
-  const h = host.trim().toLowerCase()
-  return h === "127.0.0.1" || h === "::1" || h === "localhost" || h.startsWith("127.")
-}
-
 let server: ReturnType<typeof app.listen>
 let retentionTimer: ReturnType<typeof setInterval> | null = null
 
@@ -2010,12 +2002,8 @@ function validateStartupConfiguration(): void {
   // network-reachable address without authentication. The bundled Compose file
   // sets SCG_HOST=0.0.0.0 and already requires SCG_API_KEYS; this closes the
   // manual-misconfiguration footgun (public bind + no keys) outside production.
-  if (!isLoopbackBindHost(HOST) && security.apiKeys.length === 0) {
-    errors.push(
-      `Refusing to bind to non-loopback host "${HOST}" without authentication. ` +
-        "Set SCG_API_KEYS (bearer auth) or bind to 127.0.0.1 via SCG_HOST.",
-    )
-  }
+  const bindError = networkBindAuthError(HOST, security.apiKeys.length > 0)
+  if (bindError) errors.push(bindError)
 
   if (isProduction && ALLOWED_BASE_PATHS.length === 0) {
     errors.push("SCG_ALLOWED_BASE_PATHS must resolve to at least one accessible directory in production.")
