@@ -6,6 +6,8 @@ Please report suspected vulnerabilities privately via GitHub's security
 advisory feature ("Report a vulnerability" on the repository's Security
 tab). Do not open a public issue for security reports.
 
+You can also email <security@classeve.com>.
+
 Include what you can: affected version, reproduction steps, and impact.
 We will acknowledge reports as quickly as possible and coordinate a fix
 and disclosure timeline with you.
