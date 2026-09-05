@@ -136,6 +136,15 @@ jobs:
             || { echo "::error::tools/list returned no tool surface"; exit 1; }
           grep -q 'DB health check passed' /tmp/cz-mcp.err \
             || { echo "::error::bridge did not report a passing DB health check at startup"; exit 1; }
+
+          # A clean start and stop log nothing at error level. Closing the pool
+          # under the startup retention pass logged four errors here while every
+          # check above still passed, so the checks above are not enough.
+          if grep -q '"level":"\(error\|fatal\)"' /tmp/cz-mcp.err; then
+            echo "::error::bridge logged errors during a clean cold start and shutdown"
+            grep '"level":"\(error\|fatal\)"' /tmp/cz-mcp.err | head -5
+            exit 1
+          fi
         env:
           DB_HOST: localhost
           DB_PORT: 5432

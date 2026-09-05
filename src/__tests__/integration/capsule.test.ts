@@ -36,6 +36,7 @@ function makeTargetSymbolRow(
   overrides?: Partial<{
     symbol_id: string
     canonical_name: string
+    kind: string
     signature: string
     file_path: string
     range_start_line: number
@@ -46,6 +47,7 @@ function makeTargetSymbolRow(
   return {
     symbol_id: "sym-001",
     canonical_name: "getUserById",
+    kind: "function",
     signature: "getUserById(userId: string): Promise<User>",
     file_path: "src/services/user.ts",
     range_start_line: 10,
@@ -168,8 +170,9 @@ function setupMockForMode(
       return { rows: [makeTargetSymbolRow({ uncertainty_flags: uncertaintyFlags })], rowCount: 1 }
     }
 
-    // Dependencies (structural_relations WHERE src)
-    if (sql.includes("sr.src_symbol_version_id = $1")) {
+    // Dependencies (structural_relations WHERE src — the target itself plus any
+    // members nested in its range, via the `scope` CTE).
+    if (sql.includes("sr.src_symbol_version_id")) {
       return { rows: makeDependencyRows(depCount, depSummarySize), rowCount: depCount }
     }
 
@@ -477,5 +480,72 @@ describe("Capsule Integration — Source Code Handling", () => {
     const capsule = await compiler.compile("sv-001", "snap-001", "standard")
     expect(capsule.uncertainty_notes.length).toBe(1)
     expect(capsule.uncertainty_notes[0]).toContain("2 uncertainty flags")
+  })
+})
+
+// A class holds almost no edges on its own node; its dependencies live on its
+// member methods, tied to it only by nesting inside its line range. The
+// dependency query therefore aggregates members for a container target and must
+// NOT for a callable, where a nested closure is private detail already shipped
+// with the body. The gate keys on the target's kind.
+describe("Capsule Integration — Member-dependency traversal gate", () => {
+  const compiler = new CapsuleCompiler()
+
+  beforeEach(() => {
+    mockQuery.mockReset()
+    capsuleCache.clear()
+  })
+
+  function captureDepQuery(kind: string): { sqls: string[] } {
+    const sqls: string[] = []
+    mockQuery.mockImplementation(async (sql: string) => {
+      sqls.push(sql)
+      if (sql.includes("sv.symbol_version_id = $1") && sql.includes("f.path as file_path")) {
+        return { rows: [makeTargetSymbolRow({ kind })], rowCount: 1 }
+      }
+      if (sql.includes("sr.src_symbol_version_id")) {
+        return { rows: makeDependencyRows(2), rowCount: 2 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    return { sqls }
+  }
+
+  const depSql = (sqls: string[]) => sqls.find((s) => s.includes("sr.src_symbol_version_id")) || ""
+
+  test("class target aggregates member dependencies (scope CTE present)", async () => {
+    const cap = captureDepQuery("class")
+    await compiler.compile("sv-001", "snap-001", "minimal")
+    const sql = depSql(cap.sqls)
+    expect(sql).toContain("WITH scope")
+    expect(sql).toContain("sr.src_symbol_version_id IN (SELECT svid FROM scope)")
+  })
+
+  test("interface and enum targets aggregate member dependencies", async () => {
+    for (const kind of ["interface", "enum"]) {
+      const cap = captureDepQuery(kind)
+      await compiler.compile("sv-001", "snap-001", "minimal")
+      expect(depSql(cap.sqls)).toContain("WITH scope")
+      mockQuery.mockReset()
+      capsuleCache.clear()
+    }
+  })
+
+  test("callable targets use own edges only — no member aggregation", async () => {
+    for (const kind of ["function", "method", "route_handler"]) {
+      const cap = captureDepQuery(kind)
+      await compiler.compile("sv-001", "snap-001", "minimal")
+      const sql = depSql(cap.sqls)
+      expect(sql).not.toContain("scope")
+      expect(sql).toContain("sr.src_symbol_version_id = $1")
+      mockQuery.mockReset()
+      capsuleCache.clear()
+    }
+  })
+
+  test("module target does not aggregate (avoids pulling a whole file)", async () => {
+    const cap = captureDepQuery("module")
+    await compiler.compile("sv-001", "snap-001", "minimal")
+    expect(depSql(cap.sqls)).not.toContain("scope")
   })
 })

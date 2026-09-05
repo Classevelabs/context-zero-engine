@@ -10,12 +10,11 @@
  * actionable error messages.
  */
 
-import * as dotenv from "dotenv"
 import * as fs from "fs"
 import * as path from "path"
+import { loadEnvFile } from "./load-env"
 
-const dotenvPath = process.env["CONTEXTZERO_ENV_FILE"]
-dotenv.config(dotenvPath ? { path: dotenvPath, quiet: true, override: true } : { quiet: true })
+loadEnvFile()
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

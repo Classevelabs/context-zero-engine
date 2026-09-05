@@ -252,6 +252,201 @@ export function estimateJaccardFromMinHash(sigA: number[], sigB: number[]): numb
 }
 
 // --------------------------------------------------------------------------
+// Sparse vector storage encoding
+// --------------------------------------------------------------------------
+
+/**
+ * Bytes per stored term: a 32-bit token hash and a 16-bit quantized weight.
+ *
+ * As JSONB a sparse vector cost 28.2 bytes per term, measured across 98,924
+ * terms. Almost none of that was the number: it was the token spelled out as an
+ * object key, plus JSONB's per-key entry header and a variable-width numeric.
+ * The same 98,924 terms drew on a vocabulary of 4,930 distinct tokens, so every
+ * token was written out roughly twenty times over.
+ *
+ * Nothing downstream reads a token back. cosineSimilarity and jaccardFromSparse
+ * ask only whether two vectors share a key, so the key can be any stable
+ * identity — and a hash is a smaller one than the word. A collision merges two
+ * rare terms into one dimension, which perturbs a score by the weight of the
+ * rarer term and cannot make an unrelated symbol match.
+ */
+const TERM_BYTES = 6
+
+/** Weights are L2-normalized into (0, 1], so 16 bits spans the whole range. */
+const WEIGHT_SCALE = 0xffff
+
+/**
+ * Encode a sparse vector for storage: terms sorted by token hash, each written
+ * as a big-endian uint32 hash followed by a uint16 weight.
+ *
+ * Sorted order is part of the format — it makes two stored vectors mergeable in
+ * a single linear pass, and it makes the bytes deterministic for a given term
+ * set, so an unchanged symbol re-encodes to an identical value.
+ */
+export function packSparseVector(vector: SparseVector): Buffer {
+  // Collisions inside one vector mean two tokens landed on one dimension; their
+  // weights belong to that dimension jointly.
+  const byHash = new Map<number, number>()
+  for (const [token, weight] of Object.entries(vector)) {
+    if (!Number.isFinite(weight) || weight <= 0) continue
+    const hash = fnv1a(token)
+    byHash.set(hash, (byHash.get(hash) ?? 0) + weight)
+  }
+
+  const hashes = Array.from(byHash.keys()).sort((a, b) => a - b)
+  const packed = Buffer.allocUnsafe(hashes.length * TERM_BYTES)
+  let offset = 0
+  for (const hash of hashes) {
+    // Clamp to 1: a term that rounds to zero is still a term the key set
+    // contains, and Jaccard is answered from the key set.
+    const quantized = Math.max(1, Math.min(WEIGHT_SCALE, Math.round(byHash.get(hash)! * WEIGHT_SCALE)))
+    packed.writeUInt32BE(hash, offset)
+    packed.writeUInt16BE(quantized, offset + 4)
+    offset += TERM_BYTES
+  }
+  return packed
+}
+
+/**
+ * Decode a stored sparse vector. Keys are token hashes rendered in decimal, so
+ * the result is the same shape every scoring function already consumes — two
+ * decoded vectors agree on a key exactly when they shared a token.
+ *
+ * A query vector built from text must be put through `hashSparseKeys` before it
+ * is compared against one of these.
+ */
+export function unpackSparseVector(stored: Buffer | Uint8Array | null | undefined): SparseVector {
+  const vector: SparseVector = Object.create(null) as SparseVector
+  if (!stored || stored.length < TERM_BYTES) return vector
+  const view = Buffer.isBuffer(stored) ? stored : Buffer.from(stored)
+  const terms = Math.floor(view.length / TERM_BYTES)
+  for (let i = 0; i < terms; i++) {
+    const offset = i * TERM_BYTES
+    vector[String(view.readUInt32BE(offset))] = view.readUInt16BE(offset + 4) / WEIGHT_SCALE
+  }
+  return vector
+}
+
+/**
+ * Re-key a token-keyed vector onto the hashes used in storage, so a freshly
+ * tokenized query can be compared against decoded vectors.
+ */
+export function hashSparseKeys(vector: SparseVector): SparseVector {
+  const hashed: SparseVector = Object.create(null) as SparseVector
+  for (const [token, weight] of Object.entries(vector)) {
+    const key = String(fnv1a(token))
+    hashed[key] = (hashed[key] ?? 0) + weight
+  }
+  return hashed
+}
+
+/**
+ * The distinct token hashes of a document, as signed 32-bit integers.
+ *
+ * This is the inverted-index key set: two documents can only have nonzero
+ * cosine similarity if their token-hash sets overlap, so an index over this
+ * array answers "which symbols could possibly match this query" directly,
+ * without the linear scan that decodes every stored vector.
+ *
+ * `| 0` maps the unsigned FNV hash into PostgreSQL's signed int4 range, the
+ * same coercion computeBandKeys uses, so the values live in an INTEGER[].
+ */
+export function tokenHashesInt32(tokens: Iterable<string>): number[] {
+  const seen = new Set<number>()
+  for (const token of tokens) seen.add(fnv1a(token) | 0)
+  return [...seen]
+}
+
+/**
+ * The most distinctive token hashes of an already-hashed query vector, for
+ * probing the inverted index.
+ *
+ * A query vector is keyed by unsigned-hash strings (see hashSparseKeys) and
+ * weighted by TF-IDF, so the highest weights are the rarest, most selective
+ * terms. Probing with those rather than every term keeps a query like
+ * "get the value" from dragging in every symbol that merely contains "get":
+ * a near-ubiquitous token carries an IDF near zero, contributes almost nothing
+ * to cosine, and so dropping it from the probe changes ranking negligibly while
+ * removing the term that would otherwise blow the candidate set up to the whole
+ * table. `keep` bounds the probe width for pathologically long queries.
+ */
+export function distinctiveQueryHashes(hashedVector: SparseVector, keep = 32): number[] {
+  const entries = Object.entries(hashedVector)
+  if (entries.length === 0) return []
+  entries.sort((a, b) => b[1] - a[1])
+  const kept = entries.length > keep ? entries.slice(0, keep) : entries
+  return kept.map(([key]) => Number(key) | 0)
+}
+
+/**
+ * Smallest token set that earns a stored MinHash signature.
+ *
+ * A signature over a set of size k holds at most k distinct values, so below
+ * this width the estimator is mostly reporting sentinel collisions rather than
+ * similarity. The sparse vector is already persisted and its key set is the
+ * exact token set, so `jaccardFromSparse` answers the same question exactly,
+ * for less work and no stored bytes. Ingest leaves `minhash_signature` NULL
+ * under this threshold and every read path falls back to the exact form.
+ */
+export const MINHASH_MIN_TOKENS = 8
+
+/** Bytes per packed permutation — MinHash values are 32-bit by construction. */
+const MINHASH_BYTES_PER_PERM = 4
+
+/**
+ * Pack a signature into big-endian uint32s for storage.
+ *
+ * `bigint[]` cost 8 bytes per element plus ~24 bytes of array header, for
+ * values that never exceed 0xFFFFFFFF. A fixed-width bytea halves the payload
+ * and removes the per-element varlena bookkeeping.
+ */
+export function packMinHash(signature: number[]): Buffer {
+  const packed = Buffer.allocUnsafe(signature.length * MINHASH_BYTES_PER_PERM)
+  for (let i = 0; i < signature.length; i++) {
+    packed.writeUInt32BE(signature[i]! >>> 0, i * MINHASH_BYTES_PER_PERM)
+  }
+  return packed
+}
+
+/**
+ * Unpack a stored signature. Returns null for the NULL column written below
+ * MINHASH_MIN_TOKENS, so callers can branch to the exact path.
+ */
+export function unpackMinHash(stored: Buffer | Uint8Array | null | undefined): number[] | null {
+  if (!stored || stored.length < MINHASH_BYTES_PER_PERM) return null
+  const view = Buffer.isBuffer(stored) ? stored : Buffer.from(stored)
+  const count = Math.floor(view.length / MINHASH_BYTES_PER_PERM)
+  const signature: number[] = new Array(count)
+  for (let i = 0; i < count; i++) {
+    signature[i] = view.readUInt32BE(i * MINHASH_BYTES_PER_PERM)
+  }
+  return signature
+}
+
+/**
+ * Exact Jaccard over two sparse vectors' key sets.
+ *
+ * The keys of a sparse vector are precisely the tokens that produced it, so
+ * this is the ground truth that `estimateJaccardFromMinHash` approximates.
+ * Used whenever either side stored no signature.
+ */
+export function jaccardFromSparse(a: SparseVector, b: SparseVector): number {
+  const aKeys = Object.keys(a)
+  const bKeys = Object.keys(b)
+  if (aKeys.length === 0 || bKeys.length === 0) return 0
+
+  // Probe the smaller set against the larger one.
+  const [small, large] = aKeys.length <= bKeys.length ? [aKeys, b] : [bKeys, a]
+  let intersection = 0
+  for (const key of small) {
+    if (Object.prototype.hasOwnProperty.call(large, key)) intersection++
+  }
+
+  const union = aKeys.length + bKeys.length - intersection
+  return union === 0 ? 0 : intersection / union
+}
+
+// --------------------------------------------------------------------------
 // LSH Banding — Locality-Sensitive Hashing for sub-linear candidate retrieval
 // --------------------------------------------------------------------------
 

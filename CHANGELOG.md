@@ -7,8 +7,90 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+**Upgrade note.** Migration 025 changes how sparse vectors are stored and
+empties `semantic_vectors`; the table cannot be converted in SQL because the
+new keys are computed in the application. Semantic search and homolog
+similarity return nothing for a repository until its next ingest, which
+re-embeds it against the stored corpus. Nothing else is lost.
+
 ### Fixed
 
+- **Class capsules recalled about one dependency in eight.** A class holds
+  almost no edges of its own: its collaborators are named in its methods and,
+  for injected dependencies, in its constructor's parameter types, and those
+  members are tied to the class only by line-range nesting. The dependency
+  loader read the target's own edges and nothing else, so 94% of a class's
+  missed dependencies sat one hop away. A target of kind class, interface or
+  enum now draws its dependencies from every symbol nested in its range, minus
+  edges back into the container; functions and methods keep their own edges
+  only, so a nested closure is never mistaken for a dependency. Measured on the
+  nest repository with the same targets before and after: class recall 12.5% to
+  57.7%, with the capsule growing from 4,367 to 6,470 tokens; function and
+  method capsules byte-identical. `SCG_CAPSULE_MEMBER_DEPS=0` restores the old
+  query.
+- **Constructors were not indexed**, so a class built by dependency injection
+  read as isolated: `constructor(private config: ApplicationConfig)` produced
+  no edge at all. A constructor is now a `method` symbol named `constructor`,
+  with behaviour and effect hints. `SCG_INDEX_CONSTRUCTORS=0` reverts.
+- **A JavaScript repository was compiled one file at a time.** A group of
+  plain JS files under a tsconfig without `allowJs` (or under no tsconfig, where
+  the defaults leave it off) was refused wholesale by the program and then
+  re-extracted file by file, each with a fresh program that reloaded the whole
+  standard library: a 141-file repository spent about 110 s repeating that
+  instead of the 2 s one shared program costs. JS is accepted up front for such
+  a group. Measured: express 119 s to 13 s; react from about an hour to 5.9 min.
+- **Python extraction spawned one interpreter per file**, paying the libcst
+  import and process startup every time — a 3,000-file repository spent about
+  twenty minutes almost entirely in startup. `extractor.py --batch` extracts
+  200 files per interpreter, results travel through a file keyed by path, a
+  per-file failure is isolated to that file, and a batch that cannot run falls
+  back to the per-file path. Measured: django 21 minutes to 8.9 minutes with
+  identical symbols.
+- **A re-index with nothing changed minted a full duplicate snapshot.** Every
+  full pass wrote a new snapshot — a complete copy of the repository's symbol
+  versions and everything derived from them — even when every file matched the
+  parent by content hash. On the measured database twenty snapshots held
+  584,411 symbol versions for 58,259 distinct bodies. An unchanged repository
+  now reuses its parent snapshot and reports `unchanged: true`.
+- **Embedding a symbol against a missing corpus wrote plain term-frequency
+  vectors.** With no IDF corpus every token took a default weight of 1.0, so
+  the stored vector disagreed silently with its neighbours. A snapshot with no
+  corpus now takes the full embedding pass, which builds one, and a batch loads
+  the corpus once rather than once per symbol.
+- **A wrong `CONTEXTZERO_ENV_FILE` surfaced as a password error.** Both config
+  modules loaded the file quietly and discarded the result, so a path that did
+  not resolve produced no error and the process came up with nothing
+  configured, failing later with "SASL: client password must be a string". An
+  explicitly named file that does not exist or cannot be read now fails at
+  startup and says which file. `npm run doctor` already reported this; the
+  runtime agrees with it.
+- **A client that closed its pipe left the bridge running.** Windows delivers
+  no signal to a child whose parent died, and a client exiting without
+  signalling leaves the bridge indexing and holding its advisory locks; four
+  such orphans were found alive on one machine, the largest at 1,806 MB. End,
+  close or error on stdin now triggers the same graceful shutdown as SIGTERM.
+- **Shutdown closed the connection pool under the startup retention pass.**
+  The bridge fires retention on startup without awaiting it, and a short
+  session — the CI cold-start smoke is one — shut down while that pass was still
+  running, so its remaining phases each failed with "Database driver has been
+  closed": four error lines per session that every check still passed. A
+  runner now keeps one pass in flight, shutdown waits for the phase that is
+  running, and the pass starts no further phase once a stop is requested.
+  The same drain applies to the HTTP interface's scheduled pass.
+- **Every Docker install crash-looped on first boot.** Compose mounted
+  `db/schema.sql` into `docker-entrypoint-initdb.d`, so Postgres created every
+  table, and the server's migration runner then met tables with an empty ledger,
+  failed `001_initial_schema.sql` on `relation "repositories" already exists`,
+  refused to start, and restarted forever. The README's documented install
+  path had never worked on a clean machine. Docker now uses the migration
+  runner like every other install.
+- **The package-boundary gate died on npm 12**, whose `npm pack --json` returns
+  an object keyed by package name where every earlier client returned an array.
+  Both shapes are read, and neither carrying a file list fails with a sentence
+  rather than a stack trace.
+- **Lint failed on every push over one loop form**: `while (true)` in the
+  tsconfig walk, a constant condition under eslint 8. It is now `for (;;)`, the
+  form the other unbounded loops here already use.
 - **Module-level destructured declarations are indexed.** `export const { query,
   transaction } = db` declares real, importable names. The TypeScript adapter
   skipped the whole declaration and recorded a `destructuring_binding_skipped`
@@ -20,8 +102,108 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   pattern. Measured effect on this repository's own ingest: +6 symbols, +34
   relations (0.16%).
 
+### Changed
+
+- **Semantic vectors are stored packed, and a MinHash signature only where it
+  carries signal.** On a database of 584,411 symbol versions `semantic_vectors`
+  held 5,857 MB, 2,928 MB of it the signature column, 2,360 MB of that on the
+  four views whose average width is 0 to 5 tokens — sets the sparse vector
+  already described exactly. A signature is now stored as packed `bytea`, only
+  for a view of 8 or more tokens; a narrower view is compared by exact Jaccard
+  over the sparse vector's keys, which is the value the signature estimated
+  (migration 023). Sparse vectors are six bytes per term — a 32-bit token hash
+  and a 16-bit quantized weight — instead of 28.2 as JSONB, where 98,924 terms
+  drew on 4,930 distinct tokens and each token was spelled out about twenty
+  times (migration 025). The surrogate `vector_id` is gone; the natural key is
+  the primary key.
+- **Semantic search retrieves through an inverted index.** Search was built on
+  the LSH band index, which answers "is this a near-duplicate of that", not
+  "which bodies contain these terms": a short query never collides with a long
+  body, so every search fell through to a linear scan that decoded every vector
+  in the snapshot — 583 ms at p50 on a 22k-symbol repository while the band
+  index, the largest in the database, showed 0 scans. The body view now carries
+  its distinct token hashes under a partial GIN index, and a query probes with
+  its most distinctive hashes. A symbol sharing no term with the query scores
+  exactly zero, so this is the exact candidate set, not an approximation
+  (migration 026). Band keys remain for homolog candidates.
+- **Hash indexes match the queries that use them, and autovacuum keeps up.**
+  Three homolog dedup indexes were never scanned because every lookup is
+  snapshot-scoped and the planner preferred the snapshot index; they now lead
+  with `snapshot_id`. Two indexes no query could use are dropped. Sixteen
+  churn tables get fixed-count vacuum and analyze thresholds instead of a
+  percentage, so a 2.9-million-row table is vacuumed after a bounded amount of
+  garbage rather than after 580,000 dead tuples (migration 024).
+- **Delta ingest carries vectors, the IDF corpus and effect signatures
+  forward** for files whose content hash matches the parent, and embeds only the
+  symbols extraction produced. Recomputing vectors for unchanged code was the
+  single most expensive part of an incremental pass.
+- **TypeScript extraction runs in a child process that exits.** A compiler
+  program loads every transitively imported file plus the ambient type surface;
+  on a 151-file tree extraction took the process from 75 MB to 852 MB resident,
+  and V8 never returned the pages — the heap fell to 188 MB after collection
+  while RSS stayed at 844 MB. In a long-lived bridge one index left the process
+  ten times larger for its life. The compiler now runs in a worker that exits,
+  and only its result crosses back through a file. `SCG_TS_ISOLATED=false`
+  extracts in-process.
+
+### Added
+
+- `scripts/bench-storage.mjs` reports what an index costs against the source it
+  describes, split into heap and index and per vector column, and what a
+  second pass over unchanged source writes — which should be nothing and for a
+  long time was not. `scripts/bench-e2e.mjs` measures ingest, storage, every
+  read handler's latency at p50/p95/p99 over rotating inputs, and how many of
+  those calls actually returned an answer.
+- The quality benchmark takes `CZ_BENCH_ORDER=det`, which picks the same
+  targets on every run so a before/after isolates the change, and
+  `CZ_BENCH_KIND`, which restricts targets to one symbol kind.
+- `BEHAVIOUR-DECISIONS.md` records why the engine behaves as it does where the
+  code alone does not say so, and what a regression looks like from the user's
+  side.
+- A test fails when `db/schema.sql` is older than the newest migration; the
+  file had been generated before migration 026 existed and shipped without it.
+- The CI cold-start smoke fails on any error-level log line. The retention
+  race above logged four while every existing check passed.
+- `.env.example` documents `SCG_TS_ISOLATED`, `SCG_INDEX_CONSTRUCTORS` and
+  `SCG_CAPSULE_MEMBER_DEPS`.
+
+### Security
+
+- **The API interface accepted unauthenticated network traffic outside
+  production.** The startup guard demanded `SCG_API_KEYS` only under
+  `NODE_ENV=production`, so a non-production process told to listen on
+  `0.0.0.0` — the address the bundled Compose file uses — served the network
+  with no authentication. Any non-loopback bind that carries no API keys is now
+  refused regardless of `NODE_ENV`; the policy lives in `bind-guard.ts` as pure
+  functions with unit tests.
+- `SECURITY.md` names `security@classeve.com` for reports.
+- Every third-party action in the workflows is pinned to a commit SHA; a tag
+  can be moved, a commit cannot.
+- The `fast-uri` and `qs` advisories the audit gate failed on are resolved by
+  transitive patch releases; nothing in `package.json` moves.
+
+### Testing
+
+- The install path the README prints is now run in CI: copy the Docker env
+  example, set the three values, `docker compose up -d`, wait on the image's
+  own health check, then assert that `/health` answers, a protected route
+  refuses a caller with no key, and the configured key is accepted on a route
+  that reads the database. The gate's env substitution set values in place
+  rather than appending duplicates, and the authenticated `/ready` proves the
+  migration ledger is populated rather than empty behind a pre-seeded schema.
+- The quality benchmark resolves ESM specifiers: `import "./core.js"` where the
+  file on disk is `core.ts` was unresolvable, which read out as 0% recall on
+  modern repositories that in fact delivered their dependencies. It also
+  measures TypeScript and JavaScript recall only; other languages' ground truth
+  is not parsed yet.
+- Watcher tests drive the debounce through the captured `fs.watch` callback
+  and fake timers instead of writing real files and sleeping past an OS event,
+  which raced under parallel load.
+
 ### Documentation
 
+- `TECHNICAL_DESIGN.md` describes the packed vector storage, the signature
+  threshold, and the search index.
 - **BENCHMARKS.md: the unnamed clean-ingest figure is withdrawn.** The
   2026-08-20 run (2,637 files, 29,791 symbol versions, 34,818 relations, 5m 55s,
   ~7.4 files/sec) never recorded which repository it ingested, and the database

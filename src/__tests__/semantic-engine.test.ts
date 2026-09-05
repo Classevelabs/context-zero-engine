@@ -3,7 +3,8 @@
  * Covers: normalizeToken, tokenizeName, tokenizeBody, tokenizeSignature,
  *         tokenizeBehavior, tokenizeContract, computeTF, computeIDF,
  *         computeTFIDF, cosineSimilarity, generateMinHash,
- *         estimateJaccardFromMinHash, computeBandHashes, multiViewSimilarity
+ *         estimateJaccardFromMinHash, computeBandHashes, multiViewSimilarity,
+ *         packMinHash, unpackMinHash, jaccardFromSparse
  */
 
 import {
@@ -25,6 +26,15 @@ import {
   computeBandHashes,
   multiViewSimilarity,
   LSH_ROWS_PER_BAND,
+  MINHASH_MIN_TOKENS,
+  packMinHash,
+  unpackMinHash,
+  jaccardFromSparse,
+  packSparseVector,
+  unpackSparseVector,
+  hashSparseKeys,
+  tokenHashesInt32,
+  distinctiveQueryHashes,
 } from "../semantic-engine/similarity"
 
 import type { SparseVector } from "../semantic-engine/similarity"
@@ -762,5 +772,223 @@ describe("end-to-end tokenizer → similarity pipeline", () => {
 
     // A and B are similar functions, A and C are not
     expect(simAB).toBeGreaterThan(simAC)
+  })
+})
+
+// ────────── Packed MinHash Storage ──────────
+
+describe("packMinHash / unpackMinHash", () => {
+  it("round-trips a signature unchanged", () => {
+    const signature = generateMinHash(new Set(["alpha", "beta", "gamma", "delta"]), 128)
+    expect(unpackMinHash(packMinHash(signature))).toEqual(signature)
+  })
+
+  it("packs four bytes per permutation", () => {
+    expect(packMinHash(generateMinHash(new Set(["a", "b"]), 128))).toHaveLength(512)
+  })
+
+  it("preserves the full unsigned 32-bit range", () => {
+    // 0xFFFFFFFF is the empty-set sentinel; a signed round-trip would return -1.
+    const signature = [0, 1, 0x7fffffff, 0x80000000, 0xffffffff]
+    expect(unpackMinHash(packMinHash(signature))).toEqual(signature)
+  })
+
+  it("reads NULL as absent rather than empty", () => {
+    // Distinguishes "no signature stored" from "signature of nothing", which is
+    // what lets the reader choose the exact path.
+    expect(unpackMinHash(null)).toBeNull()
+    expect(unpackMinHash(undefined)).toBeNull()
+    expect(unpackMinHash(Buffer.alloc(0))).toBeNull()
+  })
+
+  it("accepts a Uint8Array as well as a Buffer", () => {
+    const packed = packMinHash([7, 8, 9])
+    expect(unpackMinHash(new Uint8Array(packed))).toEqual([7, 8, 9])
+  })
+})
+
+describe("jaccardFromSparse", () => {
+  const vec = (...tokens: string[]): SparseVector => Object.fromEntries(tokens.map((t) => [t, 1]))
+
+  it("returns 1 for identical key sets", () => {
+    expect(jaccardFromSparse(vec("a", "b"), vec("a", "b"))).toBe(1)
+  })
+
+  it("returns 0 for disjoint key sets", () => {
+    expect(jaccardFromSparse(vec("a", "b"), vec("c", "d"))).toBe(0)
+  })
+
+  it("returns intersection over union", () => {
+    // {a,b,c} vs {b,c,d}: intersection 2, union 4
+    expect(jaccardFromSparse(vec("a", "b", "c"), vec("b", "c", "d"))).toBeCloseTo(0.5, 10)
+  })
+
+  it("treats an empty vector as no overlap", () => {
+    expect(jaccardFromSparse(vec(), vec("a"))).toBe(0)
+    expect(jaccardFromSparse(vec("a"), vec())).toBe(0)
+  })
+
+  it("is symmetric regardless of which side is larger", () => {
+    const a = vec("a", "b", "c", "d")
+    const b = vec("c", "d")
+    expect(jaccardFromSparse(a, b)).toBeCloseTo(jaccardFromSparse(b, a), 10)
+  })
+
+  it("ignores inherited object properties", () => {
+    // A token literally named "constructor" must not count as a match.
+    expect(jaccardFromSparse(vec("constructor"), vec("toString"))).toBe(0)
+  })
+
+  it("is exact where the MinHash estimate is not, below the threshold", () => {
+    // Two 3-token sets sharing one token: true Jaccard is 1/5. A 128-permutation
+    // signature over sets this narrow cannot resolve that, which is why views
+    // under MINHASH_MIN_TOKENS store no signature and use this path instead.
+    const a = vec("read", "file", "sync")
+    const b = vec("read", "socket", "async")
+    expect(a).toBeDefined()
+    expect(MINHASH_MIN_TOKENS).toBeGreaterThan(3)
+    expect(jaccardFromSparse(a, b)).toBeCloseTo(0.2, 10)
+  })
+})
+
+// ────────── Packed Sparse Vector Storage ──────────
+
+describe("packSparseVector / unpackSparseVector", () => {
+  const vec = (entries: Record<string, number>): SparseVector => entries
+
+  it("uses six bytes per term", () => {
+    expect(packSparseVector(vec({ alpha: 0.5, beta: 0.25, gamma: 0.125 }))).toHaveLength(18)
+  })
+
+  it("round-trips weights within quantization error", () => {
+    const original = vec({ alpha: 0.5, beta: 0.25, gamma: 1.0 })
+    const decoded = unpackSparseVector(packSparseVector(original))
+    const hashed = hashSparseKeys(original)
+    for (const key of Object.keys(hashed)) {
+      expect(decoded[key]).toBeCloseTo(hashed[key]!, 4)
+    }
+  })
+
+  it("decodes onto the same keys hashSparseKeys produces", () => {
+    // This is what lets a text query be compared against a stored vector.
+    const original = vec({ read: 0.6, write: 0.8 })
+    expect(Object.keys(unpackSparseVector(packSparseVector(original))).sort()).toEqual(
+      Object.keys(hashSparseKeys(original)).sort(),
+    )
+  })
+
+  it("preserves cosine similarity through the encoding", () => {
+    const a = vec({ read: 0.6, write: 0.8 })
+    const b = vec({ read: 0.8, write: 0.6 })
+    const direct = cosineSimilarity(hashSparseKeys(a), hashSparseKeys(b))
+    const stored = cosineSimilarity(unpackSparseVector(packSparseVector(a)), unpackSparseVector(packSparseVector(b)))
+    expect(stored).toBeCloseTo(direct, 4)
+  })
+
+  it("keeps a self-comparison at 1", () => {
+    const stored = unpackSparseVector(packSparseVector(vec({ a: 0.6, b: 0.8 })))
+    expect(cosineSimilarity(stored, stored)).toBeCloseTo(1, 6)
+    expect(jaccardFromSparse(stored, stored)).toBe(1)
+  })
+
+  it("emits terms in ascending hash order so encoding is deterministic", () => {
+    const packed = packSparseVector(vec({ zebra: 0.3, apple: 0.7, mango: 0.5 }))
+    const hashes: number[] = []
+    for (let i = 0; i < packed.length; i += 6) hashes.push(packed.readUInt32BE(i))
+    expect(hashes).toEqual([...hashes].sort((x, y) => x - y))
+    // Same term set, different insertion order, identical bytes — this is what
+    // lets an unchanged symbol be carried forward rather than rewritten.
+    expect(packSparseVector(vec({ apple: 0.7, mango: 0.5, zebra: 0.3 }))).toEqual(packed)
+  })
+
+  it("never quantizes a present term away to absent", () => {
+    // A term whose weight rounds below one unit is still a term the key set
+    // contains, and Jaccard is answered from the key set.
+    const decoded = unpackSparseVector(packSparseVector(vec({ tiny: 1e-9, big: 1.0 })))
+    expect(Object.keys(decoded)).toHaveLength(2)
+    for (const value of Object.values(decoded)) expect(value).toBeGreaterThan(0)
+  })
+
+  it("drops non-finite and non-positive weights", () => {
+    const decoded = unpackSparseVector(
+      packSparseVector(vec({ ok: 0.5, zero: 0, negative: -1, nan: Number.NaN, inf: Number.POSITIVE_INFINITY })),
+    )
+    expect(Object.keys(decoded)).toHaveLength(1)
+  })
+
+  it("decodes empty and truncated input to an empty vector rather than throwing", () => {
+    expect(unpackSparseVector(null)).toEqual({})
+    expect(unpackSparseVector(Buffer.alloc(0))).toEqual({})
+    expect(unpackSparseVector(Buffer.alloc(3))).toEqual({})
+  })
+
+  it("accepts a Uint8Array as well as a Buffer", () => {
+    const packed = packSparseVector(vec({ alpha: 0.5 }))
+    expect(unpackSparseVector(new Uint8Array(packed))).toEqual(unpackSparseVector(packed))
+  })
+
+  it("merges terms that collide onto one dimension", () => {
+    // Two tokens sharing a hash share a dimension; their weights belong to it
+    // jointly, and the vector must not silently lose one of them.
+    const decoded = unpackSparseVector(packSparseVector(vec({ alpha: 0.25, beta: 0.5 })))
+    const total = Object.values(decoded).reduce((sum, v) => sum + v, 0)
+    expect(total).toBeCloseTo(0.75, 3)
+  })
+})
+
+// ────────── Inverted-index helpers (migration 026) ──────────
+
+describe("tokenHashesInt32", () => {
+  it("returns the distinct token hashes as signed 32-bit integers", () => {
+    const hashes = tokenHashesInt32(["read", "file", "read"])
+    expect(hashes).toHaveLength(2) // "read" deduped
+    for (const h of hashes) {
+      expect(Number.isInteger(h)).toBe(true)
+      expect(h).toBeGreaterThanOrEqual(-2147483648)
+      expect(h).toBeLessThanOrEqual(2147483647)
+    }
+  })
+
+  it("agrees with the keys of a packed sparse vector for the same tokens", () => {
+    // The inverted index and the stored vector must key on the same identity,
+    // or a probe could never match a body that contains the term.
+    const tokens = ["parse", "config", "validate"]
+    const fromHashes = new Set(tokenHashesInt32(tokens))
+    const vec: SparseVector = Object.fromEntries(tokens.map((t) => [t, 1]))
+    const fromVector = new Set(
+      Object.keys(unpackSparseVector(packSparseVector(vec))).map((k) => Number(k) | 0),
+    )
+    expect(fromHashes).toEqual(fromVector)
+  })
+
+  it("is empty for no tokens", () => {
+    expect(tokenHashesInt32([])).toEqual([])
+  })
+})
+
+describe("distinctiveQueryHashes", () => {
+  it("keeps the highest-weighted terms and drops the rest past the cap", () => {
+    const vec: SparseVector = {}
+    for (let i = 0; i < 50; i++) vec[String(1000 + i)] = i / 50 // ascending weight
+    const kept = distinctiveQueryHashes(vec, 10)
+    expect(kept).toHaveLength(10)
+    // The ten kept must be the ten highest-weighted keys (1040..1049).
+    const keptSet = new Set(kept.map((h) => h >>> 0))
+    for (let i = 40; i < 50; i++) expect(keptSet.has(1000 + i)).toBe(true)
+  })
+
+  it("returns every term when under the cap", () => {
+    const vec: SparseVector = { "10": 0.9, "20": 0.5, "30": 0.1 }
+    expect(distinctiveQueryHashes(vec, 32).sort()).toEqual([10, 20, 30])
+  })
+
+  it("maps unsigned-hash-string keys back to the signed ints storage uses", () => {
+    // 0xFFFFFFF5 as an unsigned key must probe as the signed value the column holds.
+    const vec: SparseVector = { "4294967285": 1 }
+    expect(distinctiveQueryHashes(vec)).toEqual([-11])
+  })
+
+  it("is empty for an empty vector", () => {
+    expect(distinctiveQueryHashes({})).toEqual([])
   })
 })

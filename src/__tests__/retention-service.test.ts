@@ -249,6 +249,35 @@ describe("runRetentionPolicy", () => {
     // disables retention permanently.
     expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
   })
+
+  it("stops between phases once shutdown asks it to, and still releases the lock", async () => {
+    // Shutdown closed the pool while the startup pass was inside it, and the
+    // four phases still to run each failed with "Database driver has been
+    // closed". With a stop request the pass finishes the phase it is in and
+    // starts no other, so the pool is closed after the last query, not during it.
+    const control = { stopping: false }
+    // Phase 0 runs; while it runs, shutdown begins.
+    mockQuery.mockImplementationOnce(async () => {
+      control.stopping = true
+      return { rows: [], rowCount: 0 }
+    })
+
+    const result = await runRetentionPolicy(control)
+
+    expect(mockQuery).toHaveBeenCalledTimes(1)
+    expect(result.stoppedBefore).toBe("stale_transactions")
+    expect(result.errors).toHaveLength(0)
+    expect(mockAdvisoryRelease).toHaveBeenCalledTimes(1)
+  })
+
+  it("runs every phase when no control is given, as an admin-triggered pass does", async () => {
+    for (let i = 0; i < 7; i++) mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
+    const result = await runRetentionPolicy()
+
+    expect(result.stoppedBefore).toBeUndefined()
+    expect(mockQuery).toHaveBeenCalledTimes(7)
+  })
 })
 
 // ────────── getRetentionStats ──────────

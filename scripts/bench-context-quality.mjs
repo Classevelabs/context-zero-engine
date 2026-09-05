@@ -69,6 +69,15 @@ const N = parseInt(process.argv[2] || "40", 10)
 const BUDGET = parseInt(process.env.CZ_BENCH_BUDGET || "8000", 10)
 const MIN_NAME = parseInt(process.env.CZ_BENCH_MIN_NAME || "12", 10)
 const DIAGNOSE = process.env.CZ_BENCH_DIAGNOSE === "1"
+// RANDOM() sampling makes two runs measure different targets — fine for a single
+// estimate, useless for an A/B where the graphs differ. CZ_BENCH_ORDER=det picks
+// the same targets deterministically (largest bodies first) so a before/after
+// isolates the change rather than the dice. The qualifying population is stable
+// as long as what is toggled does not itself qualify as a target.
+const TARGET_ORDER =
+  process.env.CZ_BENCH_ORDER === "det"
+    ? "LENGTH(COALESCE(sv.body_source,'')) DESC, s.canonical_name, f.path"
+    : "RANDOM()"
 const diagnosis = { edgeExistsNotChosen: 0, noEdgeRecorded: 0, samples: [], notChosen: [] }
 const tok = (bytes) => Math.round(bytes / 4)
 const IDENT = /[A-Za-z_$][A-Za-z0-9_$]*/g
@@ -135,8 +144,23 @@ const referencing = (name) => {
 
 // ------------------------------------------------------ module resolution ---
 const EXTS = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", "/index.ts", "/index.tsx", "/index.js"]
+// ESM-in-TypeScript writes the emitted extension in the specifier — `import ...
+// from "./core.js"` where the file on disk is `core.ts`. The compiler, the
+// bundler and the engine all resolve that to the .ts; a resolver that only
+// tried `core.js` literally dropped nearly every import in a modern ESM repo
+// (zod: 99.5% of internal imports unresolved), which reads out as 0% recall for
+// a graph that in fact delivered them. Map an emitted JS extension back to its
+// source twin. This only ever returns a file already in the indexed corpus, so
+// it cannot invent a dependency — it removes a blind spot, it does not add reach.
+const JS_TO_TS = { ".js": [".ts", ".tsx"], ".jsx": [".tsx"], ".mjs": [".mts"], ".cjs": [".cts"] }
 const hit = (base) => {
   for (const e of EXTS) if (corpus.has(base + e)) return base + e
+  const m = base.match(/\.(?:js|jsx|mjs|cjs)$/)
+  if (m) {
+    const stem = base.slice(0, -m[0].length)
+    for (const e of JS_TO_TS[m[0]]) if (corpus.has(stem + e)) return stem + e
+    for (const e of EXTS) if (corpus.has(stem + e)) return stem + e
+  }
   return null
 }
 const packageRootOf = (relPath) => {
@@ -290,13 +314,19 @@ for (const r of defRes.rows) {
   allSymbolNames.add(r.name)
 }
 
+// CZ_BENCH_KIND restricts the target population to one symbol kind (e.g. class)
+// so the class-capsule DI gap can be measured apart from methods/functions,
+// which have no dotted members for a traversal fix to reach.
+const KINDS = process.env.CZ_BENCH_KIND
+  ? process.env.CZ_BENCH_KIND.split(",").map((k) => "'" + k.trim().replace(/'/g, "") + "'").join(",")
+  : "'function','method','class'"
 const targets = await db.query(
   "SELECT sv.symbol_version_id, s.canonical_name AS name, f.path AS file_path," +
     " sv.range_start_line, sv.range_end_line" +
     " FROM symbol_versions sv JOIN symbols s USING(symbol_id) JOIN files f ON f.file_id = sv.file_id" +
-    " WHERE f.snapshot_id = $1 AND s.kind IN ('function','method','class')" +
+    " WHERE f.snapshot_id = $1 AND s.kind IN (" + KINDS + ")" +
     " AND LENGTH(COALESCE(sv.body_source,'')) > 500 AND LENGTH(s.canonical_name) >= $3" +
-    " ORDER BY RANDOM() LIMIT $2",
+    " ORDER BY " + TARGET_ORDER + " LIMIT $2",
   [snapshotId, N, MIN_NAME],
 )
 

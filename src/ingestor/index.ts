@@ -11,6 +11,7 @@
 
 import * as fs from "fs"
 import * as fsp from "fs/promises"
+import * as os from "os"
 import * as path from "path"
 import * as crypto from "crypto"
 import { execFile } from "child_process"
@@ -155,6 +156,13 @@ const MAX_FILE_COUNT = boundedConfigInteger(ingestionConfig.maxFilesPerRepo, 100
 const INGEST_WORKER_CONCURRENCY = boundedConfigInteger(ingestionConfig.workerConcurrency, 8, 1, 32)
 const PYTHON_TIMEOUT_MS = boundedConfigInteger(ingestionConfig.pythonTimeout, 30_000, 1_000, 5 * 60_000)
 const MAX_PYTHON_OUTPUT_BYTES = 16 * 1024 * 1024
+// Files per Python interpreter invocation. libcst is imported once per chunk,
+// not once per file, so this collapses thousands of process+import startups into
+// a handful; kept modest so one interpreter's peak memory stays bounded.
+const PYTHON_BATCH_SIZE = 200
+// A batch's timeout scales with its file count (per-file budget × count) but is
+// capped so a pathological chunk cannot hang the ingest indefinitely.
+const MAX_PYTHON_BATCH_TIMEOUT_MS = 10 * 60_000
 const MAX_INCREMENTAL_PATHS = 500
 
 /**
@@ -377,11 +385,13 @@ export class Ingestor {
       }
       const languageSet = new Set<string>()
 
+      let indexableCount = 0
       for (const filePath of files) {
         const ext = path.extname(filePath)
         const lang = LANGUAGE_MAP[ext]
         if (!lang) continue
 
+        indexableCount++
         languageSet.add(lang)
         const relativePath = toPortableRelativePath(path.relative(canonicalRepoPath, filePath))
         const contentHash = await this.hashFile(filePath)
@@ -404,10 +414,51 @@ export class Ingestor {
         queueForExtraction(filePath, lang)
       }
 
+      // 4.2 A snapshot that would be byte-identical to its parent is not worth
+      // minting. Every full pass previously wrote one regardless, and each is a
+      // complete copy of the repository's symbol versions and their derived
+      // artifacts: on the measured database 20 snapshots held 584,411 symbol
+      // versions standing for 58,259 distinct bodies, and a watcher re-running
+      // ingestion produced that duplication with no change to show for it.
+      //
+      // Equal counts on both sides plus every file unchanged means the file set
+      // is identical, since each discovered path was matched against the parent
+      // by content hash: deletions leave the parent larger, additions arrive as
+      // changed files.
+      if (parentSnapshotId && parentHashes && unchangedCount === indexableCount && parentHashes.size === indexableCount) {
+        log.info("Repository unchanged since parent snapshot — reusing it", {
+          parentSnapshotId,
+          files: indexableCount,
+        })
+        await db.query(`DELETE FROM snapshots WHERE snapshot_id = $1`, [snapshotId])
+
+        const parentCounts = await db.query(
+          `SELECT (SELECT count(*) FROM symbol_versions WHERE snapshot_id = $1) AS symbols,
+                  (SELECT count(*) FROM structural_relations sr
+                     JOIN symbol_versions sv ON sv.symbol_version_id = sr.src_symbol_version_id
+                    WHERE sv.snapshot_id = $1) AS relations`,
+          [parentSnapshotId],
+        )
+        const counts = firstRow(parentCounts)
+        return {
+          repo_id: repoId,
+          snapshot_id: parentSnapshotId,
+          files_processed: indexableCount,
+          files_failed: 0,
+          symbols_extracted: Number(counts?.["symbols"] ?? 0),
+          relations_extracted: Number(counts?.["relations"] ?? 0),
+          behavior_hints_extracted: 0,
+          contract_hints_extracted: 0,
+          duration_ms: Date.now() - startTime,
+          unchanged: true,
+        }
+      }
+
       // 4.5 Bulk-copy symbol data for unchanged files from parent snapshot.
       // This is the core of incremental ingestion: instead of re-parsing unchanged files,
       // copy their symbol_versions, behavioral_profiles, and contract_profiles in 3 SQL queries.
       let deltaCopySucceeded = false
+      let vectorsCarriedForward = 0
       if (parentSnapshotId && unchangedCount > 0) {
         try {
           // Copy symbol versions: join on matching (path + content_hash) files
@@ -535,20 +586,24 @@ export class Ingestor {
         }
       }
 
-      // 6. Extract from Python files (parallel worker pool, same pattern as tree-sitter)
+      // 6. Extract from Python files. One interpreter per CHUNK — libcst is
+      //    imported once per chunk, not once per file — with the chunks drained
+      //    by a small worker pool so several interpreters run at once without
+      //    ever reaching one process per file.
       if (pyPaths.length > 0) {
-        const PY_CONCURRENCY = Math.min(INGEST_WORKER_CONCURRENCY, pyPaths.length)
-        const pyWorkQueue = [...pyPaths] // copy — workers drain via .shift()
+        const pyChunks: string[][] = []
+        for (let i = 0; i < pyPaths.length; i += PYTHON_BATCH_SIZE) {
+          pyChunks.push(pyPaths.slice(i, i + PYTHON_BATCH_SIZE))
+        }
+        const pyChunkQueue = [...pyChunks] // workers drain via .shift()
         const pyResults: { result: AdapterExtractionResult | null; filePath: string }[] = []
+        const PY_CONCURRENCY = Math.min(INGEST_WORKER_CONCURRENCY, pyChunks.length)
 
         const pyExtractWorker = async (): Promise<void> => {
-          for (let pyPath = pyWorkQueue.shift(); pyPath; pyPath = pyWorkQueue.shift()) {
-            try {
-              const pyResult = await this.extractFromPython(pyPath, canonicalRepoPath)
-              pyResults.push({ result: pyResult, filePath: pyPath })
-            } catch (err) {
-              log.error("Python extraction failed", err, { file: pyPath })
-              pyResults.push({ result: null, filePath: pyPath })
+          for (let chunk = pyChunkQueue.shift(); chunk; chunk = pyChunkQueue.shift()) {
+            const batch = await this.extractFromPythonBatch(chunk, canonicalRepoPath)
+            for (const pyPath of chunk) {
+              pyResults.push({ result: batch.get(pyPath) ?? null, filePath: pyPath })
             }
           }
         }
@@ -689,6 +744,78 @@ export class Ingestor {
           [parentSnapshotId, snapshotId],
         )
         relationsExtracted += relationCopy.rowCount ?? 0
+
+        // Semantic vectors are a pure function of a symbol's token streams and
+        // the snapshot's IDF corpus. Copying symbol versions forward without
+        // them meant step 7.7 re-tokenized and re-embedded every unchanged
+        // symbol in the repository on every pass — the single most expensive
+        // part of ingestion, spent reproducing rows byte-for-byte. On the
+        // measured database that was 2,914,430 vector rows standing for 58,259
+        // distinct bodies.
+        //
+        // The content-hash join is the same guard the relation copy uses: only
+        // symbols whose file is byte-identical carry their vectors over.
+        const vectorCopy = await db.query(
+          `INSERT INTO semantic_vectors (
+               symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys, token_hashes
+           )
+           SELECT sv_new.symbol_version_id, sem.view_type, sem.sparse_vector,
+                  sem.minhash_signature, sem.token_count, sem.band_keys, sem.token_hashes
+           FROM semantic_vectors sem
+           JOIN symbol_versions sv_old
+             ON sv_old.symbol_version_id = sem.symbol_version_id AND sv_old.snapshot_id = $1
+           JOIN files file_old ON file_old.file_id = sv_old.file_id
+           JOIN files file_new
+             ON file_new.snapshot_id = $2
+            AND file_new.path = file_old.path
+            AND file_new.content_hash = file_old.content_hash
+           JOIN symbol_versions sv_new
+             ON sv_new.snapshot_id = $2 AND sv_new.symbol_id = sv_old.symbol_id
+           ON CONFLICT (symbol_version_id, view_type) DO NOTHING`,
+          [parentSnapshotId, snapshotId],
+        )
+        vectorsCarriedForward = vectorCopy.rowCount ?? 0
+
+        // The vectors above are weighted against the parent's corpus, so it has
+        // to come with them for embedSymbolVersions to weight the changed
+        // symbols on the same scale.
+        await db.query(
+          `INSERT INTO idf_corpus (corpus_id, snapshot_id, view_type, document_count, token_document_counts)
+           SELECT gen_random_uuid(), $2, view_type, document_count, token_document_counts
+           FROM idf_corpus WHERE snapshot_id = $1
+           ON CONFLICT (snapshot_id, view_type) DO NOTHING`,
+          [parentSnapshotId, snapshotId],
+        )
+
+        // Effect signatures are derived from the same unchanged bodies and were
+        // likewise being recomputed rather than carried.
+        await db.query(
+          `INSERT INTO effect_signatures (
+               effect_signature_id, symbol_version_id, effects, effect_class,
+               reads_resources, writes_resources, emits_events, calls_external,
+               mutates_state, requires_auth, throws_errors, source, confidence
+           )
+           SELECT gen_random_uuid(), sv_new.symbol_version_id, es.effects, es.effect_class,
+                  es.reads_resources, es.writes_resources, es.emits_events, es.calls_external,
+                  es.mutates_state, es.requires_auth, es.throws_errors, es.source, es.confidence
+           FROM effect_signatures es
+           JOIN symbol_versions sv_old
+             ON sv_old.symbol_version_id = es.symbol_version_id AND sv_old.snapshot_id = $1
+           JOIN files file_old ON file_old.file_id = sv_old.file_id
+           JOIN files file_new
+             ON file_new.snapshot_id = $2
+            AND file_new.path = file_old.path
+            AND file_new.content_hash = file_old.content_hash
+           JOIN symbol_versions sv_new
+             ON sv_new.snapshot_id = $2 AND sv_new.symbol_id = sv_old.symbol_id
+           ON CONFLICT (symbol_version_id, source) DO NOTHING`,
+          [parentSnapshotId, snapshotId],
+        )
+
+        log.info("Delta ingestion: carried derived artifacts from parent", {
+          snapshotId,
+          vectorsCarriedForward,
+        })
       }
 
       // Determine extraction health BEFORE running post-extraction analysis.
@@ -732,9 +859,17 @@ export class Ingestor {
         // NEW-002 fix: Run batch embedding as part of ingestion so that
         // semantic_intent_similarity in the homolog engine produces real
         // values instead of always 0.
+        //
+        // When the delta copy carried vectors over, the only symbols still
+        // needing embedding are the ones extraction actually produced, so this
+        // embeds exactly those against the corpus copied alongside them.
+        // batchEmbedSnapshot rebuilds the corpus from scratch and re-embeds
+        // every symbol, which on an unchanged repository is entirely wasted.
         try {
-          const embedded = await semanticEngine.batchEmbedSnapshot(snapshotId)
-          log.info("Semantic embeddings computed", { snapshotId, embedded })
+          const embedded = vectorsCarriedForward
+            ? await semanticEngine.embedSymbolVersions(await this.getUnembeddedSymbolVersionIds(snapshotId))
+            : await semanticEngine.batchEmbedSnapshot(snapshotId)
+          log.info("Semantic embeddings computed", { snapshotId, embedded, vectorsCarriedForward })
         } catch (err) {
           log.warn("Semantic embedding failed (non-fatal)", {
             snapshotId,
@@ -1287,6 +1422,85 @@ export class Ingestor {
     } catch (err) {
       log.error("Python extractor failed", err, { file: filePath })
       return null
+    }
+  }
+
+  /**
+   * Extract a batch of Python files in ONE interpreter invocation.
+   *
+   * The single-file path spawns `python extractor.py <file>` per file, and each
+   * spawn re-imports libcst (a few hundred milliseconds) on top of interpreter
+   * startup. On a repository of thousands of Python files that fixed cost — not
+   * the parsing — dominated the ingest (a 3,000-file repo spent ~20 minutes
+   * almost entirely in repeated startup). Passing a whole chunk to one process
+   * imports libcst once for the chunk. Results come back through a temp file
+   * keyed by path, because a large chunk's JSON is past the size where buffering
+   * a child's stdout is sensible — the same shape the TypeScript worker uses.
+   *
+   * A per-file failure inside the batch is isolated by the extractor and comes
+   * back as that file's own empty/absent result, so one unparseable file costs
+   * one file, not the chunk. If the batch process itself cannot run, the files
+   * fall back to the per-file path rather than losing the Python index.
+   */
+  private async extractFromPythonBatch(
+    filePaths: string[],
+    repoPath: string,
+  ): Promise<Map<string, AdapterExtractionResult | null>> {
+    const out = new Map<string, AdapterExtractionResult | null>()
+    if (filePaths.length === 0) return out
+
+    const extractorPath = path.join(__dirname, "..", "adapters", "py", "extractor.py")
+    try {
+      await fsp.access(extractorPath)
+    } catch {
+      log.warn("Python extractor not found", { path: extractorPath })
+      for (const f of filePaths) out.set(f, null)
+      return out
+    }
+
+    const jobId = crypto.randomBytes(8).toString("hex")
+    const jobFile = path.join(os.tmpdir(), `scg-py-job-${jobId}.json`)
+    const outFile = path.join(os.tmpdir(), `scg-py-out-${jobId}.json`)
+    const pythonCommand = process.env.PYTHON_BIN || (process.platform === "win32" ? "python" : "python3")
+
+    try {
+      await fsp.writeFile(jobFile, JSON.stringify({ files: filePaths, outFile }), "utf-8")
+      const batchTimeout = Math.min(PYTHON_TIMEOUT_MS * filePaths.length, MAX_PYTHON_BATCH_TIMEOUT_MS)
+      await execFileAsync(pythonCommand, [extractorPath, "--batch", jobFile], {
+        cwd: repoPath,
+        timeout: batchTimeout,
+        maxBuffer: MAX_PYTHON_OUTPUT_BYTES,
+        encoding: "utf-8",
+      })
+
+      const payload = await fsp.readFile(outFile, "utf-8")
+      const parsed: unknown = JSON.parse(payload)
+      const byPath = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>
+      for (const f of filePaths) {
+        const r = byPath[f]
+        if (r && typeof r === "object" && Array.isArray((r as Record<string, unknown>).symbols)) {
+          const extraction = r as AdapterExtractionResult
+          if (!Array.isArray(extraction.relations)) extraction.relations = []
+          if (!Array.isArray(extraction.behavior_hints)) extraction.behavior_hints = []
+          if (!Array.isArray(extraction.contract_hints)) extraction.contract_hints = []
+          out.set(f, extraction)
+        } else {
+          out.set(f, null)
+        }
+      }
+      return out
+    } catch (err) {
+      log.warn("Python batch extraction failed — falling back to per-file", {
+        error: err instanceof Error ? err.message : String(err),
+        fileCount: filePaths.length,
+      })
+      for (const f of filePaths) {
+        out.set(f, await this.extractFromPython(f, repoPath))
+      }
+      return out
+    } finally {
+      await fsp.rm(jobFile, { force: true }).catch(() => {})
+      await fsp.rm(outFile, { force: true }).catch(() => {})
     }
   }
 
@@ -1939,22 +2153,27 @@ export class Ingestor {
         }
       }
 
-      // 4. Re-extract Python
-      for (const pyPath of pyPaths) {
-        try {
-          const pyResult = await this.extractFromPython(pyPath, basePath)
+      // 4. Re-extract Python — batched so libcst is imported per chunk, not per
+      //    file, even when one change touches many Python files at once.
+      for (let i = 0; i < pyPaths.length; i += PYTHON_BATCH_SIZE) {
+        const chunk = pyPaths.slice(i, i + PYTHON_BATCH_SIZE)
+        const batch = await this.extractFromPythonBatch(chunk, basePath)
+        for (const pyPath of chunk) {
+          const pyResult = batch.get(pyPath) ?? null
           if (pyResult) {
-            const counts = await this.persistExtractionResult(pyResult, repoId, snapshotId, basePath, "python")
-            symbolsUpdated += counts.symbols
-            relationsUpdated += counts.relations
+            try {
+              const counts = await this.persistExtractionResult(pyResult, repoId, snapshotId, basePath, "python")
+              symbolsUpdated += counts.symbols
+              relationsUpdated += counts.relations
+            } catch (err) {
+              log.error("Incremental Python persistence failed", err, { file: pyPath })
+              recordFailedPath(pyPath)
+            }
           } else {
-            // extractFromPython returns null on failure rather than throwing —
+            // extractFromPythonBatch returns null for a file it could not parse —
             // without this branch the file just vanished from the graph.
             recordFailedPath(pyPath)
           }
-        } catch (err) {
-          log.error("Incremental Python extraction failed", err, { file: pyPath })
-          recordFailedPath(pyPath)
         }
       }
 
@@ -2250,6 +2469,27 @@ export class Ingestor {
              JOIN files f ON f.file_id = sv.file_id
              WHERE sv.snapshot_id = $1 AND f.path = ANY($2)`,
       [snapshotId, paths],
+    )
+    return (result.rows as { symbol_version_id: string }[]).map((row) => row.symbol_version_id)
+  }
+
+  /**
+   * Symbol versions in a snapshot that have no semantic vectors yet.
+   *
+   * After the delta copy, this is exactly the set extraction produced: every
+   * carried-over symbol already holds its vectors, so embedding them again
+   * would rewrite identical rows.
+   */
+  private async getUnembeddedSymbolVersionIds(snapshotId: string): Promise<string[]> {
+    const result = await db.query(
+      `SELECT sv.symbol_version_id
+             FROM symbol_versions sv
+             WHERE sv.snapshot_id = $1
+               AND NOT EXISTS (
+                 SELECT 1 FROM semantic_vectors sem
+                 WHERE sem.symbol_version_id = sv.symbol_version_id
+               )`,
+      [snapshotId],
     )
     return (result.rows as { symbol_version_id: string }[]).map((row) => row.symbol_version_id)
   }

@@ -1017,9 +1017,52 @@ def _empty_result(flags: List[str]) -> Dict[str, Any]:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def _run_batch(job_file: str) -> None:
+    """Extract many files inside ONE interpreter.
+
+    libcst costs a few hundred milliseconds to import, and the old contract —
+    one `python extractor.py <file>` per file — paid that import, plus process
+    startup, once per file. On a repository of a few thousand Python files that
+    was the dominant cost of the whole ingest. Here the import happens once and
+    every file in the batch reuses it.
+
+    A per-file crash is isolated to that file's own result, exactly as the
+    single-file path returns an empty result rather than aborting. Results
+    travel back through a file, not stdout: a large batch's JSON reaches tens of
+    megabytes, past the point where buffering a child's stdout is sensible — the
+    same shape the TypeScript worker uses.
+    """
+    with open(job_file, "r", encoding="utf-8") as fh:
+        job = json.load(fh)
+    files = job.get("files", [])
+    out_file = job["outFile"]
+
+    results: Dict[str, Any] = {}
+    for filepath in files:
+        try:
+            if not os.path.isfile(filepath):
+                results[filepath] = _empty_result(["file_not_found"])
+                continue
+            results[filepath] = extract(filepath)
+        except Exception as exc:  # one poison file must not cost the batch
+            results[filepath] = _empty_result(["extraction_error"])
+            print(f"batch: extract failed for {filepath}: {exc}", file=sys.stderr)
+
+    with open(out_file, "w", encoding="utf-8") as fh:
+        json.dump(results, fh)
+
+
 if __name__ == "__main__":
+    # Batch mode: `extractor.py --batch <jobfile>`. The job file is
+    # {"files": [...absolute paths...], "outFile": "..."}; results are written
+    # there as {filepath: AdapterExtractionResult}. Single-file mode below is
+    # unchanged so existing callers and tests keep working.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--batch":
+        _run_batch(sys.argv[2])
+        sys.exit(0)
+
     if len(sys.argv) < 2:
-        print("Usage: python extractor.py <filepath>", file=sys.stderr)
+        print("Usage: python extractor.py <filepath> | --batch <jobfile>", file=sys.stderr)
         sys.exit(1)
 
     filepath = sys.argv[1]

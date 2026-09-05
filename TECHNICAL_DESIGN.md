@@ -576,16 +576,15 @@ Fields:
 Sparse TF-IDF vectors and MinHash signatures stored per symbol-version per view.
 
 Fields:
-- `vector_id`
-- `symbol_version_id`
-- `snapshot_id`
-- `view_type` (name, body, signature, behavior, contract)
-- `sparse_vector` (JSONB — token:weight pairs)
-- `minhash_signature` (JSONB — 128-permutation MinHash)
+- `symbol_version_id`, `view_type` (name, body, signature, behavior, contract) — together the primary key
+- `sparse_vector` (BYTEA — packed terms, six bytes each: a 32-bit token hash and a 16-bit quantized weight, sorted by hash)
+- `minhash_signature` (BYTEA — 128 permutations as 32-bit words; NULL for a view under 8 tokens, which is compared by exact Jaccard over the sparse vector's keys instead)
+- `token_count`
+- `band_keys` (INTEGER[] — LSH band keys derived from the signature, GIN-indexed; NULL where there is no signature)
+- `token_hashes` (INTEGER[] — the body view's distinct token hashes, GIN-indexed: the inverted index semantic search probes)
 
 Supporting tables:
 - `idf_corpus` — inverse document frequency per snapshot/view_type
-- `lsh_bands` — locality-sensitive hashing bands (16 bands x 8 rows) for sub-linear candidate retrieval
 
 ### EvidenceBundle
 Fields:
@@ -663,8 +662,9 @@ Fields:
 **Native TF-IDF + MinHash + LSH** (implemented in `semantic-engine/`)
 - No external vector database required (no pgvector, no Qdrant)
 - 5-view tokenization with L2-normalized sparse TF-IDF vectors
-- MinHash signatures (128 permutations) with BigInt arithmetic
-- LSH banding (16 bands x 8 rows) for sub-linear candidate retrieval
+- MinHash signatures (128 permutations) with BigInt arithmetic, stored only for views of 8 or more tokens
+- LSH banding (16 bands x 8 rows) for near-duplicate candidate retrieval
+- An inverted index over body token hashes for search: a query can only match a body that shares a term with it
 - Cosine similarity for precise scoring
 
 ### Lexical/code search
@@ -808,7 +808,7 @@ Generate per-symbol multi-view TF-IDF vectors with 5 views:
 - **behavior** (weight: 0.15) — purity class, resource touches, effect patterns
 - **contract** (weight: 0.10) — input/output/error contract tokens
 
-Vectors stored per symbol_version in `semantic_vectors` table with MinHash signatures (128 permutations) and LSH bands (16 bands x 8 rows).
+Vectors stored per symbol_version in the `semantic_vectors` table as packed binary terms, with a MinHash signature (128 permutations) and its LSH band keys (16 bands x 8 rows) on views wide enough to carry one, and the body view's token hashes for the search index.
 
 ## 14.7 Stage 7: Candidate generation
 Generate homolog candidates using 5 buckets:

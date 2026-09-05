@@ -25,6 +25,7 @@ import { runPendingMigrations } from "../db-driver/migrate"
 import { transactionalChangeEngine } from "../transactional-editor"
 import { features, logging, retention as retentionConfig, server as serverConfig, watcher as watcherConfig } from "../config"
 import { runRetentionPolicy } from "../services/retention-service"
+import { RetentionRunner } from "../retention-runner"
 import { isMutatingMcpTool } from "./security"
 import {
   handleResolveSymbol,
@@ -257,6 +258,7 @@ const SERVER_VERSION = serverConfig.version
 let toolsRegistered = 0
 let healthCheckTimerRef: ReturnType<typeof setInterval> | null = null
 let retentionTimerRef: ReturnType<typeof setInterval> | null = null
+let retentionRunner: RetentionRunner | null = null
 let activeWatcher: import("../watcher").Watcher | null = null
 
 const server = new McpServer(
@@ -1637,13 +1639,16 @@ async function main(): Promise<void> {
   // load-bearing piece: it enforces the per-repo snapshot cap + age expiry immediately on connect.
   // Both the startup run and the interval are non-blocking and never crash the bridge.
   if (retentionConfig.retentionEnabled) {
-    const prune = () =>
-      runRetentionPolicy().catch((err) =>
-        log.error("Retention policy run failed", err instanceof Error ? err : new Error(String(err))),
-      )
-    void prune() // immediate prune on startup — the interval alone never fires in a short session
+    // The runner keeps at most one pass in flight and lets shutdown wait for
+    // it — retention-runner.ts has the "Database driver has been closed"
+    // errors that closing the pool under the startup pass produced.
+    retentionRunner = new RetentionRunner(
+      (control) => runRetentionPolicy(control),
+      (err) => log.error("Retention policy run failed", err instanceof Error ? err : new Error(String(err))),
+    )
+    retentionRunner.trigger() // immediate prune on startup — the interval alone never fires in a short session
     if (retentionConfig.retentionIntervalMinutes > 0) {
-      retentionTimerRef = setInterval(prune, retentionConfig.retentionIntervalMinutes * 60_000)
+      retentionTimerRef = setInterval(() => retentionRunner?.trigger(), retentionConfig.retentionIntervalMinutes * 60_000)
       retentionTimerRef.unref() // don't keep the process alive for it
     }
     log.info("Retention policy active", {
@@ -1725,6 +1730,12 @@ async function shutdown(signal: string): Promise<void> {
     clearInterval(retentionTimerRef)
     retentionTimerRef = null
   }
+  if (retentionRunner) {
+    // A pass still running holds pool connections; closing the pool beneath it
+    // is what logged four "Database driver has been closed" errors on every
+    // short session. stop() returns once the current phase has finished.
+    await retentionRunner.stop()
+  }
   if (activeWatcher) {
     // Releases the per-repository advisory locks, so the next bridge to start
     // can take over watching instead of finding them held by a dead session.
@@ -1762,6 +1773,32 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   void shutdown("SIGINT")
 })
+
+// A stdio MCP server outlives nothing: when the client goes, so does its
+// reason to exist. Signals do not carry that news. Windows delivers neither
+// SIGTERM nor SIGINT to a child whose parent died, and even on POSIX a client
+// that exits without signalling leaves the bridge running — so the only
+// portable notice of a departed client is end-of-input on the pipe it was
+// speaking through.
+//
+// Without this the process leaked, and leaked expensively: the handlers above
+// are what stop the file watcher, release its per-repository advisory locks and
+// close the connection pool, so an orphan kept indexing a repository nobody was
+// asking about while holding the locks the next session needed. Four such
+// orphans were found alive on one machine, the largest at 1,806 MB.
+// A closing pipe raises `end` and then `close` (and `error` first, on a broken
+// one); they are one event, so only the first is passed on and the others do
+// not have to be explained away as duplicate signals on every shutdown.
+let clientGone = false
+const clientDisconnected = (reason: string) => (): void => {
+  if (clientGone) return
+  clientGone = true
+  void shutdown(reason)
+}
+process.stdin.on("end", clientDisconnected("stdin-end"))
+process.stdin.on("close", clientDisconnected("stdin-close"))
+// EPIPE/ECONNRESET on a dead pipe is a disconnect, not a fault to report.
+process.stdin.on("error", clientDisconnected("stdin-error"))
 
 // Prevent unhandled rejections from crashing the process
 process.on("unhandledRejection", (reason: unknown) => {

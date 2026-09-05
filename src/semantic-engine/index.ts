@@ -26,6 +26,15 @@ import {
   multiViewSimilarity,
   computeBandKeys,
   LSH_ROWS_PER_BAND,
+  MINHASH_MIN_TOKENS,
+  packMinHash,
+  unpackMinHash,
+  jaccardFromSparse,
+  packSparseVector,
+  unpackSparseVector,
+  hashSparseKeys,
+  tokenHashesInt32,
+  distinctiveQueryHashes,
 } from "./similarity"
 
 const log = new Logger("semantic-engine")
@@ -51,7 +60,7 @@ const MINHASH_PERMUTATIONS = 128
  * Band keys now ride on the vector row, so this is the only insert shape.
  */
 const MAX_PG_PARAMS = 30000
-/** vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys */
+/** symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys, token_hashes */
 const SEMANTIC_VEC_COLS = 7
 const MAX_VEC_ROWS_PER_INSERT = Math.floor(MAX_PG_PARAMS / SEMANTIC_VEC_COLS) // ~4285
 const MAX_LSH_CANDIDATES = 1_000
@@ -64,10 +73,121 @@ const EMBEDDING_FLUSH_SYMBOLS = 200
  * unbounded heap and create multi-megabyte JSON parameters.
  */
 const MAX_IDF_VOCABULARY_PER_VIEW = 50_000
-const EMPTY_MINHASH_VALUE = 0xffffffff
+/**
+ * One view's stored similarity data. `signature` is null for views narrower
+ * than MINHASH_MIN_TOKENS and for rows written before migration 023; `sparse`
+ * is always present and is the exact token set, so a comparison is always
+ * answerable.
+ */
+type ViewVector = { signature: number[] | null; sparse: SparseVector }
 
-function isEmptyMinHash(signature: number[]): boolean {
-  return signature.length === 0 || signature.every((value) => value === EMPTY_MINHASH_VALUE)
+/**
+ * The columns every similarity read needs. Takes the table alias because
+ * symbol_versions carries symbol_version_id too, so the joined reads would
+ * otherwise be ambiguous.
+ */
+function viewVectorColumns(alias = ""): string {
+  const prefix = alias ? `${alias}.` : ""
+  return `${prefix}symbol_version_id, ${prefix}view_type, ${prefix}minhash_signature, ${prefix}sparse_vector`
+}
+
+/**
+ * Group `viewVectorColumns` rows into per-symbol, per-view vectors.
+ */
+function groupViewVectors(rows: Record<string, unknown>[]): Map<string, Record<string, ViewVector>> {
+  const grouped = new Map<string, Record<string, ViewVector>>()
+  for (const row of rows) {
+    const svId = row["symbol_version_id"] as string
+    let views = grouped.get(svId)
+    if (!views) {
+      views = {}
+      grouped.set(svId, views)
+    }
+    views[row["view_type"] as string] = {
+      signature: unpackMinHash(row["minhash_signature"] as Buffer | null),
+      sparse: unpackSparseVector(row["sparse_vector"] as Buffer | null),
+    }
+  }
+  return grouped
+}
+
+/**
+ * Jaccard between two views: the MinHash estimate when both sides stored a
+ * signature, the exact value from the sparse key sets otherwise. Narrow views
+ * take the exact path, which is what they were always approximating.
+ */
+function viewJaccard(a: ViewVector | undefined, b: ViewVector | undefined): number {
+  if (!a || !b) return 0
+  if (a.signature && b.signature) return estimateJaccardFromMinHash(a.signature, b.signature)
+  return jaccardFromSparse(a.sparse, b.sparse)
+}
+
+/**
+ * Weighted multi-view similarity across DEFAULT_VIEW_WEIGHTS. Shared by the
+ * LSH and linear candidate paths so the two can never drift apart.
+ */
+function scoreViews(target: Record<string, ViewVector>, candidate: Record<string, ViewVector>): number {
+  let totalSim = 0
+  let totalWeight = 0
+  for (const [viewType, weight] of Object.entries(DEFAULT_VIEW_WEIGHTS)) {
+    totalWeight += weight
+    totalSim += weight * viewJaccard(target[viewType], candidate[viewType])
+  }
+  return totalWeight > 0 ? totalSim / totalWeight : 0
+}
+
+/**
+ * A snapshot's stored IDF corpus, and whether one was actually found.
+ *
+ * `present` is the part that matters. Every consumer previously treated a
+ * missing corpus as an empty one and carried on: computeTFIDF falls back to a
+ * default IDF of 1.0 per token, which silently turns TF-IDF into plain TF. A
+ * frequent, undiscriminating token then weighs as much as a rare one, so
+ * ranking quietly degrades with nothing logged and no way to tell from the
+ * results that it happened.
+ */
+type SnapshotIdf = { idfByView: Record<string, Record<string, number>>; present: boolean }
+
+/**
+ * Load and reconstruct a snapshot's IDF weights from the stored document
+ * counts. One query for all five views.
+ */
+async function loadSnapshotIdf(snapshotId: string | undefined): Promise<SnapshotIdf> {
+  const idfByView: Record<string, Record<string, number>> = {}
+  if (!snapshotId) return { idfByView, present: false }
+
+  const result = await db.query(
+    `SELECT view_type, document_count, token_document_counts
+       FROM idf_corpus WHERE snapshot_id = $1`,
+    [snapshotId],
+  )
+
+  for (const row of result.rows) {
+    const docCounts: Record<string, number> =
+      typeof row.token_document_counts === "string"
+        ? JSON.parse(row.token_document_counts)
+        : row.token_document_counts
+    const totalDocs = row.document_count as number
+    const idf: Record<string, number> = {}
+    for (const [token, freq] of Object.entries(docCounts)) {
+      idf[token] = Math.log(1 + totalDocs / (1 + freq))
+    }
+    idfByView[row.view_type as string] = idf
+  }
+
+  return { idfByView, present: result.rows.length > 0 }
+}
+
+/**
+ * Signature and band keys for one view, or nulls when the view is too narrow
+ * to earn them (see MINHASH_MIN_TOKENS). Keeping both decisions in one place
+ * guarantees band_keys are never present without the signature they derive
+ * from, which the candidate reader relies on.
+ */
+function buildLshFields(tokenSet: Set<string>): { minhash: Buffer | null; bandKeys: number[] | null } {
+  if (tokenSet.size < MINHASH_MIN_TOKENS) return { minhash: null, bandKeys: null }
+  const signature = generateMinHash(tokenSet, MINHASH_PERMUTATIONS)
+  return { minhash: packMinHash(signature), bandKeys: computeBandKeys(signature, LSH_ROWS_PER_BAND) }
 }
 
 /**
@@ -76,13 +196,13 @@ function isEmptyMinHash(signature: number[]): boolean {
  */
 function buildMultiRowVectorInsert(
   rows: {
-    vectorId: string
     symbolVersionId: string
     viewType: string
-    sparseJson: string
-    minhash: number[]
+    sparse: Buffer
+    minhash: Buffer | null
     tokenCount: number
-    bandKeys: number[]
+    bandKeys: number[] | null
+    tokenHashes: number[] | null
   }[],
 ): { text: string; params: unknown[] }[] {
   const statements: { text: string; params: unknown[] }[] = []
@@ -93,18 +213,19 @@ function buildMultiRowVectorInsert(
     let idx = 1
     for (const r of chunk) {
       valuesClauses.push(`($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}, $${idx + 6})`)
-      params.push(r.vectorId, r.symbolVersionId, r.viewType, r.sparseJson, r.minhash, r.tokenCount, r.bandKeys)
+      params.push(r.symbolVersionId, r.viewType, r.sparse, r.minhash, r.tokenCount, r.bandKeys, r.tokenHashes)
       idx += SEMANTIC_VEC_COLS
     }
     statements.push({
       text: `INSERT INTO semantic_vectors
-                   (vector_id, symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys)
+                   (symbol_version_id, view_type, sparse_vector, minhash_signature, token_count, band_keys, token_hashes)
                    VALUES ${valuesClauses.join(", ")}
                    ON CONFLICT (symbol_version_id, view_type)
                    DO UPDATE SET sparse_vector = EXCLUDED.sparse_vector,
                                  minhash_signature = EXCLUDED.minhash_signature,
                                  token_count = EXCLUDED.token_count,
                                  band_keys = EXCLUDED.band_keys,
+                                 token_hashes = EXCLUDED.token_hashes,
                                  created_at = NOW()`,
       params,
     })
@@ -184,76 +305,6 @@ class SemanticEngine {
     }
   }
 
-  /**
-   * Compute IDF statistics for an entire snapshot, per view type.
-   * PostgreSQL performs the document-frequency aggregation so source vectors
-   * are never all materialized in the Node process.
-   */
-  async computeSnapshotIDF(snapshotId: string): Promise<void> {
-    const done = log.startTimer("computeSnapshotIDF", { snapshotId })
-
-    try {
-      for (const viewType of VIEW_TYPES) {
-        const countResult = await db.query(
-          `SELECT COUNT(*)::int AS document_count
-                     FROM semantic_vectors sv
-                     JOIN symbol_versions symv ON symv.symbol_version_id = sv.symbol_version_id
-                     WHERE symv.snapshot_id = $1 AND sv.view_type = $2`,
-          [snapshotId, viewType],
-        )
-        const rawCount = countResult.rows[0]?.document_count
-        const totalDocs = typeof rawCount === "number" ? rawCount : Number.parseInt(String(rawCount ?? "0"), 10)
-
-        if (!Number.isFinite(totalDocs) || totalDocs <= 0) {
-          await db.query(`DELETE FROM idf_corpus WHERE snapshot_id = $1 AND view_type = $2`, [snapshotId, viewType])
-          log.debug("No documents found for IDF computation", { snapshotId, viewType })
-          continue
-        }
-
-        // Keep the most frequent vocabulary entries when the cap is reached.
-        // Unstored tokens use computeTFIDF's documented default IDF of 1.0.
-        const frequencyResult = await db.query(
-          `SELECT keys.token, COUNT(*)::int AS document_count
-                     FROM semantic_vectors sv
-                     JOIN symbol_versions symv ON symv.symbol_version_id = sv.symbol_version_id
-                     CROSS JOIN LATERAL jsonb_object_keys(sv.sparse_vector) AS keys(token)
-                     WHERE symv.snapshot_id = $1 AND sv.view_type = $2
-                     GROUP BY keys.token
-                     ORDER BY COUNT(*) DESC, keys.token
-                     LIMIT $3`,
-          [snapshotId, viewType, MAX_IDF_VOCABULARY_PER_VIEW],
-        )
-        const tokenDocCounts = Object.create(null) as Record<string, number>
-        for (const row of frequencyResult.rows) {
-          if (typeof row.token !== "string") continue
-          const frequency = typeof row.document_count === "number" ? row.document_count : Number(row.document_count)
-          if (Number.isFinite(frequency) && frequency > 0) tokenDocCounts[row.token] = frequency
-        }
-
-        // Upsert into idf_corpus
-        const corpusId = uuidv4()
-        await db.query(
-          `INSERT INTO idf_corpus (corpus_id, snapshot_id, view_type, document_count, token_document_counts)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (snapshot_id, view_type)
-                     DO UPDATE SET document_count = $4, token_document_counts = $5, computed_at = NOW()`,
-          [corpusId, snapshotId, viewType, totalDocs, JSON.stringify(tokenDocCounts)],
-        )
-
-        log.debug("IDF computed for view", {
-          snapshotId,
-          viewType,
-          totalDocs,
-          retainedTokens: frequencyResult.rows.length,
-        })
-      }
-
-      done()
-    } catch (error) {
-      log.error("Failed to compute snapshot IDF", error, { snapshotId })
-      throw error
-    }
-  }
 
   /**
    * Embed a single symbol version: generate 5 view token streams,
@@ -266,6 +317,14 @@ class SemanticEngine {
     signature: string,
     behaviorHints: BehaviorHint[],
     contractHint: ContractHint | null,
+    /**
+     * The snapshot's IDF corpus, when the caller already holds it. Embedding a
+     * set of symbols one at a time otherwise re-queried and re-parsed the whole
+     * corpus for every symbol — two queries and up to five JSON documents of as
+     * many as 50,000 tokens each, per symbol, on the path the watcher runs
+     * after every edit.
+     */
+    preloadedIdf?: SnapshotIdf,
   ): Promise<void> {
     const done = log.startTimer("embedSymbol", { symbolVersionId })
 
@@ -286,46 +345,25 @@ class SemanticEngine {
           : [],
       }
 
-      // Step 2: Load IDF from DB (try to find corpus for this symbol's snapshot)
-      const snapshotResult = await db.query(`SELECT snapshot_id FROM symbol_versions WHERE symbol_version_id = $1`, [
-        symbolVersionId,
-      ])
-      const snapshotId = snapshotResult.rows[0]?.snapshot_id
-
-      // Load IDF per view type if available
-      const idfByView: Record<string, Record<string, number>> = {}
-      if (snapshotId) {
-        const idfResult = await db.query(
-          `SELECT view_type, document_count, token_document_counts
-                     FROM idf_corpus
-                     WHERE snapshot_id = $1`,
-          [snapshotId],
-        )
-        for (const row of idfResult.rows) {
-          const docCounts: Record<string, number> =
-            typeof row.token_document_counts === "string"
-              ? JSON.parse(row.token_document_counts)
-              : row.token_document_counts
-          const totalDocs = row.document_count as number
-
-          // Reconstruct IDF from stored doc counts
-          const idf: Record<string, number> = {}
-          for (const [token, freq] of Object.entries(docCounts)) {
-            idf[token] = Math.log(1 + totalDocs / (1 + freq))
-          }
-          idfByView[row.view_type as string] = idf
-        }
+      // Step 2: Load IDF for this symbol's snapshot, unless the caller supplied it.
+      let corpus = preloadedIdf
+      if (!corpus) {
+        const snapshotResult = await db.query(`SELECT snapshot_id FROM symbol_versions WHERE symbol_version_id = $1`, [
+          symbolVersionId,
+        ])
+        corpus = await loadSnapshotIdf(snapshotResult.rows[0]?.snapshot_id as string | undefined)
       }
+      const idfByView = corpus.idfByView
 
       // Step 3: Compute TF-IDF and MinHash for each view, prepare multi-row inserts
       const vectorRows: {
-        vectorId: string
         symbolVersionId: string
         viewType: string
-        sparseJson: string
-        minhash: number[]
+        sparse: Buffer
+        minhash: Buffer | null
         tokenCount: number
-        bandKeys: number[]
+        bandKeys: number[] | null
+        tokenHashes: number[] | null
       }[] = []
 
       for (const viewType of VIEW_TYPES) {
@@ -334,18 +372,21 @@ class SemanticEngine {
         const idf = idfByView[viewType] || {}
         const tfidf = computeTFIDF(tf, idf)
 
+        // Band keys ride on the vector row — see migration 019 — and are only
+        // minted for views wide enough to hold a signature, see migration 023.
         const tokenSet = new Set(tokens)
-        const minhash = generateMinHash(tokenSet, MINHASH_PERMUTATIONS)
+        const { minhash, bandKeys } = buildLshFields(tokenSet)
 
         vectorRows.push({
-          vectorId: uuidv4(),
           symbolVersionId,
           viewType,
-          sparseJson: JSON.stringify(tfidf),
+          sparse: packSparseVector(tfidf),
           minhash,
           tokenCount: tokens.length,
-          // Band keys ride on the vector row — see migration 019.
-          bandKeys: tokenSet.size > 0 ? computeBandKeys(minhash, LSH_ROWS_PER_BAND) : [],
+          bandKeys,
+          // Only the body view is searched, so only it carries the inverted
+          // index — see migration 026.
+          tokenHashes: viewType === "body" ? tokenHashesInt32(tokenSet) : null,
         })
       }
 
@@ -376,9 +417,9 @@ class SemanticEngine {
     const done = log.startTimer("findSemanticCandidates", { symbolVersionId, snapshotId, topK })
 
     try {
-      // Step 1: Load target MinHash signatures (all views)
+      // Step 1: Load the target's stored vectors and band keys for every view.
       const targetResult = await db.query(
-        `SELECT view_type, minhash_signature
+        `SELECT ${viewVectorColumns()}, band_keys
                  FROM semantic_vectors
                  WHERE symbol_version_id = $1`,
         [symbolVersionId],
@@ -390,15 +431,16 @@ class SemanticEngine {
         return []
       }
 
-      const targetMinHashes: Record<string, number[]> = {}
-      for (const row of targetResult.rows) {
-        targetMinHashes[row.view_type as string] = row.minhash_signature as number[]
-      }
+      const targetViews = groupViewVectors(targetResult.rows).get(symbolVersionId) ?? {}
 
-      // Step 2: Compute band keys for the target's MinHash signatures
+      // Step 2: Band keys are persisted alongside the signature they derive
+      // from, so the target's are read rather than recomputed. Views below
+      // MINHASH_MIN_TOKENS store neither and simply contribute no candidates —
+      // they still score, exactly, in step 6.
       const targetBandKeys: Record<string, number[]> = {}
-      for (const [viewType, minhash] of Object.entries(targetMinHashes)) {
-        if (!isEmptyMinHash(minhash)) targetBandKeys[viewType] = computeBandKeys(minhash, LSH_ROWS_PER_BAND)
+      for (const row of targetResult.rows) {
+        const keys = row.band_keys as number[] | null
+        if (keys && keys.length > 0) targetBandKeys[row.view_type as string] = keys
       }
 
       if (Object.keys(targetBandKeys).length === 0) {
@@ -419,7 +461,7 @@ class SemanticEngine {
 
       if (lshCheck.rows.length === 0) {
         log.info("No LSH band keys for snapshot, falling back to linear scan", { snapshotId })
-        const result = await this._findSemanticCandidatesLinear(symbolVersionId, snapshotId, topK, targetMinHashes)
+        const result = await this._findSemanticCandidatesLinear(symbolVersionId, snapshotId, topK, targetViews)
         done({ candidates: result.length, mode: "linear-fallback" })
         return result
       }
@@ -460,50 +502,31 @@ class SemanticEngine {
         return []
       }
 
-      // Step 5: Load MinHash signatures for LSH candidate symbols (chunked)
+      // Step 5: Load candidate vectors (chunked)
       const candidateIds = Array.from(candidateSvIds)
       const CHUNK_SIZE = 5000
-      const candidateMinHashes: Map<string, Record<string, number[]>> = new Map()
+      const candidateViews: Map<string, Record<string, ViewVector>> = new Map()
 
       for (let i = 0; i < candidateIds.length; i += CHUNK_SIZE) {
         const chunk = candidateIds.slice(i, i + CHUNK_SIZE)
         const placeholders = chunk.map((_, j) => `$${j + 1}`).join(", ")
-        const minhashResult = await db.query(
-          `SELECT symbol_version_id, view_type, minhash_signature
+        const vectorResult = await db.query(
+          `SELECT ${viewVectorColumns()}
                      FROM semantic_vectors
                      WHERE symbol_version_id IN (${placeholders})`,
           chunk,
         )
 
-        for (const row of minhashResult.rows) {
-          const svId = row.symbol_version_id as string
-          if (!candidateMinHashes.has(svId)) {
-            candidateMinHashes.set(svId, {})
-          }
-          candidateMinHashes.get(svId)![row.view_type as string] = row.minhash_signature as number[]
+        for (const [svId, views] of groupViewVectors(vectorResult.rows)) {
+          candidateViews.set(svId, views)
         }
       }
 
       // Step 6: Re-score candidates with weighted Jaccard similarity
       const scores: { svId: string; estimatedSimilarity: number }[] = []
 
-      for (const [svId, viewMinHashes] of candidateMinHashes) {
-        let totalSim = 0
-        let totalWeight = 0
-
-        for (const [viewType, weight] of Object.entries(DEFAULT_VIEW_WEIGHTS)) {
-          const targetSig = targetMinHashes[viewType]
-          const candidateSig = viewMinHashes[viewType]
-
-          totalWeight += weight
-
-          if (targetSig && candidateSig) {
-            totalSim += weight * estimateJaccardFromMinHash(targetSig, candidateSig)
-          }
-        }
-
-        const estimatedSimilarity = totalWeight > 0 ? totalSim / totalWeight : 0
-        scores.push({ svId, estimatedSimilarity })
+      for (const [svId, views] of candidateViews) {
+        scores.push({ svId, estimatedSimilarity: scoreViews(targetViews, views) })
       }
 
       // Sort by similarity descending, take top-K
@@ -531,11 +554,11 @@ class SemanticEngine {
     symbolVersionId: string,
     snapshotId: string,
     topK: number,
-    targetMinHashes: Record<string, number[]>,
+    targetViews: Record<string, ViewVector>,
   ): Promise<{ svId: string; estimatedSimilarity: number }[]> {
-    // Load all other symbols' MinHash signatures in the same snapshot
+    // Load all other symbols' vectors in the same snapshot
     const candidatesResult = await db.query(
-      `SELECT sv.symbol_version_id, sv.view_type, sv.minhash_signature
+      `SELECT ${viewVectorColumns("sv")}
              FROM semantic_vectors sv
              JOIN symbol_versions symv ON symv.symbol_version_id = sv.symbol_version_id
              WHERE symv.snapshot_id = $1 AND sv.symbol_version_id != $2
@@ -543,36 +566,9 @@ class SemanticEngine {
       [snapshotId, symbolVersionId],
     )
 
-    // Group by symbol_version_id
-    const candidateMinHashes: Map<string, Record<string, number[]>> = new Map()
-    for (const row of candidatesResult.rows) {
-      const svId = row.symbol_version_id as string
-      if (!candidateMinHashes.has(svId)) {
-        candidateMinHashes.set(svId, {})
-      }
-      candidateMinHashes.get(svId)![row.view_type as string] = row.minhash_signature as number[]
-    }
-
-    // Compute estimated similarity for each candidate
     const scores: { svId: string; estimatedSimilarity: number }[] = []
-
-    for (const [svId, viewMinHashes] of candidateMinHashes) {
-      let totalSim = 0
-      let totalWeight = 0
-
-      for (const [viewType, weight] of Object.entries(DEFAULT_VIEW_WEIGHTS)) {
-        const targetSig = targetMinHashes[viewType]
-        const candidateSig = viewMinHashes[viewType]
-
-        totalWeight += weight
-
-        if (targetSig && candidateSig) {
-          totalSim += weight * estimateJaccardFromMinHash(targetSig, candidateSig)
-        }
-      }
-
-      const estimatedSimilarity = totalWeight > 0 ? totalSim / totalWeight : 0
-      scores.push({ svId, estimatedSimilarity })
+    for (const [svId, views] of groupViewVectors(candidatesResult.rows)) {
+      scores.push({ svId, estimatedSimilarity: scoreViews(targetViews, views) })
     }
 
     // Sort by similarity descending, take top-K
@@ -602,37 +598,18 @@ class SemanticEngine {
         return 0
       }
 
-      const viewsA: Map<string, SparseVector> = new Map()
-      for (const row of resultA.rows) {
-        let vec: SparseVector
-        try {
-          vec = typeof row.sparse_vector === "string" ? JSON.parse(row.sparse_vector) : row.sparse_vector
-        } catch (error) {
-          log.debug("Skipping corrupt semantic vector for similarity source", {
-            svIdA,
-            error: error instanceof Error ? error.message : String(error),
-          })
-          continue
+      // Decoding a packed vector is total — a truncated or empty value yields an
+      // empty vector, which scores zero — so the per-row parse guards the JSONB
+      // form needed are gone with it.
+      const byView = (rows: Record<string, unknown>[]): Map<string, SparseVector> => {
+        const views = new Map<string, SparseVector>()
+        for (const row of rows) {
+          views.set(row["view_type"] as string, unpackSparseVector(row["sparse_vector"] as Buffer | null))
         }
-        viewsA.set(row.view_type as string, vec)
+        return views
       }
 
-      const viewsB: Map<string, SparseVector> = new Map()
-      for (const row of resultB.rows) {
-        let vec: SparseVector
-        try {
-          vec = typeof row.sparse_vector === "string" ? JSON.parse(row.sparse_vector) : row.sparse_vector
-        } catch (error) {
-          log.debug("Skipping corrupt semantic vector for similarity target", {
-            svIdB,
-            error: error instanceof Error ? error.message : String(error),
-          })
-          continue
-        }
-        viewsB.set(row.view_type as string, vec)
-      }
-
-      return multiViewSimilarity(viewsA, viewsB, DEFAULT_VIEW_WEIGHTS)
+      return multiViewSimilarity(byView(resultA.rows), byView(resultB.rows), DEFAULT_VIEW_WEIGHTS)
     } catch (error) {
       log.error("Failed to compute semantic similarity", error, { svIdA, svIdB })
       throw error
@@ -645,24 +622,21 @@ class SemanticEngine {
    * logic but aren't byte-identical — unlike hash comparison which is binary.
    */
   async computeBodySimilarity(svIdA: string, svIdB: string): Promise<number> {
-    const [resultA, resultB] = await Promise.all([
-      db.query(`SELECT minhash_signature FROM semantic_vectors WHERE symbol_version_id = $1 AND view_type = 'body'`, [
-        svIdA,
-      ]),
-      db.query(`SELECT minhash_signature FROM semantic_vectors WHERE symbol_version_id = $1 AND view_type = 'body'`, [
-        svIdB,
-      ]),
-    ])
+    const bodyVector = (svId: string) =>
+      db.query(
+        `SELECT ${viewVectorColumns()} FROM semantic_vectors WHERE symbol_version_id = $1 AND view_type = 'body'`,
+        [svId],
+      )
+    const [resultA, resultB] = await Promise.all([bodyVector(svIdA), bodyVector(svIdB)])
 
     if (resultA.rows.length === 0 || resultB.rows.length === 0) return 0
 
-    const rowA = firstRow(resultA)
-    const rowB = firstRow(resultB)
-    const sigA = Array.isArray(rowA?.["minhash_signature"]) ? (rowA["minhash_signature"] as number[]) : null
-    const sigB = Array.isArray(rowB?.["minhash_signature"]) ? (rowB["minhash_signature"] as number[]) : null
-    if (!sigA || !sigB) return 0
+    // A body short enough to store no signature is still compared, exactly,
+    // from its sparse vector — see viewJaccard.
+    const viewsA = groupViewVectors(resultA.rows).get(svIdA)
+    const viewsB = groupViewVectors(resultB.rows).get(svIdB)
 
-    return estimateJaccardFromMinHash(sigA, sigB)
+    return viewJaccard(viewsA?.["body"], viewsB?.["body"])
   }
 
   /**
@@ -700,6 +674,26 @@ class SemanticEngine {
         loader.loadContractProfiles(ids),
       ])
 
+      // Every symbol here belongs to the same snapshot, so its corpus is loaded
+      // once for the whole set rather than once per symbol.
+      const snapshotId = rows[0]?.snapshot_id as string | undefined
+      const corpus = await loadSnapshotIdf(snapshotId)
+
+      // Embedding against an absent corpus is not a degraded result, it is a
+      // wrong one: every token would take the default IDF of 1.0 and the stored
+      // vectors would be plain TF, scored later against vectors that are not.
+      // Building the corpus is exactly what the full pass does, so defer to it
+      // rather than writing vectors that quietly disagree with their neighbours.
+      if (!corpus.present && snapshotId) {
+        log.warn("No IDF corpus for snapshot — running a full embed to build one", {
+          snapshotId,
+          requested: symbolVersionIds.length,
+        })
+        const embeddedAll = await this.batchEmbedSnapshot(snapshotId)
+        done({ embedded: embeddedAll, mode: "corpus-rebuild" })
+        return embeddedAll
+      }
+
       let embedded = 0
       for (const symbol of rows) {
         const { behaviorHints, contractHint } = this._buildHintsFromProfiles(
@@ -714,6 +708,7 @@ class SemanticEngine {
           symbol.signature ?? "",
           behaviorHints,
           contractHint,
+          corpus,
         )
         embedded++
       }
@@ -843,13 +838,13 @@ class SemanticEngine {
       // Pass 2: recompute one page at a time and persist real-IDF vectors.
       let embedded = 0
       let pendingVectorRows: {
-        vectorId: string
         symbolVersionId: string
         viewType: string
-        sparseJson: string
-        minhash: number[]
+        sparse: Buffer
+        minhash: Buffer | null
         tokenCount: number
-        bandKeys: number[]
+        bandKeys: number[] | null
+        tokenHashes: number[] | null
       }[] = []
 
       const flushPending = async () => {
@@ -862,8 +857,7 @@ class SemanticEngine {
       // is broken down rather than reported as one number — without this split
       // there is no way to tell CPU (tf-idf, minhash) from I/O (flush).
       let tfidfMs = 0
-      let minhashMs = 0
-      let bandMs = 0
+      let lshMs = 0
       let flushMs = 0
 
       cursor = undefined
@@ -879,21 +873,17 @@ class SemanticEngine {
 
             mark = Date.now()
             const tokenSet = new Set(tokens)
-            const minhash = generateMinHash(tokenSet, MINHASH_PERMUTATIONS)
-            minhashMs += Date.now() - mark
-
-            mark = Date.now()
-            const bandKeys = tokenSet.size > 0 ? computeBandKeys(minhash, LSH_ROWS_PER_BAND) : []
-            bandMs += Date.now() - mark
+            const { minhash, bandKeys } = buildLshFields(tokenSet)
+            lshMs += Date.now() - mark
 
             pendingVectorRows.push({
-              vectorId: uuidv4(),
               symbolVersionId: stream.symbolVersionId,
               viewType,
-              sparseJson: JSON.stringify(tfidf),
+              sparse: packSparseVector(tfidf),
               minhash,
               tokenCount: tokens.length,
               bandKeys,
+              tokenHashes: viewType === "body" ? tokenHashesInt32(tokenSet) : null,
             })
           }
 
@@ -918,8 +908,7 @@ class SemanticEngine {
         snapshotId,
         embedded,
         tfidf_ms: tfidfMs,
-        minhash_ms: minhashMs,
-        band_ms: bandMs,
+        lsh_ms: lshMs,
         db_flush_ms: flushMs,
       })
 
@@ -970,7 +959,12 @@ class SemanticEngine {
       )
 
       const queryIDF: Record<string, number> = {}
-      if (idfResult.rows.length > 0) {
+      if (idfResult.rows.length === 0) {
+        // Without weights the query is scored on raw term frequency, so a
+        // common word counts for as much as a distinguishing one. Results still
+        // come back, which is why this has to be said out loud.
+        log.warn("No IDF corpus for snapshot — search is ranking on term frequency alone", { snapshotId })
+      } else {
         const docCounts = jsonField<Record<string, number>>(firstRow(idfResult), "token_document_counts") ?? {}
         const totalDocs = idfResult.rows[0].document_count as number
         for (const [token, freq] of Object.entries(docCounts)) {
@@ -981,33 +975,39 @@ class SemanticEngine {
       }
 
       // Step 4: Compute query TF-IDF vector
-      const queryVector = computeTFIDF(queryTF, queryIDF)
+      // Stored vectors are keyed by token hash (migration 025), so the query
+      // built from text has to be re-keyed onto the same identity before it can
+      // be compared against them.
+      const queryVector = hashSparseKeys(computeTFIDF(queryTF, queryIDF))
 
-      // Step 5: Compute MinHash for query tokens and look up LSH candidates
-      const queryTokenSet = new Set(queryTokens)
-      const queryMinHash = generateMinHash(queryTokenSet, MINHASH_PERMUTATIONS)
-      const queryBandKeys = computeBandKeys(queryMinHash, LSH_ROWS_PER_BAND)
+      // Step 5: Retrieve candidates from the body inverted index (migration 026).
+      // Cosine is a sum over shared terms, so a symbol that shares no query token
+      // scores exactly zero — which makes "bodies whose token_hashes overlap the
+      // query" the exact set worth scoring, not an approximation. Probing with
+      // the distinctive (high-IDF) query hashes keeps a ubiquitous word from
+      // dragging in the whole table while changing the ranking of real matches
+      // negligibly. Snapshots embedded before migration 026 have token_hashes
+      // NULL, match nothing here, and fall through to the batched scan below —
+      // the same graceful degradation migration 019 relied on.
+      const queryHashes = distinctiveQueryHashes(queryVector)
 
       let candidateSvIds: string[] = []
 
-      if (queryBandKeys.length > 0) {
-        // One GIN-answered overlap replaces the band-tuple join. Snapshots
-        // embedded before migration 019 have band_keys NULL, match nothing, and
-        // fall through to the batched scan below.
-        const lshResult = await db.query(
+      if (queryHashes.length > 0) {
+        const invResult = await db.query(
           `SELECT sem.symbol_version_id
                      FROM semantic_vectors sem
                      JOIN symbol_versions sv ON sv.symbol_version_id = sem.symbol_version_id
                      WHERE sv.snapshot_id = $1
                        AND sem.view_type = 'body'
-                       AND sem.band_keys && $2::int[]
+                       AND sem.token_hashes && $2::int[]
                      ORDER BY sem.symbol_version_id
                      LIMIT $3`,
-          [snapshotId, queryBandKeys, MAX_LSH_CANDIDATES],
+          [snapshotId, queryHashes, MAX_LSH_CANDIDATES],
         )
 
-        candidateSvIds = lshResult.rows.map((r) => r.symbol_version_id as string)
-        log.debug("LSH candidates found for query", { count: candidateSvIds.length, snapshotId })
+        candidateSvIds = invResult.rows.map((r) => r.symbol_version_id as string)
+        log.debug("Inverted-index candidates for query", { count: candidateSvIds.length, snapshotId })
       }
 
       // Step 6: Score candidates by cosine similarity
@@ -1061,16 +1061,7 @@ class SemanticEngine {
       )
 
       for (const row of result.rows) {
-        let svVec: SparseVector
-        try {
-          svVec = typeof row.sparse_vector === "string" ? JSON.parse(row.sparse_vector) : row.sparse_vector
-        } catch (error) {
-          log.debug("Skipping corrupt body vector during chunked scan", {
-            candidate_count: candidateSvIds.length,
-            error: error instanceof Error ? error.message : String(error),
-          })
-          continue
-        }
+        const svVec = unpackSparseVector(row.sparse_vector as Buffer | null)
 
         let sim = cosineSimilarity(queryVector, svVec)
 
@@ -1149,16 +1140,7 @@ class SemanticEngine {
       if (result.rows.length === 0) break
 
       for (const row of result.rows) {
-        let svVec: SparseVector
-        try {
-          svVec = typeof row.sparse_vector === "string" ? JSON.parse(row.sparse_vector) : row.sparse_vector
-        } catch (error) {
-          log.debug("Skipping corrupt body vector during batched scan", {
-            snapshotId,
-            error: error instanceof Error ? error.message : String(error),
-          })
-          continue
-        }
+        const svVec = unpackSparseVector(row.sparse_vector as Buffer | null)
 
         let sim = cosineSimilarity(queryVector, svVec)
 

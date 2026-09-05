@@ -55,6 +55,27 @@ const MIN_TOKEN_BUDGET = 100
 const MAX_TOKEN_BUDGET = 100_000
 const MAX_FALLBACK_SOURCE_BYTES = 2 * 1024 * 1024
 
+// A container's dependencies live on its member symbols, not on the container's
+// own node (a class holds almost no edges; its collaborators are named inside
+// its methods and constructor). When on (the default), the dependency set of a
+// CONTAINER target is drawn from the target plus every symbol nested in its line
+// range. Off restores the pre-member-traversal behaviour — the target's own
+// edges only — as a rollback switch.
+const CAPSULE_MEMBER_DEPS = process.env["SCG_CAPSULE_MEMBER_DEPS"] !== "0"
+
+// Only container kinds aggregate their members' dependencies. A callable
+// (function, method, route handler) owns its dependencies on its own node, and
+// any symbol nested in its body — a closure, a local helper — is private detail
+// already shipped with its source, not a separate dependency; aggregating those
+// would change callable capsules for no gain. Classes and their structural
+// analogues (interfaces and enums carry methods in several languages) are the
+// only targets whose real dependencies live one level down, so the traversal is
+// gated to them. A module is deliberately excluded: aggregating every symbol in
+// a file is not a dependency set. The gate keys on the target's own kind — a
+// structural property the graph already records — so a callable can never
+// regress in any language.
+const MEMBER_CONTAINER_KINDS = new Set(["class", "interface", "enum"])
+
 /**
  * Serialized size of the capsule's fixed JSON skeleton — the keys, brackets
  * and empty arrays that ship regardless of content. Charged up front so the
@@ -236,7 +257,7 @@ export class CapsuleCompiler {
     // Load all context in parallel where possible
     const emptyNodeRawList: { node: ContextNode; raw: SymbolRow }[] = []
     const [deps, callers, tests] = await Promise.all([
-      this.loadDirectDependencies(symbolVersionId),
+      this.loadDirectDependencies(symbolVersionId, MEMBER_CONTAINER_KINDS.has(target.kind)),
       mode !== "minimal" ? this.loadCallers(symbolVersionId) : Promise.resolve(emptyNodeRawList),
       mode !== "minimal" ? this.loadTestContext(symbolVersionId) : Promise.resolve([] as ContextNode[]),
     ])
@@ -824,6 +845,7 @@ export class CapsuleCompiler {
   public async loadSymbolVersion(svId: string): Promise<{
     symbol_id: string
     canonical_name: string
+    kind: string
     signature: string
     file_path: string
     range_start_line: number
@@ -833,7 +855,7 @@ export class CapsuleCompiler {
   } | null> {
     const result = await db.query(
       `
-            SELECT sv.symbol_id, s.canonical_name, sv.signature,
+            SELECT sv.symbol_id, s.canonical_name, s.kind, sv.signature,
                    f.path as file_path, sv.range_start_line, sv.range_end_line,
                    sv.body_source, sv.uncertainty_flags
             FROM symbol_versions sv
@@ -848,6 +870,7 @@ export class CapsuleCompiler {
         | {
             symbol_id: string
             canonical_name: string
+            kind: string
             signature: string
             file_path: string
             range_start_line: number
@@ -859,7 +882,10 @@ export class CapsuleCompiler {
     )
   }
 
-  public async loadDirectDependencies(svId: string): Promise<{ node: ContextNode; raw: SymbolRow }[]> {
+  public async loadDirectDependencies(
+    svId: string,
+    expandMembers = false,
+  ): Promise<{ node: ContextNode; raw: SymbolRow }[]> {
     // One row per dependency symbol. The extractor records both a `calls`
     // edge and a `references` edge for the same pair — calling a function is
     // also referencing it — and without DISTINCT ON the same dependency
@@ -867,8 +893,37 @@ export class CapsuleCompiler {
     // consumed two slots of the LIMIT. Half the dependency capacity of every
     // capsule went to photocopies. The strongest relation represents each
     // pair: a call outranks a type usage outranks a bare mention.
+    // A container's dependencies are its members' dependencies. A class holds
+    // almost no edges on its own symbol — its collaborators are named in its
+    // methods and, for injected dependencies, in its constructor's parameter
+    // types. Those members are not linked to the class by name (methods are
+    // bare-named, not `Class.method`) or by any containment edge; the only
+    // structural fact tying them together is that a member's line range nests
+    // inside the container's, in the same file. So for a container the
+    // dependency set is drawn from the target AND every symbol nested within it,
+    // minus edges that point back INTO the container (a method calling a sibling
+    // method or the class itself — already present in the target's own source,
+    // not a dependency to ship). `expandMembers` is set only for container-kind
+    // targets; a callable keeps the plain "own edges" query, so nested closures
+    // in a function body are never mistaken for its dependencies. The rollback
+    // switch (CAPSULE_MEMBER_DEPS off) forces the plain query for everything.
+    const expand = CAPSULE_MEMBER_DEPS && expandMembers
+    const scopeCte = `
+            WITH scope AS (
+              SELECT nsv.symbol_version_id AS svid
+              FROM symbol_versions nsv
+              JOIN symbol_versions tgt ON tgt.symbol_version_id = $1
+              WHERE nsv.file_id = tgt.file_id
+                AND nsv.range_start_line >= tgt.range_start_line
+                AND nsv.range_end_line <= tgt.range_end_line
+            )`
+    const srcPredicate = expand
+      ? `sr.src_symbol_version_id IN (SELECT svid FROM scope)
+                AND sr.dst_symbol_version_id NOT IN (SELECT svid FROM scope WHERE svid <> $1)`
+      : `sr.src_symbol_version_id = $1`
     const result = await db.query(
       `
+            ${expand ? scopeCte : ""}
             SELECT * FROM (
               SELECT DISTINCT ON (sv.symbol_version_id)
                      sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
@@ -878,7 +933,7 @@ export class CapsuleCompiler {
               JOIN symbol_versions sv ON sv.symbol_version_id = sr.dst_symbol_version_id
               JOIN symbols s ON s.symbol_id = sv.symbol_id
               JOIN files f ON f.file_id = sv.file_id
-              WHERE sr.src_symbol_version_id = $1
+              WHERE ${srcPredicate}
               ORDER BY sv.symbol_version_id,
                        CASE sr.relation_type
                          WHEN 'calls' THEN 0

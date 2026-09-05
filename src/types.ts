@@ -463,6 +463,12 @@ export interface IngestionResult {
   duration_ms: number
   /** Why files failed (first few reasons) — lets callers see the cause instead of a bare count. */
   failure_summary?: string[]
+  /**
+   * Set when every file matched the parent snapshot, so `snapshot_id` is the
+   * parent's rather than a newly minted one. The index is current; nothing was
+   * re-extracted because there was nothing to extract.
+   */
+  unchanged?: boolean
   // V2 additions
   dispatch_edges_resolved?: number
   lineages_computed?: number

@@ -1,12 +1,11 @@
-import * as dotenv from "dotenv"
 import * as fs from "fs"
 import * as tls from "tls"
+import { loadEnvFile } from "../load-env"
 import { Logger } from "../logger"
 
 const log = new Logger("db-driver")
 
-const dotenvPath = process.env["CONTEXTZERO_ENV_FILE"]
-dotenv.config(dotenvPath ? { path: dotenvPath, quiet: true, override: true } : { quiet: true })
+loadEnvFile()
 
 /**
  * Supported SSL modes, matching PostgreSQL's sslmode semantics:

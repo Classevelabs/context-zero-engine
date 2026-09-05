@@ -62,6 +62,7 @@ import {
 import type { CapsuleMode, ValidationMode, TracePack } from "../types"
 import { renderMetrics, metricsMiddleware, setGauge } from "../metrics"
 import { runPendingMigrations } from "../db-driver/migrate"
+import { RetentionRunner } from "../retention-runner"
 import { firstRow, optionalStringField, parseCountField } from "../db-driver/result"
 import { isPathWithinBase, resolveExistingPath, resolvePathWithinBase } from "../path-security"
 import { deriveWorkspaceSnapshotIdentity } from "../workspace-native"
@@ -1989,6 +1990,7 @@ const HOST = serverConfig.host
 
 let server: ReturnType<typeof app.listen>
 let retentionTimer: ReturnType<typeof setInterval> | null = null
+let retentionRunner: RetentionRunner | null = null
 
 function validateStartupConfiguration(): void {
   validateConfiguration()
@@ -2058,11 +2060,13 @@ async function startServer(): Promise<void> {
   // Schedule periodic retention policy if enabled
   if (retentionConfig.retentionEnabled && retentionConfig.retentionIntervalMinutes > 0) {
     const intervalMs = retentionConfig.retentionIntervalMinutes * 60_000
-    retentionTimer = setInterval(() => {
-      runRetentionPolicy().catch((err) => {
-        log.error("Scheduled retention policy failed", err instanceof Error ? err : new Error(String(err)))
-      })
-    }, intervalMs)
+    // One pass in flight at most, and shutdown waits for it before the pool
+    // closes — see retention-runner.ts.
+    retentionRunner = new RetentionRunner(
+      (control) => runRetentionPolicy(control),
+      (err) => log.error("Scheduled retention policy failed", err instanceof Error ? err : new Error(String(err))),
+    )
+    retentionTimer = setInterval(() => retentionRunner?.trigger(), intervalMs)
     retentionTimer.unref() // don't prevent shutdown
     log.info("Retention policy scheduled", { intervalMinutes: retentionConfig.retentionIntervalMinutes })
   }
@@ -2105,11 +2109,15 @@ function shutdown(signal: string): void {
     clearInterval(retentionTimer)
     retentionTimer = null
   }
+  // A scheduled pass still running holds pool connections; wait for its
+  // current phase before the pool closes (see retention-runner.ts).
+  const retentionDrained = retentionRunner ? retentionRunner.stop() : Promise.resolve()
   if (!server) {
     destroyAllCaches()
     limiter.destroy()
     destroyAuthCleanup()
-    db.close()
+    retentionDrained
+      .then(() => db.close())
       .catch(() => {
         /* best-effort during early shutdown */
       })
@@ -2123,6 +2131,7 @@ function shutdown(signal: string): void {
       destroyAllCaches()
       limiter.destroy()
       destroyAuthCleanup()
+      await retentionDrained
       await db.close()
       log.info("Server closed")
     } catch (err) {

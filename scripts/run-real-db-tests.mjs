@@ -2,13 +2,25 @@ import assert from "assert/strict"
 import path from "path"
 import { fileURLToPath } from "url"
 import dotenv from "dotenv"
+import fs from "fs"
 import pg from "pg"
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(scriptDir, "..")
 const envFile = process.env.CONTEXTZERO_ENV_FILE || path.join(repoRoot, ".env")
 
-dotenv.config({ path: envFile, quiet: true, override: Boolean(process.env.CONTEXTZERO_ENV_FILE) })
+// An explicitly named env file must exist. Loading it quietly and discarding
+// the result turned a wrong path into "SASL: client password must be a string",
+// which names neither the file nor the fact that it was never read.
+if (process.env.CONTEXTZERO_ENV_FILE && !fs.existsSync(envFile)) {
+  console.error(`CONTEXTZERO_ENV_FILE points at ${envFile}, which does not exist.`)
+  process.exit(1)
+}
+const loaded = dotenv.config({ path: envFile, quiet: true, override: Boolean(process.env.CONTEXTZERO_ENV_FILE) })
+if (process.env.CONTEXTZERO_ENV_FILE && loaded.error) {
+  console.error(`CONTEXTZERO_ENV_FILE at ${envFile} could not be read: ${loaded.error.message}`)
+  process.exit(1)
+}
 
 const { Pool } = pg
 const tableName = `_contextzero_db_smoke_${Date.now()}`

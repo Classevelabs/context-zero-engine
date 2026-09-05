@@ -228,6 +228,11 @@ const mockStat = jest.fn()
 const mockLstat = jest.fn()
 const mockReadFile = jest.fn()
 const mockAccess = jest.fn()
+// The batched Python adapter moves its job/result through temp files, so the
+// mock has to answer writeFile/rm too. rm MUST resolve a promise — the ingestor
+// calls `.catch()` on it.
+const mockWriteFile = jest.fn().mockResolvedValue(undefined)
+const mockRm = jest.fn().mockResolvedValue(undefined)
 
 jest.mock("fs/promises", () => ({
   readdir: (...args: any[]) => mockReaddir(...args),
@@ -235,6 +240,8 @@ jest.mock("fs/promises", () => ({
   lstat: (...args: any[]) => mockLstat(...args),
   readFile: (...args: any[]) => mockReadFile(...args),
   access: (...args: any[]) => mockAccess(...args),
+  writeFile: (...args: any[]) => mockWriteFile(...args),
+  rm: (...args: any[]) => mockRm(...args),
 }))
 
 // fs (sync) mock — needed for Dirent construction
@@ -1022,9 +1029,12 @@ describe("Ingestor — Delta detection", () => {
   test("re-extracts unchanged files when a delta profile copy fails", async () => {
     setupLockAcquired()
     mockStat.mockResolvedValueOnce({ isDirectory: () => true })
-    mockReaddir.mockResolvedValueOnce([makeDirent("unchanged.ts", { isFile: true })])
+    mockReaddir.mockResolvedValueOnce([
+      makeDirent("unchanged.ts", { isFile: true }),
+      makeDirent("changed.ts", { isFile: true }),
+    ])
     mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
-    mockStat.mockResolvedValueOnce({ size: 100 })
+    mockStat.mockResolvedValueOnce({ size: 100 }).mockResolvedValueOnce({ size: 100 })
     const content = Buffer.from("export const unchanged = 1;")
     mockReadFile.mockResolvedValue(content)
     const expectedHash = require("crypto").createHash("sha256").update(content).digest("hex")
@@ -1033,7 +1043,13 @@ describe("Ingestor — Delta detection", () => {
     mockQuery.mockImplementation(async (text: string) => {
       if (text.includes("SELECT index_status FROM snapshots")) return { rows: [{ index_status: "complete" }], rowCount: 1 }
       if (text.includes("SELECT path, content_hash FROM files")) {
-        return { rows: [{ path: "unchanged.ts", content_hash: expectedHash }], rowCount: 1 }
+        return {
+          rows: [
+            { path: "unchanged.ts", content_hash: expectedHash },
+            { path: "changed.ts", content_hash: "stale-hash" },
+          ],
+          rowCount: 2,
+        }
       }
       if (text.includes("INSERT INTO symbol_versions") && text.includes("f_old")) return { rows: [], rowCount: 1 }
       if (text.includes("INSERT INTO behavioral_profiles") && !failedBehaviorCopy) {
@@ -1045,17 +1061,21 @@ describe("Ingestor — Delta detection", () => {
 
     const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123", "main", "parent-snap")
 
-    expect(mockExtractFromTypeScript).toHaveBeenCalledWith([path.join("/repo", "unchanged.ts")], expect.anything())
-    expect(result.files_processed).toBe(1)
+    // The copy failed, so the file it would have carried must be parsed instead.
+    const extracted = mockExtractFromTypeScript.mock.calls.flatMap((call: unknown[]) => call[0] as string[])
+    expect(extracted).toContain(path.join("/repo", "unchanged.ts"))
     expect(result.symbols_extracted).toBe(0)
   })
 
   test("rebinds and copies outgoing relations from unchanged source files", async () => {
     setupLockAcquired()
     mockStat.mockResolvedValueOnce({ isDirectory: () => true })
-    mockReaddir.mockResolvedValueOnce([makeDirent("unchanged.ts", { isFile: true })])
+    mockReaddir.mockResolvedValueOnce([
+      makeDirent("unchanged.ts", { isFile: true }),
+      makeDirent("changed.ts", { isFile: true }),
+    ])
     mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
-    mockStat.mockResolvedValueOnce({ size: 100 })
+    mockStat.mockResolvedValueOnce({ size: 100 }).mockResolvedValueOnce({ size: 100 })
     const content = Buffer.from("export const unchanged = 1;")
     mockReadFile.mockResolvedValue(content)
     const expectedHash = require("crypto").createHash("sha256").update(content).digest("hex")
@@ -1063,7 +1083,13 @@ describe("Ingestor — Delta detection", () => {
     mockQuery.mockImplementation(async (text: string) => {
       if (text.includes("SELECT index_status FROM snapshots")) return { rows: [{ index_status: "complete" }], rowCount: 1 }
       if (text.includes("SELECT path, content_hash FROM files")) {
-        return { rows: [{ path: "unchanged.ts", content_hash: expectedHash }], rowCount: 1 }
+        return {
+          rows: [
+            { path: "unchanged.ts", content_hash: expectedHash },
+            { path: "changed.ts", content_hash: "stale-hash" },
+          ],
+          rowCount: 2,
+        }
       }
       if (text.includes("INSERT INTO symbol_versions") && text.includes("f_old")) return { rows: [], rowCount: 1 }
       if (text.includes("INSERT INTO structural_relations") && text.includes("src_file_new")) {
@@ -1080,7 +1106,91 @@ describe("Ingestor — Delta detection", () => {
     expect(relationCopy?.[1]).toEqual(["parent-snap", "snap-001"])
     expect(String(relationCopy?.[0])).toContain("src_file_new.content_hash = src_file_old.content_hash")
     expect(result.relations_extracted).toBe(2)
+    // Only the changed file is parsed; the unchanged one is carried.
+    expect(mockExtractFromTypeScript).toHaveBeenCalledWith([path.join("/repo", "changed.ts")], expect.anything())
+  })
+
+  test("carries semantic vectors, the IDF corpus and effect signatures for unchanged files", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([
+      makeDirent("unchanged.ts", { isFile: true }),
+      makeDirent("changed.ts", { isFile: true }),
+    ])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValueOnce({ size: 100 }).mockResolvedValueOnce({ size: 100 })
+    const content = Buffer.from("export const unchanged = 1;")
+    mockReadFile.mockResolvedValue(content)
+    const expectedHash = require("crypto").createHash("sha256").update(content).digest("hex")
+
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes("SELECT index_status FROM snapshots")) return { rows: [{ index_status: "complete" }], rowCount: 1 }
+      if (text.includes("SELECT path, content_hash FROM files")) {
+        return {
+          rows: [
+            { path: "unchanged.ts", content_hash: expectedHash },
+            { path: "changed.ts", content_hash: "stale-hash" },
+          ],
+          rowCount: 2,
+        }
+      }
+      if (text.includes("INSERT INTO symbol_versions") && text.includes("f_old")) return { rows: [], rowCount: 1 }
+      if (text.includes("INSERT INTO semantic_vectors")) return { rows: [], rowCount: 5 }
+      return { rows: [], rowCount: 0 }
+    })
+
+    await ingestor.ingestRepo("/repo", "test-repo", "abc123", "main", "parent-snap")
+
+    const findCopy = (table: string) =>
+      mockQuery.mock.calls.find(
+        (call: any[]) => String(call[0]).includes("INSERT INTO " + table) && String(call[0]).includes("SELECT"),
+      )
+
+    // Vectors are the largest derived artifact; recomputing them for content
+    // that did not change was the bulk of ingestion cost.
+    const vectorCopy = findCopy("semantic_vectors")
+    expect(vectorCopy?.[1]).toEqual(["parent-snap", "snap-001"])
+    expect(String(vectorCopy?.[0])).toContain("file_new.content_hash = file_old.content_hash")
+
+    // Carried vectors are weighted against the parent's corpus, so it comes too.
+    expect(findCopy("idf_corpus")?.[1]).toEqual(["parent-snap", "snap-001"])
+    expect(findCopy("effect_signatures")?.[1]).toEqual(["parent-snap", "snap-001"])
+  })
+
+  test("reuses the parent snapshot when no file changed", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([makeDirent("unchanged.ts", { isFile: true })])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValueOnce({ size: 100 })
+    const content = Buffer.from("export const unchanged = 1;")
+    mockReadFile.mockResolvedValue(content)
+    const expectedHash = require("crypto").createHash("sha256").update(content).digest("hex")
+
+    mockQuery.mockImplementation(async (text: string) => {
+      if (text.includes("SELECT index_status FROM snapshots")) return { rows: [{ index_status: "complete" }], rowCount: 1 }
+      if (text.includes("SELECT path, content_hash FROM files")) {
+        return { rows: [{ path: "unchanged.ts", content_hash: expectedHash }], rowCount: 1 }
+      }
+      if (text.includes("FROM symbol_versions WHERE snapshot_id")) {
+        return { rows: [{ symbols: 42, relations: 7 }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+
+    const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123", "main", "parent-snap")
+
+    // A byte-identical snapshot is a full duplicate of the repository's symbol
+    // versions and every artifact derived from them. The parent already is it.
+    expect(result.unchanged).toBe(true)
+    expect(result.snapshot_id).toBe("parent-snap")
+    expect(result.symbols_extracted).toBe(42)
     expect(mockExtractFromTypeScript).not.toHaveBeenCalled()
+
+    const deleted = mockQuery.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("DELETE FROM snapshots WHERE snapshot_id"),
+    )
+    expect(deleted?.[1]).toEqual(["snap-001"])
   })
 })
 
@@ -1201,6 +1311,56 @@ describe("Ingestor — Python extraction", () => {
     const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123")
 
     expect(result.files_failed).toBe(1)
+  })
+
+  test("batches many Python files into ONE interpreter invocation, not one spawn per file", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([
+      makeDirent("a.py", { isFile: true }),
+      makeDirent("b.py", { isFile: true }),
+      makeDirent("c.py", { isFile: true }),
+    ])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValue({ size: 100 })
+    mockAccess.mockResolvedValue(undefined)
+
+    // Faithfully mock the extractor.py --batch contract: it reads a job file of
+    // { files, outFile } and writes { path: AdapterExtractionResult } to outFile.
+    // Capturing the job lets the result be keyed by the exact paths asked for.
+    let jobFiles: string[] = []
+    let outFilePath = ""
+    mockWriteFile.mockImplementation(async (_p: string, content: string) => {
+      const job = JSON.parse(content)
+      jobFiles = job.files
+      outFilePath = job.outFile
+    })
+    const emptyResult = {
+      symbols: [],
+      relations: [],
+      behavior_hints: [],
+      contract_hints: [],
+      parse_confidence: 1.0,
+      uncertainty_flags: [],
+    }
+    mockReadFile.mockImplementation(async (p: string) =>
+      p === outFilePath
+        ? JSON.stringify(Object.fromEntries(jobFiles.map((f) => [f, emptyResult])))
+        : Buffer.from("x = 1"),
+    )
+    mockExecFileAsync.mockResolvedValue({ stdout: "", stderr: "" })
+
+    const result = await ingestor.ingestRepo("/repo", "test-repo", "abc123")
+
+    // Three Python files, but a single batched interpreter spawn — the whole
+    // point of the fix. A regression to per-file spawning would make this 3.
+    const batchCalls = mockExecFileAsync.mock.calls.filter(
+      (c: any[]) => Array.isArray(c[1]) && c[1].includes("--batch"),
+    )
+    expect(batchCalls).toHaveLength(1)
+    expect(mockExecFileAsync).toHaveBeenCalledTimes(1)
+    expect(result.files_failed).toBe(0)
+    expect(result.files_processed).toBeGreaterThanOrEqual(3)
   })
 })
 

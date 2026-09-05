@@ -2,6 +2,13 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 
+const mockWatch = jest.fn()
+
+jest.mock("fs", () => ({
+  ...jest.requireActual("fs"),
+  watch: (...args: unknown[]) => mockWatch(...args),
+}))
+
 const mockQuery = jest.fn()
 const mockTryAdvisoryLock = jest.fn()
 const mockIngestIncremental = jest.fn()
@@ -28,10 +35,6 @@ jest.mock("../incremental-target", () => ({
 }))
 
 import { isIndexablePath, Watcher } from "../watcher"
-
-const flushAsync = async (): Promise<void> => {
-  await new Promise((resolve) => setImmediate(resolve))
-}
 
 describe("isIndexablePath", () => {
   test("accepts source files the ingestor has an adapter for", () => {
@@ -75,11 +78,42 @@ describe("isIndexablePath", () => {
 describe("Watcher", () => {
   let tempRoot: string
   let release: jest.Mock
+  let emit: ((filename: string) => void) | null
+
+  /**
+   * Drive the debounce forward without waiting on a clock.
+   *
+   * These tests used to write a real file and sleep past the debounce, which
+   * meant they were really waiting on recursive fs.watch to deliver an OS event
+   * — latency that is not bounded and stretches under parallel load, where this
+   * suite ran 5.7s against 2.0s alone. The wait was sized for the debounce it
+   * was named after (30ms) but had to be an order of magnitude longer (250ms)
+   * to cover the event, and it still raced.
+   *
+   * Injecting the change through the captured fs.watch callback removes the OS
+   * from the loop, so what each test asserts is the debounce, coalescing and
+   * retry behaviour itself, at whatever speed the machine happens to run.
+   */
+  const advance = async (ms: number): Promise<void> => {
+    await jest.advanceTimersByTimeAsync(ms)
+  }
 
   beforeEach(() => {
     jest.clearAllMocks()
+    jest.useFakeTimers()
     tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "contextzero-watch-"))
     fs.mkdirSync(path.join(tempRoot, "src"), { recursive: true })
+
+    emit = null
+    // Capture the change callback instead of subscribing to the filesystem.
+    // start() still calls fs.existsSync on the real temp directory, so the
+    // path-presence check keeps its meaning.
+    mockWatch.mockImplementation(
+      (_target: unknown, _options: unknown, listener: (event: string, filename: string) => void) => {
+        emit = (filename: string) => listener("change", filename)
+        return { on: jest.fn(), close: jest.fn() }
+      },
+    )
 
     release = jest.fn(async () => {})
     mockTryAdvisoryLock.mockResolvedValue({ release })
@@ -98,7 +132,23 @@ describe("Watcher", () => {
   })
 
   afterEach(() => {
+    jest.useRealTimers()
     fs.rmSync(tempRoot, { recursive: true, force: true })
+  })
+
+  test("subscribes to the whole repository in one recursive watch", async () => {
+    // The OS subscription is the one thing the injected callback cannot check,
+    // so assert its shape directly: one recursive watch per repository, rather
+    // than a periodic walk or a watch per directory.
+    const watcher = new Watcher({ debounceMs: 30, refineAfterIdleMs: 0 })
+    await watcher.start()
+
+    expect(mockWatch).toHaveBeenCalledTimes(1)
+    const [target, options] = mockWatch.mock.calls[0] as [string, { recursive: boolean }]
+    expect(target).toBe(tempRoot)
+    expect(options.recursive).toBe(true)
+
+    await watcher.stop()
   })
 
   test("indexes a batch after the debounce window", async () => {
@@ -107,9 +157,12 @@ describe("Watcher", () => {
     const watched = await watcher.start()
     expect(watched).toHaveLength(1)
 
-    fs.writeFileSync(path.join(tempRoot, "src", "app.ts"), "export const a = 1\n")
-    await new Promise((resolve) => setTimeout(resolve, 250))
-    await flushAsync()
+    emit!("src/app.ts")
+    // Nothing may run before the window closes, or a burst would be indexed
+    // file by file.
+    expect(mockIngestIncremental).not.toHaveBeenCalled()
+
+    await advance(30)
 
     expect(mockIngestIncremental).toHaveBeenCalled()
     const [, , paths, options] = mockIngestIncremental.mock.calls[0] as [string, string, string[], { refine: string }]
@@ -124,14 +177,20 @@ describe("Watcher", () => {
     const watcher = new Watcher({ debounceMs: 60, refineAfterIdleMs: 0 })
     await watcher.start()
 
+    // Spread the burst across the window so each edit restarts the debounce,
+    // which is the case that would fire five passes if it did not.
     for (let i = 0; i < 5; i++) {
-      fs.writeFileSync(path.join(tempRoot, "src", `mod${i}.ts`), `export const v${i} = ${i}\n`)
+      emit!(`src/mod${i}.ts`)
+      await advance(20)
     }
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    await flushAsync()
+    expect(mockIngestIncremental).not.toHaveBeenCalled()
+
+    await advance(60)
 
     // A formatter sweep or branch switch must cost one pass, not one per file.
     expect(mockIngestIncremental).toHaveBeenCalledTimes(1)
+    const [, , paths] = mockIngestIncremental.mock.calls[0] as [string, string, string[]]
+    expect(paths).toHaveLength(5)
 
     await watcher.stop()
   })
@@ -144,6 +203,7 @@ describe("Watcher", () => {
 
     // Two watchers on one snapshot would each lose batches to the other's lock.
     expect(watched).toHaveLength(0)
+    expect(mockWatch).not.toHaveBeenCalled()
     await watcher.stop()
   })
 
@@ -177,12 +237,16 @@ describe("Watcher", () => {
     const watcher = new Watcher({ debounceMs: 30, refineAfterIdleMs: 0 })
     await watcher.start()
 
-    fs.writeFileSync(path.join(tempRoot, "src", "retry.ts"), "export const r = 1\n")
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    await flushAsync()
+    emit!("src/retry.ts")
+    await advance(30)
+    expect(mockIngestIncremental).toHaveBeenCalledTimes(1)
 
-    // The files are genuinely unindexed; reporting success would strand them.
-    expect(mockIngestIncremental.mock.calls.length).toBeGreaterThanOrEqual(2)
+    // The refusal reschedules the same files one debounce later. The files are
+    // genuinely unindexed; reporting success would strand them.
+    await advance(30)
+    expect(mockIngestIncremental).toHaveBeenCalledTimes(2)
+    const [, , retried] = mockIngestIncremental.mock.calls[1] as [string, string, string[]]
+    expect(retried.some((p) => p.endsWith("retry.ts"))).toBe(true)
 
     await watcher.stop()
   })
@@ -191,10 +255,8 @@ describe("Watcher", () => {
     const watcher = new Watcher({ debounceMs: 40, refineAfterIdleMs: 0 })
     await watcher.start()
 
-    fs.mkdirSync(path.join(tempRoot, "node_modules", "pkg"), { recursive: true })
-    fs.writeFileSync(path.join(tempRoot, "node_modules", "pkg", "index.ts"), "export const x = 1\n")
-    await new Promise((resolve) => setTimeout(resolve, 250))
-    await flushAsync()
+    emit!("node_modules/pkg/index.ts")
+    await advance(200)
 
     expect(mockIngestIncremental).not.toHaveBeenCalled()
 

@@ -14,6 +14,7 @@
 import { db } from "../db-driver"
 import { Logger } from "../logger"
 import { retention } from "../config"
+import type { PassControl } from "../retention-runner"
 
 const log = new Logger("retention-service")
 
@@ -23,6 +24,8 @@ const RETENTION_LOCK_ID = 999999937 // prime, avoids collision with ingestion lo
 // ────────── Result Types ──────────
 
 export interface RetentionRunResult {
+  /** Set when shutdown stopped the pass between phases: the first phase that did not run. */
+  stoppedBefore?: string
   snapshotsExpired: number
   snapshotsCapped: number
   /** Snapshots abandoned mid-ingest and marked failed so reads get a real error. */
@@ -293,7 +296,11 @@ export async function cleanupOrphanedData(): Promise<number> {
  * concurrent runs. Each phase runs independently — a failure in one
  * does not prevent the others from executing.
  */
-export async function runRetentionPolicy(): Promise<RetentionRunResult> {
+/**
+ * `control` lets a shutdown in progress stop the pass between phases; a pass
+ * started by an admin tool runs without one and always completes.
+ */
+export async function runRetentionPolicy(control?: PassControl): Promise<RetentionRunResult> {
   const start = Date.now()
   const errors: string[] = []
 
@@ -323,52 +330,61 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
   let staleTransactionsCleaned = 0
   let orphansCleaned = 0
 
+  // One phase at a time, each in its own try so a failure in one never costs
+  // the others. Between phases the pass looks for a stop request: shutdown
+  // then waits for the phase that is running and no longer, instead of closing
+  // the pool under a pass that still has four phases to go.
+  const phases: { name: string; failure: string; run: () => Promise<number>; record: (n: number) => void }[] = [
+    // Snapshots abandoned mid-ingest go first, because until one of these is
+    // reaped the whole repository answers nothing readable — a worse state than
+    // any amount of stale data, and the cheapest to clear.
+    {
+      name: "stuck_indexing",
+      failure: "Retention: stuck-indexing reap failed",
+      run: cleanupStuckIndexingSnapshots,
+      record: (n) => (stuckIndexingReaped = n),
+    },
+    // Stale transactions: fast, high priority.
+    {
+      name: "stale_transactions",
+      failure: "Retention: stale transaction cleanup failed",
+      run: cleanupStaleTransactions,
+      record: (n) => (staleTransactionsCleaned = n),
+    },
+    {
+      name: "snapshot_expiry",
+      failure: "Retention: snapshot expiry failed",
+      run: cleanupExpiredSnapshots,
+      record: (n) => (snapshotsExpired = n),
+    },
+    {
+      name: "snapshot_cap",
+      failure: "Retention: snapshot cap enforcement failed",
+      run: enforceSnapshotCap,
+      record: (n) => (snapshotsCapped = n),
+    },
+    {
+      name: "orphan_cleanup",
+      failure: "Retention: orphan cleanup failed",
+      run: cleanupOrphanedData,
+      record: (n) => (orphansCleaned = n),
+    },
+  ]
+  let stoppedBefore: string | undefined
+
   try {
-    // Phase 0: Snapshots abandoned mid-ingest. First, and in its own try, because
-    // until one of these is reaped the whole repository answers nothing readable —
-    // a worse state than any amount of stale data, and the cheapest to clear.
-    try {
-      stuckIndexingReaped = await cleanupStuckIndexingSnapshots()
-    } catch (err) {
-      const wrapped = err instanceof Error ? err : new Error(String(err))
-      log.error("Retention: stuck-indexing reap failed", wrapped)
-      errors.push(`stuck_indexing: ${wrapped.message}`)
-    }
-
-    // Phase 1: Stale transactions (fast, high priority)
-    try {
-      staleTransactionsCleaned = await cleanupStaleTransactions()
-    } catch (err) {
-      const wrapped = err instanceof Error ? err : new Error(String(err))
-      log.error("Retention: stale transaction cleanup failed", wrapped)
-      errors.push(`stale_transactions: ${wrapped.message}`)
-    }
-
-    // Phase 2: Snapshot expiry
-    try {
-      snapshotsExpired = await cleanupExpiredSnapshots()
-    } catch (err) {
-      const wrapped = err instanceof Error ? err : new Error(String(err))
-      log.error("Retention: snapshot expiry failed", wrapped)
-      errors.push(`snapshot_expiry: ${wrapped.message}`)
-    }
-
-    // Phase 3: Snapshot cap enforcement
-    try {
-      snapshotsCapped = await enforceSnapshotCap()
-    } catch (err) {
-      const wrapped = err instanceof Error ? err : new Error(String(err))
-      log.error("Retention: snapshot cap enforcement failed", wrapped)
-      errors.push(`snapshot_cap: ${wrapped.message}`)
-    }
-
-    // Phase 4: Orphan cleanup
-    try {
-      orphansCleaned = await cleanupOrphanedData()
-    } catch (err) {
-      const wrapped = err instanceof Error ? err : new Error(String(err))
-      log.error("Retention: orphan cleanup failed", wrapped)
-      errors.push(`orphan_cleanup: ${wrapped.message}`)
+    for (const phase of phases) {
+      if (control?.stopping) {
+        stoppedBefore = phase.name
+        break
+      }
+      try {
+        phase.record(await phase.run())
+      } catch (err) {
+        const wrapped = err instanceof Error ? err : new Error(String(err))
+        log.error(phase.failure, wrapped)
+        errors.push(`${phase.name}: ${wrapped.message}`)
+      }
     }
   } finally {
     await retentionLock.release()
@@ -376,7 +392,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
 
   const durationMs = Date.now() - start
 
-  log.info("Retention policy completed", {
+  log.info(stoppedBefore ? "Retention policy stopped between phases — shutdown requested" : "Retention policy completed", {
     snapshotsExpired,
     snapshotsCapped,
     stuckIndexingReaped,
@@ -384,6 +400,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
     orphansCleaned,
     durationMs,
     errorCount: errors.length,
+    ...(stoppedBefore ? { stoppedBefore } : {}),
   })
 
   return {
@@ -394,6 +411,7 @@ export async function runRetentionPolicy(): Promise<RetentionRunResult> {
     orphansCleaned,
     durationMs,
     errors,
+    ...(stoppedBefore ? { stoppedBefore } : {}),
   }
 }
 
