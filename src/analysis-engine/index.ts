@@ -37,10 +37,12 @@ export class StructuralGraphEngine {
       return 0
     }
 
-    // Identity columns only. This runs once per ingested file, and the full
-    // row set carries body_source for every symbol in the snapshot — 21 MB
-    // against 2.4 MB on a real snapshot, all of it discarded right after the
-    // two maps below are built.
+    // Identity columns only, loaded once for the whole snapshot. This used
+    // to run once per ingested file, rebuilding the index each time and
+    // asking the database for every name the index did not hold: 3.8 s of
+    // gin's 17.6 s ingest, 11.9 s of flask's 28.6 s, 19.0 s of this engine's
+    // 56.8 s. Resolving after every file's symbols exist also lets a
+    // relation reach a symbol in a file persisted after its own.
     const svRows = await coreDataService.getSymbolIdentitiesForSnapshot(snapshotId)
     const svByKey = new Map<string, string>()
     // Canonical names map to EVERY symbol carrying them, not to one.
@@ -97,12 +99,6 @@ export class StructuralGraphEngine {
     const unique = (bucket: string[] | undefined): string | undefined =>
       bucket && bucket.length === 1 ? bucket[0] : undefined
 
-    /** The identifier a call chain ends in: `pkg.Func` → `Func`, `a.b.c()` → `c`. */
-    const lastSegment = (name: string): string => {
-      const parts = name.split(/::|\./)
-      return parts[parts.length - 1] ?? name
-    }
-
     /**
      * Resolve a target from the in-memory maps, from the source symbol's own
      * scopes outward. Undefined means "not uniquely known here".
@@ -134,56 +130,13 @@ export class StructuralGraphEngine {
     // different fact: it says "one of these several", and picking one is a
     // guess presented as a measurement. Better to record no edge than a
     // confident wrong one; the adapter's exact declaration key is what
-    // resolves those cases.
-
-    // First pass: collect the names that no in-memory scope resolves, so the
-    // database can be asked once for each — by the identifier the call ends
-    // in, since that is what a symbol is named.
-    const unresolvedTargets = new Set<string>()
-    for (const rel of rawRelations) {
-      const srcSvId = svByKey.get(rel.source_key)
-      if (!srcSvId) continue
-      if (!resolveInScope(rel)) unresolvedTargets.add(lastSegment(rel.target_name))
-    }
-
-    // Batch-resolve all unresolved targets in chunked queries (avoids N+1)
-    const CHUNK_SIZE = 5000
-    const resolvedFromDb = new Map<string, string | null>()
-    if (unresolvedTargets.size > 0) {
-      const targetNames = Array.from(unresolvedTargets)
-      for (let i = 0; i < targetNames.length; i += CHUNK_SIZE) {
-        const chunk = targetNames.slice(i, i + CHUNK_SIZE)
-        const placeholders = chunk.map((_, j) => `$${j + 3}`).join(",")
-        const dbResult = await db.query(
-          `
-                    SELECT sv.symbol_version_id, s.canonical_name
-                    FROM symbol_versions sv
-                    JOIN symbols s ON s.symbol_id = sv.symbol_id
-                    WHERE s.repo_id = $1 AND sv.snapshot_id = $2
-                    AND s.canonical_name IN (${placeholders})
-                    ORDER BY s.canonical_name, sv.symbol_version_id
-                `,
-          [repoId, snapshotId, ...chunk],
-        )
-        // Count candidates per name; a name matching several symbols stays
-        // unresolved rather than being pinned to whichever row sorted first.
-        for (const row of dbResult.rows as { symbol_version_id: string; canonical_name: string }[]) {
-          const seen = resolvedFromDb.get(row.canonical_name)
-          if (seen === undefined) resolvedFromDb.set(row.canonical_name, row.symbol_version_id)
-          else if (seen !== null && seen !== row.symbol_version_id) resolvedFromDb.set(row.canonical_name, null)
-        }
-      }
-      log.debug("Batch-resolved unresolved relation targets", {
-        unresolved: unresolvedTargets.size,
-        resolved: resolvedFromDb.size,
-      })
-    }
-
-    // Second pass: build relation insert statements using all resolution sources
+    // resolves those cases. The index holds every symbol of the snapshot, so
+    // there is nothing left to ask the database for.
     let persisted = 0
     let sourceFailures = 0
     let targetFailures = 0
-    const statements: { text: string; params: unknown[] }[] = []
+    const rows: unknown[][] = []
+    const seenEdges = new Set<string>()
 
     for (const rel of rawRelations) {
       const srcSvId = svByKey.get(rel.source_key)
@@ -193,22 +146,19 @@ export class StructuralGraphEngine {
       }
 
       // Exact declaration key first — it is the only source that can tell two
-      // same-named symbols apart — then the scopes, then the database, and at
-      // every step only a unique match counts.
-      const dstSvId = resolveInScope(rel) || resolvedFromDb.get(lastSegment(rel.target_name)) || undefined
-
+      // same-named symbols apart — then the scopes, and at every step only a
+      // unique match counts.
+      const dstSvId = resolveInScope(rel)
       if (!dstSvId) {
         targetFailures++
         continue
       }
 
-      statements.push({
-        text: `INSERT INTO structural_relations (relation_id, src_symbol_version_id, dst_symbol_version_id, relation_type, strength, source, confidence)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7)
-                       ON CONFLICT (src_symbol_version_id, dst_symbol_version_id, relation_type)
-                       DO UPDATE SET confidence = GREATEST(structural_relations.confidence, EXCLUDED.confidence)`,
-        params: [uuidv4(), srcSvId, dstSvId, rel.relation_type, 1.0, "static_analysis", 0.9],
-      })
+      // One statement cannot update the same conflict target twice.
+      const edgeKey = `${srcSvId}|${dstSvId}|${rel.relation_type}`
+      if (seenEdges.has(edgeKey)) continue
+      seenEdges.add(edgeKey)
+      rows.push([uuidv4(), srcSvId, dstSvId, rel.relation_type, 1.0, "static_analysis", 0.9])
       persisted++
     }
 
@@ -221,9 +171,17 @@ export class StructuralGraphEngine {
       })
     }
 
-    // Batch insert all relation statements in a single transaction
-    if (statements.length > 0) {
-      await db.batchInsert(statements)
+    // One multi-row statement per chunk, not one round-trip per edge.
+    if (rows.length > 0) {
+      await db.bulkInsert(
+        "structural_relations",
+        ["relation_id", "src_symbol_version_id", "dst_symbol_version_id", "relation_type", "strength", "source", "confidence"],
+        rows,
+        {
+          conflict:
+            "ON CONFLICT (src_symbol_version_id, dst_symbol_version_id, relation_type) DO UPDATE SET confidence = GREATEST(structural_relations.confidence, EXCLUDED.confidence)",
+        },
+      )
     }
 
     timer({ persisted, sourceFailures, targetFailures })

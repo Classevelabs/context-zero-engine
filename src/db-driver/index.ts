@@ -213,6 +213,60 @@ export interface AdvisoryLock {
 
 // ─── Database Driver ─────────────────────────────────────────────────────────
 
+/** PostgreSQL: "ON CONFLICT DO UPDATE command cannot affect row a second time". */
+const CARDINALITY_VIOLATION = "21000"
+
+/** Placeholder budget per merged statement; PostgreSQL's cap is 65,535. */
+const MERGE_MAX_PARAMS = 30_000
+
+/**
+ * A single-row insert that can be folded: `INSERT INTO t (cols) VALUES
+ * ($1, ..., $n)` followed by nothing or an ON CONFLICT clause that carries
+ * no placeholders of its own.
+ */
+const SINGLE_ROW_INSERT_RE =
+  /^(\s*INSERT\s+INTO\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*VALUES)\s*\(([^)]*)\)((?:\s+ON\s+CONFLICT[\s\S]*)?)\s*$/i
+
+export interface MergeShape {
+  prefix: string
+  suffix: string
+  width: number
+}
+
+/** The merge shape of a statement, or null when it must run as written. */
+export function mergeShapeOf(text: string): MergeShape | null {
+  const m = SINGLE_ROW_INSERT_RE.exec(text)
+  if (!m) return null
+  const placeholders = m[2]!.split(",").map((p) => p.trim())
+  for (let i = 0; i < placeholders.length; i++) if (placeholders[i] !== `$${i + 1}`) return null
+  const suffix = m[3] ?? ""
+  if (/\$\d/.test(suffix)) return null
+  return { prefix: m[1]!, suffix, width: placeholders.length }
+}
+
+/** Consecutive statements with the same foldable text form one group; everything else is its own group of one. */
+export function groupMergeableStatements(
+  statements: { text: string; params: unknown[] }[],
+): { statements: { text: string; params: unknown[] }[]; merge: MergeShape | null }[] {
+  const groups: { statements: { text: string; params: unknown[] }[]; merge: MergeShape | null }[] = []
+  const shapes = new Map<string, MergeShape | null>()
+  for (const stmt of statements) {
+    let shape = shapes.get(stmt.text)
+    if (shape === undefined) {
+      shape = mergeShapeOf(stmt.text)
+      if (shape && shape.width !== stmt.params.length) shape = null
+      shapes.set(stmt.text, shape)
+    }
+    const last = groups[groups.length - 1]
+    if (shape && last && last.merge && last.statements[0]!.text === stmt.text && stmt.params.length === shape.width) {
+      last.statements.push(stmt)
+    } else {
+      groups.push({ statements: [stmt], merge: shape && stmt.params.length === shape.width ? shape : null })
+    }
+  }
+  return groups
+}
+
 class DatabaseDriver {
   private static instance: DatabaseDriver | null = null
   private pool: Pool
@@ -497,19 +551,69 @@ class DatabaseDriver {
     const identifier = "[A-Za-z_][A-Za-z0-9_]*"
     const target = `\\(\\s*${identifier}(?:\\s*,\\s*${identifier})*\\s*\\)`
     const doNothing = new RegExp(`^ON\\s+CONFLICT(?:\\s*${target})?\\s+DO\\s+NOTHING$`, "i")
-    if (!doNothing.test(trimmed)) {
+    // DO UPDATE is admitted only in the shapes the engine writes: take the
+    // incoming value, or the greater / lesser of the stored and incoming
+    // values. Identifiers only; no literals, no quotes, no other functions.
+    const value = `(?:EXCLUDED\\.${identifier}|(?:GREATEST|LEAST)\\(\\s*${identifier}\\.${identifier}\\s*,\\s*EXCLUDED\\.${identifier}\\s*\\))`
+    const assignment = `${identifier}\\s*=\\s*${value}`
+    const doUpdate = new RegExp(
+      `^ON\\s+CONFLICT\\s*${target}\\s+DO\\s+UPDATE\\s+SET\\s+${assignment}(?:\\s*,\\s*${assignment})*$`,
+      "i",
+    )
+    if (!doNothing.test(trimmed) && !doUpdate.test(trimmed)) {
       throw new Error(
-        "bulkInsert: conflict must be ON CONFLICT [(column, ...)] DO NOTHING using unquoted identifiers",
+        "bulkInsert: conflict must be ON CONFLICT [(column, ...)] DO NOTHING, or ON CONFLICT (column, ...) DO UPDATE SET column = EXCLUDED.column | GREATEST(table.column, EXCLUDED.column) | LEAST(...), using unquoted identifiers",
       )
     }
     return ` ${trimmed}`
   }
 
+  /**
+   * Run many statements in one transaction, merging what can be merged.
+   *
+   * Every engine persists through this method, and every one of them handed
+   * it one single-row INSERT per row: 21,849 round-trips for this engine's
+   * relations, one per risk score, one per invariant, one per effect
+   * signature. Consecutive statements with identical text of the form
+   * `INSERT INTO t (cols) VALUES ($1..$n) [ON CONFLICT ...]` are now folded
+   * into one multi-row statement per chunk with the placeholders renumbered;
+   * anything else (an UPDATE, a CTE, a lone row) runs as written. A folded
+   * chunk that PostgreSQL refuses because two rows hit the same conflict
+   * target (cardinality_violation) is rolled back to a savepoint and run row
+   * by row, so a caller that relied on last-write-wins keeps that.
+   */
   public async batchInsert(statements: { text: string; params: unknown[] }[]): Promise<void> {
     await this.transaction(async (client) => {
       await client.query(this.bulkTimeoutSql())
-      for (const stmt of statements) {
-        await client.query(stmt.text, stmt.params)
+      for (const group of groupMergeableStatements(statements)) {
+        if (group.merge === null) {
+          for (const stmt of group.statements) await client.query(stmt.text, stmt.params)
+          continue
+        }
+        const { prefix, suffix, width } = group.merge
+        const maxRows = Math.max(1, Math.floor(MERGE_MAX_PARAMS / width))
+        for (let offset = 0; offset < group.statements.length; offset += maxRows) {
+          const chunk = group.statements.slice(offset, offset + maxRows)
+          const tuples: string[] = []
+          const params: unknown[] = []
+          let idx = 1
+          for (const stmt of chunk) {
+            const placeholders: string[] = []
+            for (let c = 0; c < width; c++) placeholders.push(`$${idx++}`)
+            tuples.push(`(${placeholders.join(", ")})`)
+            params.push(...stmt.params)
+          }
+          await client.query("SAVEPOINT batch_merge")
+          try {
+            await client.query(`${prefix} ${tuples.join(", ")}${suffix}`, params)
+            await client.query("RELEASE SAVEPOINT batch_merge")
+          } catch (err) {
+            if ((err as { code?: string }).code !== CARDINALITY_VIOLATION) throw err
+            await client.query("ROLLBACK TO SAVEPOINT batch_merge")
+            await client.query("RELEASE SAVEPOINT batch_merge")
+            for (const stmt of chunk) await client.query(stmt.text, stmt.params)
+          }
+        }
       }
     })
   }

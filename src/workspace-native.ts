@@ -26,6 +26,8 @@ export interface WorkspaceFileInfo {
   absPath: string
   relativePath: string
   size: number
+  /** Last modification time, so a parse can be reused while the file is unchanged. */
+  mtimeMs: number
   language: SupportedLanguage | null
 }
 
@@ -396,6 +398,7 @@ export async function discoverWorkspaceFiles(
         absPath: entryPath,
         relativePath: toPortableRelativePath(path.relative(repoPath, entryPath) || path.basename(entryPath)),
         size: stat.size,
+        mtimeMs: stat.mtimeMs,
         language,
       })
     }
@@ -448,6 +451,42 @@ function buildRegex(pattern: string, wsLog?: WorkspaceLogger): { regex: RegExp; 
       mode: "literal",
     }
   }
+}
+
+/**
+ * Parsed symbols per file, reused while the file's size and mtime hold.
+ * Every symbol search parsed every file of the workspace again; a search
+ * over an unchanged tree is a lookup, not a parse. Bounded so a long
+ * session over many repositories does not hold every tree in memory.
+ */
+const PARSE_CACHE_MAX = 4000
+const parseCache = new Map<string, { size: number; mtimeMs: number; extraction: ReturnType<typeof extractWithTreeSitter> }>()
+
+async function parsedSymbols(
+  file: WorkspaceFileInfo,
+  language: SupportedLanguage,
+): Promise<ReturnType<typeof extractWithTreeSitter> | null> {
+  const cached = parseCache.get(file.absPath)
+  if (cached && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
+    // Refresh recency: delete + set keeps the map in eviction order.
+    parseCache.delete(file.absPath)
+    parseCache.set(file.absPath, cached)
+    return cached.extraction
+  }
+  const source = await readTextFile(file.absPath)
+  if (source === null) return null
+  const extraction = extractWithTreeSitter(file.relativePath, source, language)
+  if (parseCache.size >= PARSE_CACHE_MAX) {
+    const oldest = parseCache.keys().next().value
+    if (oldest !== undefined) parseCache.delete(oldest)
+  }
+  parseCache.set(file.absPath, { size: file.size, mtimeMs: file.mtimeMs, extraction })
+  return extraction
+}
+
+/** How many parsed files the search cache holds; for tests and diagnostics. */
+export function parseCacheSize(): number {
+  return parseCache.size
 }
 
 async function readTextFile(filePath: string): Promise<string | null> {
@@ -742,11 +781,10 @@ export async function searchWorkspaceSymbols(
     if (options?.language && language !== options.language) continue
 
     try {
-      const source = await readTextFile(file.absPath)
-      if (source === null) continue
+      const extraction = await parsedSymbols(file, language)
+      if (extraction === null) continue
       scannedFiles++
 
-      const extraction = extractWithTreeSitter(file.relativePath, source, language)
       const symbols = extraction.symbols
         .filter((symbol) => !options?.kindFilter || symbol.kind === options.kindFilter)
         .map((symbol) => {

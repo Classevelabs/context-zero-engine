@@ -721,15 +721,10 @@ export class CoreDataService {
    * Identity triples for every symbol in a snapshot — nothing else.
    *
    * Relation resolution needs only stable_key, canonical_name and
-   * symbol_version_id, but was calling getSymbolVersionsForSnapshot, which
-   * selects `sv.*` and therefore drags `body_source` — the full text of every
-   * symbol — across the wire. On the REX snapshot that is 21 MB per call
-   * against 2,413 kB of identity, and the call happens once per ingested file:
-   * 2,576 files x 21 MB is roughly 54 GB of redundant transfer and parsing for
-   * data that is discarded immediately.
-   *
-   * Measured on that snapshot: 1,160ms for the full row set, 304ms for these
-   * three columns — 3.8x cheaper, per file.
+   * symbol_version_id. It is loaded once per snapshot, after every file's
+   * symbols exist, and it must be complete: a cap here would silently drop
+   * every edge into the symbols past it, which is why there is none. Three
+   * columns for 125,777 versions (the largest snapshot seen) is about 12 MB.
    */
   public async getSymbolIdentitiesForSnapshot(
     snapshot_id: string,
@@ -740,7 +735,6 @@ export class CoreDataService {
             FROM symbol_versions sv
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             WHERE sv.snapshot_id = $1
-            LIMIT 100000
         `,
       [snapshot_id],
     )

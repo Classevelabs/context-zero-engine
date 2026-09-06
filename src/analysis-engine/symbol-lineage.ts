@@ -109,6 +109,77 @@ const RENAME_CONFIDENCE_THRESHOLD = 0.45
 /** Maximum number of old candidates to run expensive matching against per new symbol */
 const MAX_FUZZY_CANDIDATES = 200
 
+/** Character bigrams of a lower-cased name; a one-character name is its own bigram. */
+export function nameBigrams(name: string): Set<string> {
+  const lower = name.toLowerCase()
+  const grams = new Set<string>()
+  if (lower.length < 2) {
+    if (lower.length === 1) grams.add(lower)
+    return grams
+  }
+  for (let i = 0; i + 1 < lower.length; i++) grams.add(lower.slice(i, i + 2))
+  return grams
+}
+
+/**
+ * Old symbols indexed by (kind, language) bucket, then by name bigram and
+ * by body and normalized-AST hash, so a new symbol's candidates are found
+ * by lookup: the bucket's symbols sharing the most bigrams with its name,
+ * plus any sharing its hashes.
+ */
+export class CandidateIndex {
+  private readonly buckets = new Map<string, { byBigram: Map<string, number[]>; byHash: Map<string, number[]>; syms: SnapshotSymbolRow[] }>()
+
+  constructor(oldByKind: Map<string, SnapshotSymbolRow[]>) {
+    for (const syms of oldByKind.values()) {
+      for (const sym of syms) {
+        const key = `${sym.kind}\u0000${sym.language}`
+        let bucket = this.buckets.get(key)
+        if (!bucket) this.buckets.set(key, (bucket = { byBigram: new Map(), byHash: new Map(), syms: [] }))
+        const idx = bucket.syms.length
+        bucket.syms.push(sym)
+        for (const gram of nameBigrams(sym.canonical_name)) {
+          const list = bucket.byBigram.get(gram)
+          if (list) list.push(idx)
+          else bucket.byBigram.set(gram, [idx])
+        }
+        for (const hash of [sym.body_hash, sym.normalized_ast_hash]) {
+          if (!hash) continue
+          const list = bucket.byHash.get(hash)
+          if (list) list.push(idx)
+          else bucket.byHash.set(hash, [idx])
+        }
+      }
+    }
+  }
+
+  /** Candidates for a new symbol, most shared bigrams first, hash matches always included; never the symbol itself. */
+  candidatesFor(newSym: SnapshotSymbolRow, limit: number): { sym: SnapshotSymbolRow }[] {
+    const bucket = this.buckets.get(`${newSym.kind}\u0000${newSym.language}`)
+    if (!bucket) return []
+    const shared = new Map<number, number>()
+    for (const gram of nameBigrams(newSym.canonical_name)) {
+      for (const idx of bucket.byBigram.get(gram) ?? []) shared.set(idx, (shared.get(idx) ?? 0) + 1)
+    }
+    const isSelf = (sym: SnapshotSymbolRow): boolean =>
+      sym.canonical_name === newSym.canonical_name && sym.file_path === newSym.file_path
+    const ranked = [...shared.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+      .map(([idx]) => bucket.syms[idx]!)
+      .filter((sym) => !isSelf(sym))
+      .slice(0, limit)
+    const chosen = new Set(ranked)
+    for (const hash of [newSym.body_hash, newSym.normalized_ast_hash]) {
+      if (!hash) continue
+      for (const idx of bucket.byHash.get(hash) ?? []) {
+        const sym = bucket.syms[idx]!
+        if (!isSelf(sym)) chosen.add(sym)
+      }
+    }
+    return [...chosen].map((sym) => ({ sym }))
+  }
+}
+
 /** Weights for fuzzy matching signals */
 const MATCH_WEIGHTS = {
   normalized_ast: 0.3,
@@ -521,26 +592,18 @@ export class SymbolLineageEngine {
 
     const matches: RenameMatch[] = []
 
+    // Candidates come from an index, not a scan. The loop below used to rank
+    // every same-kind old symbol by edit distance for every new symbol: a
+    // quadratic pass with a Levenshtein table at each step, 3.2 s on this
+    // engine's own snapshot. A rename keeps most of a name's bigrams, and a
+    // move keeps the body or the normalized AST, so the candidates are the
+    // old symbols that share bigrams with the new name (most shared first)
+    // and the ones that share its body or AST hash; nothing else can score.
+    const index = new CandidateIndex(oldByKind)
+
     for (const newSym of newSymbols) {
-      // Only match against same-kind symbols (function <-> function, class <-> class)
-      const sameKindOld = oldByKind.get(newSym.kind)
-      if (!sameKindOld || sameKindOld.length === 0) continue
-
-      // Pre-filter to same language and exclude self-matches
-      const eligible = sameKindOld.filter(
-        (oldSym) =>
-          oldSym.language === newSym.language &&
-          !(oldSym.canonical_name === newSym.canonical_name && oldSym.file_path === newSym.file_path),
-      )
-      if (eligible.length === 0) continue
-
-      // Pre-sort candidates by name edit distance (cheapest signal) and cap
-      const scored = eligible.map((oldSym) => ({
-        sym: oldSym,
-        nameDist: this.levenshteinDistance(oldSym.canonical_name, newSym.canonical_name),
-      }))
-      scored.sort((a, b) => a.nameDist - b.nameDist)
-      const candidates = scored.slice(0, MAX_FUZZY_CANDIDATES)
+      const candidates = index.candidatesFor(newSym, MAX_FUZZY_CANDIDATES)
+      if (candidates.length === 0) continue
 
       let bestMatch: RenameMatch | null = null
       let bestScore = 0

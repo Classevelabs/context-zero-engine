@@ -20,6 +20,7 @@ import type { BehavioralProfile, ContractProfile } from "../types"
 // ── DB mocks ────────────────────────────────────────────────────────
 const mockQuery = jest.fn().mockResolvedValue({ rows: [], rowCount: 0 })
 const mockBatchInsert = jest.fn().mockResolvedValue(undefined)
+const mockBulkInsert = jest.fn().mockResolvedValue({ rowsInserted: 0 })
 const mockTransaction = jest.fn().mockImplementation(async (cb: any) =>
   cb({
     query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }),
@@ -31,6 +32,7 @@ jest.mock("../db-driver", () => ({
   db: {
     query: (...args: any[]) => mockQuery(...args),
     batchInsert: (...args: any[]) => mockBatchInsert(...args),
+    bulkInsert: (...args: any[]) => mockBulkInsert(...args),
     transaction: (...args: any[]) => mockTransaction(...args),
     queryWithClient: (...args: any[]) => mockQueryWithClient(...args),
   },
@@ -143,6 +145,8 @@ beforeEach(() => {
   jest.clearAllMocks()
   mockQuery.mockResolvedValue({ rows: [], rowCount: 0 })
   mockBatchInsert.mockResolvedValue(undefined)
+  mockBulkInsert.mockReset()
+  mockBulkInsert.mockResolvedValue({ rowsInserted: 0 })
 })
 
 // =====================================================================
@@ -2061,7 +2065,27 @@ describe("StructuralGraphEngine", () => {
 
       const result = await sge.computeRelationsFromRaw("snap-1", "repo-1", relations)
       expect(result).toBe(1)
-      expect(mockBatchInsert).toHaveBeenCalled()
+      // One multi-row statement for the whole snapshot, not one per edge.
+      expect(mockBulkInsert).toHaveBeenCalledTimes(1)
+      const [table, columns, rows, options] = mockBulkInsert.mock.calls[0]!
+      expect(table).toBe("structural_relations")
+      expect(columns).toEqual(["relation_id", "src_symbol_version_id", "dst_symbol_version_id", "relation_type", "strength", "source", "confidence"])
+      expect(rows).toHaveLength(1)
+      expect(rows[0].slice(1, 4)).toEqual(["sv-a", "sv-b", "calls"])
+      expect(options.conflict).toContain("DO UPDATE SET confidence = GREATEST(structural_relations.confidence, EXCLUDED.confidence)")
+      expect(mockQuery.mock.calls.some((c) => String(c[0]).includes("canonical_name IN"))).toBe(false)
+    })
+
+    test("the same edge extracted twice is written once", async () => {
+      const { coreDataService } = require("../db-driver/core_data")
+      coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
+        { stable_key: "src/a.ts::funcA", canonical_name: "funcA", symbol_version_id: "sv-a" },
+        { stable_key: "src/b.ts::funcB", canonical_name: "funcB", symbol_version_id: "sv-b" },
+      ])
+      const rel = { source_key: "src/a.ts::funcA", target_name: "funcB", relation_type: "calls" as const }
+      const result = await sge.computeRelationsFromRaw("snap-1", "repo-1", [rel, { ...rel }])
+      expect(result).toBe(1)
+      expect(mockBulkInsert.mock.calls[0]![2]).toHaveLength(1)
     })
 
     test("skips relations with unresolved source", async () => {
@@ -2081,10 +2105,10 @@ describe("StructuralGraphEngine", () => {
     // the relations it extracted, flask 6.5%.
     describe("resolves by scope, from the caller outward", () => {
       const persistedTargets = (): string[] =>
-        (mockBatchInsert.mock.calls.at(-1)?.[0] as { params: unknown[] }[]).map((s) => s.params[2] as string)
+        (mockBulkInsert.mock.calls.at(-1)?.[2] as unknown[][]).map((row) => row[2] as string)
 
       beforeEach(() => {
-        mockBatchInsert.mockClear()
+        mockBulkInsert.mockClear()
         const { coreDataService } = require("../db-driver/core_data")
         coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
           { stable_key: "pkg/a.go::handle", canonical_name: "handle", symbol_version_id: "sv-a-handle" },
@@ -2124,9 +2148,10 @@ describe("StructuralGraphEngine", () => {
           { source_key: "other/c.go::farCaller", target_name: "c.JSON", relation_type: "calls" as const },
         ])
         // The first names the owner; the second names a variable, and JSON is
-        // unique in the repository, so both land on the same member.
-        expect(n).toBe(2)
-        expect(persistedTargets()).toEqual(["sv-ctx-json", "sv-ctx-json"])
+        // unique in the repository, so both land on the same member — and the
+        // same edge is written once.
+        expect(n).toBe(1)
+        expect(persistedTargets()).toEqual(["sv-ctx-json"])
       })
 
       test("a file-level relation comes from the file's module symbol", async () => {
@@ -2137,14 +2162,20 @@ describe("StructuralGraphEngine", () => {
         expect(persistedTargets()).toEqual(["sv-unique"])
       })
 
-      test("the database is asked by the identifier a chain ends in, not the chain", async () => {
-        mockQuery.mockResolvedValueOnce({ rows: [{ symbol_version_id: "sv-db", canonical_name: "Split" }], rowCount: 1 })
+      test("a chain resolves by the identifier it ends in, from the index, with no database lookup", async () => {
+        // `strings.Split` names a package the index does not know; `Split` is
+        // unique in the repository, so the chain lands on it without a query.
+        const { coreDataService } = require("../db-driver/core_data")
+        coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
+          { stable_key: "pkg/a.go::caller", canonical_name: "caller", symbol_version_id: "sv-caller" },
+          { stable_key: "lib/str.go::Split", canonical_name: "Split", symbol_version_id: "sv-split" },
+        ])
         const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
           { source_key: "pkg/a.go::caller", target_name: "strings.Split", relation_type: "calls" as const },
         ])
-        const lookup = mockQuery.mock.calls.find((c) => String(c[0]).includes("canonical_name IN"))
-        expect(lookup?.[1]).toEqual(["repo-1", "snap-1", "Split"])
         expect(n).toBe(1)
+        expect(persistedTargets()).toEqual(["sv-split"])
+        expect(mockQuery.mock.calls.some((c) => String(c[0]).includes("canonical_name IN"))).toBe(false)
       })
     })
   })

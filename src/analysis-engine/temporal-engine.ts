@@ -22,6 +22,7 @@ import { Logger } from "../logger"
 import { resolveExistingPath } from "../path-security"
 import { temporal as temporalConfig } from "../config"
 import { blameFile, commitsPerSymbol, withinBudget, type SymbolHistory, type SymbolRange } from "./blame-co-change"
+import { refinedParentOf } from "./deep-contracts"
 
 const log = new Logger("temporal-engine")
 
@@ -359,17 +360,24 @@ export class TemporalEngine {
 
     const rows = (
       await db.query(
-        `SELECT f.path, s.symbol_id, sv.range_start_line, sv.range_end_line
+        `SELECT f.path, s.symbol_id, sv.symbol_version_id, sv.range_start_line, sv.range_end_line
            FROM symbol_versions sv
            JOIN symbols s ON s.symbol_id = sv.symbol_id
            JOIN files f ON f.file_id = sv.file_id
           WHERE sv.snapshot_id = $1 AND s.kind <> 'module'`,
         [snapshotId],
       )
-    ).rows as { path: string; symbol_id: string; range_start_line: number; range_end_line: number }[]
+    ).rows as {
+      path: string
+      symbol_id: string
+      symbol_version_id: string
+      range_start_line: number
+      range_end_line: number
+    }[]
 
     const rangesByFile = new Map<string, SymbolRange[]>()
     const symbolsByFile = new Map<string, string[]>()
+    const versionBySymbol = new Map<string, string>()
     for (const row of rows) {
       const ranges = rangesByFile.get(row.path) ?? []
       ranges.push({ symbol_id: row.symbol_id, range_start_line: row.range_start_line, range_end_line: row.range_end_line })
@@ -377,27 +385,78 @@ export class TemporalEngine {
       const ids = symbolsByFile.get(row.path) ?? []
       if (!ids.includes(row.symbol_id)) ids.push(row.symbol_id)
       symbolsByFile.set(row.path, ids)
+      versionBySymbol.set(row.symbol_id, row.symbol_version_id)
     }
 
+    // A file with the same content as in the parent snapshot has the same
+    // blame: each line's last commit is a property of the content. Its
+    // symbols' commit sets are carried from the parent version's stored
+    // history instead of being blamed again, as long as every symbol of the
+    // file has one; a file where any symbol lacks a stored set is blamed.
     const commitsBySymbol = new Map<string, Set<string>>()
     const blamedFiles = new Set<string>()
-    let unblamable = 0
-    const { skipped } = await withinBudget(
-      [...rangesByFile.entries()],
-      BLAME_CONCURRENCY,
-      temporalConfig.blameBudgetMs,
-      async ([path, ranges]) => {
-        const shas = await blameFile(repoBasePath, path, BLAME_FILE_TIMEOUT_MS)
-        if (!shas) {
-          unblamable++
-          return
-        }
-        blamedFiles.add(path)
-        for (const [symbolId, commits] of commitsPerSymbol(shas, ranges)) commitsBySymbol.set(symbolId, commits)
-      },
-    )
+    const carriedFiles = new Set<string>()
+    const parent = await refinedParentOf(snapshotId)
+    if (parent) {
+      const carried = (
+        await db.query(
+          `SELECT f.path, sv.symbol_id, h.commit_shas
+             FROM symbol_versions sv
+             JOIN symbols s ON s.symbol_id = sv.symbol_id AND s.kind <> 'module'
+             JOIN files f ON f.file_id = sv.file_id
+             JOIN files pf ON pf.snapshot_id = $2 AND pf.path = f.path AND pf.content_hash = f.content_hash
+             JOIN symbol_versions p ON p.snapshot_id = $2 AND p.symbol_id = sv.symbol_id AND p.file_id = pf.file_id
+             JOIN symbol_history h ON h.symbol_version_id = p.symbol_version_id
+            WHERE sv.snapshot_id = $1`,
+          [snapshotId, parent],
+        )
+      ).rows as { path: string; symbol_id: string; commit_shas: string[] }[]
+      const carriedByFile = new Map<string, Map<string, string[]>>()
+      for (const row of carried) {
+        const perFile = carriedByFile.get(row.path) ?? new Map<string, string[]>()
+        perFile.set(row.symbol_id, row.commit_shas)
+        carriedByFile.set(row.path, perFile)
+      }
+      for (const [path, perFile] of carriedByFile) {
+        const wanted = symbolsByFile.get(path) ?? []
+        if (wanted.length === 0 || !wanted.every((id) => perFile.has(id))) continue
+        for (const id of wanted) commitsBySymbol.set(id, new Set(perFile.get(id)))
+        carriedFiles.add(path)
+      }
+    }
 
-    timer({ files: rangesByFile.size, blamed: blamedFiles.size, unblamable, budget_skipped: skipped })
+    let unblamable = 0
+    const toBlame = [...rangesByFile.entries()].filter(([path]) => !carriedFiles.has(path))
+    const { skipped } = await withinBudget(toBlame, BLAME_CONCURRENCY, temporalConfig.blameBudgetMs, async ([path, ranges]) => {
+      const shas = await blameFile(repoBasePath, path, BLAME_FILE_TIMEOUT_MS)
+      if (!shas) {
+        unblamable++
+        return
+      }
+      blamedFiles.add(path)
+      for (const [symbolId, commits] of commitsPerSymbol(shas, ranges)) commitsBySymbol.set(symbolId, commits)
+    })
+
+    // Store what was attributed, carried or blamed, for the next snapshot.
+    const historyRows: unknown[][] = []
+    for (const [symbolId, commits] of commitsBySymbol) {
+      const versionId = versionBySymbol.get(symbolId)
+      if (versionId) historyRows.push([versionId, [...commits]])
+    }
+    if (historyRows.length > 0) {
+      await db.bulkInsert("symbol_history", ["symbol_version_id", "commit_shas"], historyRows, {
+        conflict: "ON CONFLICT (symbol_version_id) DO UPDATE SET commit_shas = EXCLUDED.commit_shas",
+      })
+    }
+
+    for (const path of carriedFiles) blamedFiles.add(path)
+    timer({
+      files: rangesByFile.size,
+      blamed: blamedFiles.size - carriedFiles.size,
+      carried: carriedFiles.size,
+      unblamable,
+      budget_skipped: skipped,
+    })
     return { commitsBySymbol, blamedFiles, symbolsByFile, filesSkipped: unblamable + skipped }
   }
 

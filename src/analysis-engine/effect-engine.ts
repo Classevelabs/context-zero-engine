@@ -27,6 +27,7 @@
 
 import { v4 as uuidv4 } from "uuid"
 import { db } from "../db-driver"
+import { refinedParentOf } from "./deep-contracts"
 import { jsonField, validateRows, validateBehavioralProfile, validateContractProfile } from "../db-driver/result"
 import { Logger } from "../logger"
 import { stripLiteralsAndComments } from "./code-text"
@@ -624,17 +625,33 @@ export class EffectEngine {
   public async computeEffectSignatures(snapshotId: string): Promise<number> {
     const timer = log.startTimer("computeEffectSignatures", { snapshotId })
 
-    // Load all symbol versions for the snapshot
+    // Load all symbol versions for the snapshot. A version carried forward
+    // from a fully refined parent with the same body and signature brings
+    // the parent version's direct effects along (`carried`), and is assembled
+    // from those instead of being mined again; transitive entries are not
+    // copied, because the graph around it may have changed, and propagation
+    // rebuilds them for the whole snapshot right after.
+    const parent = await refinedParentOf(snapshotId)
     const svResult = await db.query(
       `
             SELECT sv.symbol_version_id, sb.body_source, sv.signature, sv.summary,
-                   sv.language, s.canonical_name, s.kind
+                   sv.language, s.canonical_name, s.kind,
+                   ${parent ? "pes.effects" : "NULL"} AS carried
             FROM symbol_versions sv
             LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
+            ${
+              parent
+                ? `LEFT JOIN symbol_versions p
+                     ON p.snapshot_id = $2 AND p.symbol_id = sv.symbol_id
+                    AND p.body_ref IS NOT DISTINCT FROM sv.body_ref AND p.signature = sv.signature
+                   LEFT JOIN effect_signatures pes
+                     ON pes.symbol_version_id = p.symbol_version_id AND pes.source = 'static_analysis'`
+                : ""
+            }
             WHERE sv.snapshot_id = $1
         `,
-      [snapshotId],
+      parent ? [snapshotId, parent] : [snapshotId],
     )
 
     const symbolVersions = svResult.rows as {
@@ -645,7 +662,9 @@ export class EffectEngine {
       language: string
       canonical_name: string
       kind: string
+      carried: EffectEntry[] | null
     }[]
+    let carriedCount = 0
 
     if (symbolVersions.length === 0) {
       timer({ computed: 0 })
@@ -694,25 +713,32 @@ export class EffectEngine {
 
       const effects: EffectEntry[] = []
 
-      // Mine from behavioral profile
-      if (bp) {
-        effects.push(...withSource(this.mineFromBehavioralProfile(bp), "behavioral_profile"))
-      }
+      if (Array.isArray(sv.carried)) {
+        // Same text, same signature, same profiles: the direct observations
+        // are the parent's, exactly.
+        effects.push(...sv.carried.filter((e) => e.provenance !== "transitive"))
+        carriedCount++
+      } else {
+        // Mine from behavioral profile
+        if (bp) {
+          effects.push(...withSource(this.mineFromBehavioralProfile(bp), "behavioral_profile"))
+        }
 
-      // Mine from contract profile
-      if (cp) {
-        effects.push(...withSource(this.mineFromContractProfile(cp), "contract_profile"))
-      }
+        // Mine from contract profile
+        if (cp) {
+          effects.push(...withSource(this.mineFromContractProfile(cp), "contract_profile"))
+        }
 
-      // Mine from framework patterns (body source + signature)
-      // Skip framework pattern mining for class/interface/type_alias symbols:
-      // their body_source contains ALL member code, so patterns like .query()
-      // or .get() inside methods would be falsely attributed to the class itself.
-      // Individual methods get their own effect signatures.
-      const isContainerKind = sv.kind === "class" || sv.kind === "interface" || sv.kind === "type_alias"
-      if (!isContainerKind) {
-        const codeText = [sv.body_source || "", sv.signature || "", sv.summary || ""].join("\n")
-        effects.push(...this.mineFromFrameworkPatterns(codeText, sv.language))
+        // Mine from framework patterns (body source + signature)
+        // Skip framework pattern mining for class/interface/type_alias symbols:
+        // their body_source contains ALL member code, so patterns like .query()
+        // or .get() inside methods would be falsely attributed to the class itself.
+        // Individual methods get their own effect signatures.
+        const isContainerKind = sv.kind === "class" || sv.kind === "interface" || sv.kind === "type_alias"
+        if (!isContainerKind) {
+          const codeText = [sv.body_source || "", sv.signature || "", sv.summary || ""].join("\n")
+          effects.push(...this.mineFromFrameworkPatterns(codeText, sv.language))
+        }
       }
 
       // Deduplicate effects by kind+descriptor
@@ -778,7 +804,7 @@ export class EffectEngine {
       await db.batchInsert(chunk)
     }
 
-    timer({ computed, total_symbols: symbolVersions.length })
+    timer({ computed, carried: carriedCount, total_symbols: symbolVersions.length })
     return computed
   }
 

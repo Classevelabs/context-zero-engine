@@ -303,6 +303,23 @@ export function capPerSymbol(candidates: InvariantCandidate[]): InvariantCandida
   return candidates.filter((c) => !c.scope_symbol_id || !over.has(c.scope_symbol_id) || kept.has(c))
 }
 
+/**
+ * The parent snapshot whose derived rows a new snapshot may inherit: complete,
+ * and owing no deferred refinement. Null otherwise, which means "mine
+ * everything", never "trust a gap".
+ */
+export async function refinedParentOf(snapshotId: string): Promise<string | null> {
+  const result = await db.query(
+    `SELECT p.snapshot_id
+       FROM snapshots c
+       JOIN snapshots p ON p.snapshot_id = c.parent_snapshot_id
+      WHERE c.snapshot_id = $1 AND p.index_status = 'complete' AND p.refinement_pending_since IS NULL`,
+    [snapshotId],
+  )
+  const row = result.rows[0] as { snapshot_id?: string } | undefined
+  return row?.snapshot_id ?? null
+}
+
 export class DeepContractSynthesizer {
   // -----------------------------------------------------------------------
   // Public API
@@ -330,9 +347,40 @@ export class DeepContractSynthesizer {
     let persisted = 0
     const BATCH_SIZE = 500
 
-    // Phase 1: per-symbol body + signature + decorator mining in batches
-    // Uses LIMIT/OFFSET to avoid loading all body_source columns at once
-    for (let offset = 0; offset < totalSymbols; offset += BATCH_SIZE) {
+    // A version carried forward from a fully refined parent snapshot with the
+    // same body and signature has exactly the invariants its symbol already
+    // holds: they are re-verified against this snapshot in one statement and
+    // the symbol is not mined again. On a one-file change that is every
+    // symbol but the changed file's. The parent must be complete and owe no
+    // deferred refinement, or its rows cannot be trusted to exist.
+    const parent = await refinedParentOf(snapshotId)
+    let carried = 0
+    if (parent) {
+      const reverified = await db.query(
+        `UPDATE invariants i
+            SET last_verified_snapshot_id = $1
+           FROM symbol_versions sv
+           JOIN symbol_versions p
+             ON p.snapshot_id = $3 AND p.symbol_id = sv.symbol_id
+            AND p.body_ref IS NOT DISTINCT FROM sv.body_ref AND p.signature = sv.signature
+          WHERE sv.snapshot_id = $1 AND i.repo_id = $2 AND i.scope_symbol_id = sv.symbol_id`,
+        [snapshotId, repoId, parent],
+      )
+      carried = reverified.rowCount ?? 0
+    }
+
+    // Phase 1: per-symbol body + signature + decorator mining, paged by key.
+    // OFFSET paging re-scanned every earlier page on each step, which made
+    // the loop quadratic in the snapshot; a cursor on the ordered key reads
+    // each row once.
+    const unchangedFilter = parent
+      ? `AND NOT EXISTS (
+                    SELECT 1 FROM symbol_versions p
+                    WHERE p.snapshot_id = $4 AND p.symbol_id = sv.symbol_id
+                      AND p.body_ref IS NOT DISTINCT FROM sv.body_ref AND p.signature = sv.signature)`
+      : ""
+    let cursor = "00000000-0000-0000-0000-000000000000"
+    for (;;) {
       const batchResult = await db.query(
         `
                 SELECT sv.*, sb.body_source, s.canonical_name, s.kind, s.stable_key, s.repo_id, f.path as file_path
@@ -340,14 +388,17 @@ export class DeepContractSynthesizer {
                 LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
                 JOIN symbols s ON s.symbol_id = sv.symbol_id
                 JOIN files f ON f.file_id = sv.file_id
-                WHERE sv.snapshot_id = $1
+                WHERE sv.snapshot_id = $1 AND sv.symbol_version_id > $2
+                ${unchangedFilter}
                 ORDER BY sv.symbol_version_id
-                LIMIT $2 OFFSET $3
+                LIMIT $3
             `,
-        [snapshotId, BATCH_SIZE, offset],
+        parent ? [snapshotId, cursor, BATCH_SIZE, parent] : [snapshotId, cursor, BATCH_SIZE],
       )
 
       const svRows = batchResult.rows as import("../db-driver/core_data").SymbolVersionRow[]
+      if (svRows.length === 0) break
+      cursor = svRows[svRows.length - 1]!.symbol_version_id
       const batchCandidates: InvariantCandidate[] = []
 
       for (const sv of svRows) {
@@ -429,6 +480,8 @@ export class DeepContractSynthesizer {
       cross_symbol_invariants: crossSymbolCount,
       total_persisted: totalPersisted,
       trimmed_over_cap: trimmed,
+      carried_from_parent: carried,
+      symbols: totalSymbols,
     })
     return totalPersisted
   }

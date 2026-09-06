@@ -322,10 +322,25 @@ describe("DatabaseDriver.bulkInsert conflict safety", () => {
   })
 
   it.each([
+    "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
+    "ON CONFLICT (src, dst, kind) DO UPDATE SET confidence = GREATEST(edges.confidence, EXCLUDED.confidence)",
+    "ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a, b = LEAST(events.b, EXCLUDED.b)",
+  ])("allows an update clause of the checkable shape: %s", async (conflict) => {
+    await expect(db.bulkInsert("events", ["id", "value"], [["event-1", "ok"]], { conflict })).resolves.toEqual({
+      rowsInserted: 1,
+    })
+    expect(mockClient.query).toHaveBeenCalledWith(expect.stringContaining(conflict), ["event-1", "ok"])
+  })
+
+  it.each([
     "ON CONFLICT (id) DO NOTHING; DROP TABLE events",
     "ON CONFLICT (id) DO NOTHING --",
-    "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value",
     "ON CONFLICT (id /* injected */) DO NOTHING",
+    "ON CONFLICT (id) DO UPDATE SET value = 'x'",
+    "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value; DROP TABLE events",
+    "ON CONFLICT (id) DO UPDATE SET value = lower(EXCLUDED.value)",
+    "ON CONFLICT DO UPDATE SET value = EXCLUDED.value",
+    "ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value WHERE true",
   ])("rejects unstructured conflict SQL: %s", async (conflict) => {
     await expect(db.bulkInsert("events", ["id"], [["event-1"]], { conflict })).rejects.toThrow(
       "conflict must be",

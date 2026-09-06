@@ -40,7 +40,7 @@ import { resolveExistingPath, resolvePathWithinBase } from "../path-security"
 import { toPortableRelativePath } from "../workspace-native"
 import type { PoolClient } from "pg"
 import type { SymbolVersionRow } from "../db-driver/core_data"
-import type { AdapterExtractionResult, IngestionResult, IngestionErrorCode, ExtractedSymbol } from "../types"
+import type { AdapterExtractionResult, IngestionResult, IngestionErrorCode, ExtractedSymbol, ExtractedRelation } from "../types"
 
 const log = new Logger("ingestor")
 const MAX_CANONICAL_NAME_LENGTH = 255
@@ -188,6 +188,24 @@ async function isNugetPackagesDir(dirPath: string): Promise<boolean> {
 }
 
 export class Ingestor {
+  /** The latest complete snapshot of a repository on a branch, or null. Never throws: no parent means a full ingest. */
+  private async latestCompleteSnapshot(repoId: string, branch: string): Promise<string | null> {
+    try {
+      const result = await db.query(
+        `SELECT snapshot_id FROM snapshots
+          WHERE repo_id = $1 AND branch = $2 AND index_status = 'complete'
+          ORDER BY indexed_at DESC LIMIT 1`,
+        [repoId, branch],
+      )
+      return optionalStringField(firstRow(result), "snapshot_id") ?? null
+    } catch (err) {
+      log.warn("Could not resolve a parent snapshot — running a full ingest", {
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return null
+    }
+  }
+
   /**
    * Ingest a full repository into the ContextZero graph.
    */
@@ -196,7 +214,7 @@ export class Ingestor {
     repoName: string,
     commitSha: string,
     branch: string = "main",
-    parentSnapshotId: string | null = null,
+    parentSnapshotId?: string | null,
   ): Promise<IngestionResult> {
     const timer = log.startTimer("ingestRepo", { repoPath, repoName, commitSha })
     const startTime = Date.now()
@@ -287,6 +305,14 @@ export class Ingestor {
         base_path: canonicalRepoPath,
       })
 
+      // Delta by default. The parent is the latest complete snapshot of this
+      // repository on this branch unless the caller names one or passes null.
+      // Only the MCP handler used to look this up, so every other entry (the
+      // REST server, the benches, a script) re-parsed every file and re-ran
+      // every engine over the whole snapshot on each ingest: a second pass
+      // over gin with one file touched re-extracted all 99 files.
+      if (parentSnapshotId === undefined) parentSnapshotId = await this.latestCompleteSnapshot(repoId, branch)
+
       // 2. Create snapshot
       const snapshotId = await coreDataService.createSnapshot({
         repo_id: repoId,
@@ -372,6 +398,8 @@ export class Ingestor {
       let filesFailed = 0
       let symbolsExtracted = 0
       let relationsExtracted = 0
+      // Raw relations from every persisted file, resolved in one pass below.
+      const pendingRelations: ExtractedRelation[] = []
       let behaviorHintsExtracted = 0
       let contractHintsExtracted = 0
       const failureSummary: string[] = []
@@ -562,7 +590,7 @@ export class Ingestor {
             "typescript",
           )
           symbolsExtracted += counts.symbols
-          relationsExtracted += counts.relations
+          pendingRelations.push(...counts.rawRelations)
           behaviorHintsExtracted += counts.behaviorHints
           contractHintsExtracted += counts.contractHints
           const tsFailed = tsResult.failed_files?.length ?? 0
@@ -624,7 +652,7 @@ export class Ingestor {
                 "python",
               )
               symbolsExtracted += counts.symbols
-              relationsExtracted += counts.relations
+              pendingRelations.push(...counts.rawRelations)
               behaviorHintsExtracted += counts.behaviorHints
               contractHintsExtracted += counts.contractHints
               filesProcessed++
@@ -691,7 +719,7 @@ export class Ingestor {
             try {
               const counts = await this.persistExtractionResult(result, repoId, snapshotId, canonicalRepoPath, lang)
               symbolsExtracted += counts.symbols
-              relationsExtracted += counts.relations
+              pendingRelations.push(...counts.rawRelations)
               behaviorHintsExtracted += counts.behaviorHints
               contractHintsExtracted += counts.contractHints
               filesProcessed++
@@ -709,6 +737,13 @@ export class Ingestor {
             failureSummary.push(`${lang}: extraction failed for ${filePath} (see log)`)
           }
         }
+      }
+
+      // One resolution pass for the whole snapshot, now that every file's
+      // symbols exist: a relation can reach a symbol in a file persisted after
+      // its own, and the identity index is built once instead of per file.
+      if (pendingRelations.length > 0) {
+        relationsExtracted += await structuralGraphEngine.computeRelationsFromRaw(snapshotId, repoId, pendingRelations)
       }
 
       // Raw relations are emitted by their source file. Reusing unchanged
@@ -1038,7 +1073,7 @@ export class Ingestor {
     snapshotId: string,
     repoPath: string,
     language: string,
-  ): Promise<{ symbols: number; relations: number; behaviorHints: number; contractHints: number }> {
+  ): Promise<{ symbols: number; rawRelations: ExtractedRelation[]; behaviorHints: number; contractHints: number }> {
     // File content cache — read each source file at most once for body_source extraction.
     // Keyed by absolute path to avoid symlink/aliasing cache misses.
     const fileContentCache = new Map<string, string[] | null>()
@@ -1453,12 +1488,11 @@ export class Ingestor {
     await coreDataService.bulkUpsertBehavioralProfiles(behavioralBatch)
     await coreDataService.bulkUpsertContractProfiles(contractBatch)
 
-    // Resolve structural relations
-    const relCount = await structuralGraphEngine.computeRelationsFromRaw(snapshotId, repoId, extraction.relations)
-
+    // Relations are resolved once for the whole snapshot, after every file's
+    // symbols exist; this file only hands its raw relations up.
     return {
       symbols: extraction.symbols.length,
-      relations: relCount,
+      rawRelations: extraction.relations,
       behaviorHints: extraction.behavior_hints.length,
       contractHints: extraction.contract_hints.length,
     }
@@ -1972,6 +2006,7 @@ export class Ingestor {
 
       let symbolsUpdated = 0
       let relationsUpdated = 0
+      const pendingRelations: ExtractedRelation[] = []
       let newFilesIndexed = 0
 
       // 1. Delete old symbol_versions for changed files
@@ -2225,7 +2260,7 @@ export class Ingestor {
           const tsResult = await extractFromTypeScript(tsPaths, tsconfigPath || undefined)
           const counts = await this.persistExtractionResult(tsResult, repoId, snapshotId, basePath, "typescript")
           symbolsUpdated += counts.symbols
-          relationsUpdated += counts.relations
+          pendingRelations.push(...counts.rawRelations)
           // The adapter isolates per-file failures internally, so a resolved
           // promise can still carry files it could not parse.
           for (const failedFile of tsResult.failed_files ?? []) recordFailedPath(failedFile)
@@ -2246,7 +2281,7 @@ export class Ingestor {
             try {
               const counts = await this.persistExtractionResult(pyResult, repoId, snapshotId, basePath, "python")
               symbolsUpdated += counts.symbols
-              relationsUpdated += counts.relations
+              pendingRelations.push(...counts.rawRelations)
             } catch (err) {
               log.error("Incremental Python persistence failed", err, { file: pyPath })
               recordFailedPath(pyPath)
@@ -2282,7 +2317,7 @@ export class Ingestor {
           if (result) {
             const counts = await this.persistExtractionResult(result, repoId, snapshotId, basePath, lang)
             symbolsUpdated += counts.symbols
-            relationsUpdated += counts.relations
+            pendingRelations.push(...counts.rawRelations)
           } else {
             // Null result is a failure, not an empty file — same silent-loss
             // hazard as the Python path above.
@@ -2292,6 +2327,12 @@ export class Ingestor {
           log.error(`Incremental ${lang} extraction failed`, err, { file: filePath })
           recordFailedPath(filePath)
         }
+      }
+
+      // One resolution pass over every re-extracted file's relations, against
+      // the whole snapshot (copied-forward versions included).
+      if (pendingRelations.length > 0) {
+        relationsUpdated += await structuralGraphEngine.computeRelationsFromRaw(snapshotId, repoId, pendingRelations)
       }
 
       // Incremental invalidation deletes semantic vectors through the
