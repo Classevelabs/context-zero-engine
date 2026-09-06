@@ -22,3 +22,39 @@ export const MUTATING_MCP_TOOLS = new Set([
 export function isMutatingMcpTool(toolName: string): boolean {
   return MUTATING_MCP_TOOLS.has(toolName)
 }
+
+/**
+ * Whether a tool is registered — and therefore listed — for this process.
+ *
+ * Every listed tool's schema rides in the model's context on every turn, and
+ * the 61 schemas together came to 49 KB, about 12,000 tokens per turn. While
+ * SCG_MCP_MUTATIONS_ENABLED is off the 17 mutation tools are refused outright,
+ * so listing them bought nothing but that cost. A tool a session cannot call
+ * is not listed; the session note from {@link unlistedMutationToolsNote} says
+ * once, at connect, where they went.
+ */
+export function shouldRegisterTool(toolName: string, features: { mutationsEnabled: boolean }): boolean {
+  return features.mutationsEnabled || !isMutatingMcpTool(toolName)
+}
+
+/**
+ * Whether `_auth_token` belongs in a tool's input schema. It is there so the
+ * SDK does not strip it before the auth wrapper reads it — which only matters
+ * when a secret exists for it to match. Without one the field was 6.6 KB of
+ * every tool list, describing a check that never ran.
+ */
+export function authTokenInSchema(secrets: { secret?: string | null; adminSecret?: string | null }): boolean {
+  return Boolean(secrets.secret || secrets.adminSecret)
+}
+
+/**
+ * The server's session-level instructions when mutation tools are unlisted:
+ * one sentence the client sees at connect, instead of 17 schemas on every turn.
+ */
+export function unlistedMutationToolsNote(count: number): string {
+  return (
+    `${count} tools that ingest, index, edit, review or run maintenance are not listed because ` +
+    `SCG_MCP_MUTATIONS_ENABLED is off in this server's environment. A local operator enables them ` +
+    `there; they are not available through tool arguments.`
+  )
+}

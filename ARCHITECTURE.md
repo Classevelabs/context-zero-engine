@@ -89,7 +89,7 @@ All adapters produce the same normalized output (`AdapterExtractionResult`), ens
 
 ### 3.9 API Layer
 - **REST API (`mcp-interface`)** — Express 5 HTTP server with **60 routes** (7 GET + 53 POST). Fail-closed API key auth, distinct production admin keys for mutation/command/admin routes, bounded per-route rate limiting, tiered body limits, input validation, Prometheus metrics, correlation IDs, HSTS enforcement, and a sanitized JSON error boundary.
-- **MCP Stdio Bridge (`mcp-bridge`)** — Native Model Context Protocol server over a trusted local stdio child-process channel. **61 tools** are registered with Zod schema validation; mutation tools require operator-level `SCG_MCP_MUTATIONS_ENABLED=true`. Optional per-call secrets are defense in depth, not remote transport authentication. All logging goes to stderr.
+- **MCP Stdio Bridge (`mcp-bridge`)** — Native Model Context Protocol server over a trusted local stdio child-process channel. **61 tools** with Zod schema validation; the 17 mutation tools are registered only when operator-level `SCG_MCP_MUTATIONS_ENABLED=true` is set, so a default session lists 44 and is told at connect where the rest are. Optional per-call secrets are defense in depth, not remote transport authentication. All logging goes to stderr.
 - **Native Workspace Tools** — 3 DB-free tools (`scg_native_codebase_overview`, `scg_native_symbol_search`, `scg_native_search_code`) for direct filesystem analysis via `workspace-native.ts`. Available only through MCP bridge (no HTTP routes).
 
 ### 3.10 Caching Layer (`cache`)

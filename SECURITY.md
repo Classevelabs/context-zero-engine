@@ -43,9 +43,10 @@ localhost, harden it:
   its `_auth_token` is a tool argument visible to the MCP client. Do not relay
   this stdio server over an untrusted network transport.
 - **Keep mutation and command execution off unless needed.** MCP mutation
-  tools require `SCG_MCP_MUTATIONS_ENABLED=true`. Repository validation
-  commands additionally require `SCG_ALLOW_UNSANDBOXED_EXECUTION=true`.
-  Enable them only for trusted repositories under a restricted OS identity.
+  tools require `SCG_MCP_MUTATIONS_ENABLED=true` and are not listed to the
+  client until it is set. Repository validation commands additionally require
+  `SCG_ALLOW_UNSANDBOXED_EXECUTION=true`. Enable them only for trusted
+  repositories under a restricted OS identity.
 
 ## Built-in Controls
 

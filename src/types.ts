@@ -290,7 +290,6 @@ export interface ContextCapsule {
   family_context?: FamilyContextNode[]
   effect_signature?: CapsuleEffectSummary[]
   inclusion_rationale?: InclusionRationale[]
-  compilation_id?: string
 }
 
 export interface ContextNode {

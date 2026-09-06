@@ -806,6 +806,37 @@ describe("handleCompileContextCapsule", () => {
     )
     expect(result.isError).toBe(true)
   })
+
+  test("ships compact JSON and asks for no inclusion reasons by default", async () => {
+    // The text is what the model pays for. Pretty-printing was a tenth of every
+    // capsule in whitespace, and inclusion reasons another 646 bytes of prose.
+    mockDbQuery.mockResolvedValue({ rows: [{ base_path: "/repo" }] })
+    const capsule = { target_symbol: { name: "getUser" }, context_nodes: [{ name: "dep" }], token_estimate: 12 }
+    ;(capsuleCompiler.compile as jest.Mock).mockResolvedValue(capsule)
+
+    const result = await handleCompileContextCapsule(
+      { symbol_version_id: VALID_UUID, snapshot_id: VALID_UUID_2 },
+      log,
+    )
+
+    const text = (result.content[0] as { type: "text"; text: string }).text
+    expect(text).not.toContain("\n")
+    expect((JSON.parse(text) as { capsule: unknown }).capsule).toEqual(capsule)
+    expect(capsuleCompiler.compile).toHaveBeenLastCalledWith(VALID_UUID, VALID_UUID_2, "standard", 8000, "/repo", {
+      explain: false,
+    })
+  })
+
+  test("explain: true reaches the compiler", async () => {
+    mockDbQuery.mockResolvedValue({ rows: [{ base_path: "/repo" }] })
+    ;(capsuleCompiler.compile as jest.Mock).mockResolvedValue({ context_nodes: [] })
+
+    await handleCompileContextCapsule({ symbol_version_id: VALID_UUID, snapshot_id: VALID_UUID_2, explain: true }, log)
+
+    expect(capsuleCompiler.compile).toHaveBeenLastCalledWith(VALID_UUID, VALID_UUID_2, "standard", 8000, "/repo", {
+      explain: true,
+    })
+  })
 })
 
 // ═══════════════════════════════════════════════════════════

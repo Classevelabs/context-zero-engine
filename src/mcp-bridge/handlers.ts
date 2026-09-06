@@ -114,10 +114,14 @@ interface CallToolResult {
 
 // ────────── Shared Helpers ──────────
 
-/** Standard MCP text result */
+/**
+ * Standard MCP text result. Compact JSON: the text is what the model pays
+ * for, and pretty-printing it was a tenth of every capsule and a twenty-fifth
+ * of every smart context in whitespace, measured on a real repository.
+ */
 function textResult(data: unknown): CallToolResult {
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    content: [{ type: "text" as const, text: JSON.stringify(data) }],
   }
 }
 
@@ -666,7 +670,7 @@ function annotateCallToolResult(result: CallToolResult, decision: IndexIntegrity
   if (first && first.type === "text") {
     try {
       const merged = mergeIntegrityAnnotation(JSON.parse(first.text), decision)
-      return { ...result, content: [{ type: "text" as const, text: JSON.stringify(merged, null, 2) }] }
+      return { ...result, content: [{ type: "text" as const, text: JSON.stringify(merged) }] }
     } catch {
       /* fall through — the warning is appended below rather than dropped */
     }
@@ -963,12 +967,15 @@ async function handleCompileContextCapsuleImpl(
   )
   const repoBasePath = optionalStringField(firstRow(basePathResult), "base_path")
 
+  const explain = args.explain === true
+
   const capsule = await capsuleCompiler.compile(
     symbol_version_id,
     snapshot_id,
     mode as CapsuleMode,
     token_budget,
     repoBasePath,
+    { explain },
   )
 
   return textResult({ capsule })

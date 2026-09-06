@@ -198,11 +198,13 @@ Any MCP client that speaks stdio works: the server is
 single `CONTEXTZERO_ENV_FILE` pointing at your `.env`).
 
 MCP uses a trusted local stdio child-process boundary; it is not a remote
-network authentication layer. Read tools are enabled by default. Before using
-ingestion, editing, retention cleanup, or validation tools, a local operator
-must set `SCG_MCP_MUTATIONS_ENABLED=true`. Validation commands additionally
-require `SCG_ALLOW_UNSANDBOXED_EXECUTION=true` and should run only on trusted
-repositories under a restricted operating-system account.
+network authentication layer. The 44 read tools are listed by default. The 17
+tools that ingest, edit, run retention cleanup, or validate are listed only
+after a local operator sets `SCG_MCP_MUTATIONS_ENABLED=true`; until then the
+session is told once, at connect, that they exist and where the switch is.
+Validation commands additionally require `SCG_ALLOW_UNSANDBOXED_EXECUTION=true`
+and should run only on trusted repositories under a restricted
+operating-system account.
 
 ### 2. Index a repository
 
@@ -282,7 +284,9 @@ is where `SCG_REPOS_PATH` is mounted inside the container.
 | Native Workspace (no DB) | 3 | `scg_native_codebase_overview`, `scg_native_symbol_search`, `scg_native_search_code` |
 | Admin | 5 | `scg_admin_run_retention`, `scg_admin_db_stats`, `scg_admin_system_info` |
 
-The complete registry is in [ARCHITECTURE.md](ARCHITECTURE.md).
+A session lists the 44 read tools by default; the 17 that mutate appear once
+`SCG_MCP_MUTATIONS_ENABLED=true` is set. The complete registry is in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 

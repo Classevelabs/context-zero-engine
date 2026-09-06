@@ -15,6 +15,11 @@ re-embeds it against the stored corpus. Nothing else is lost.
 
 ### Fixed
 
+- **A capsule shipped 14 tokens more than its own estimate said.** The row id
+  of the persisted compilation record was attached after the estimate was
+  taken, and nothing reads that id back through any tool. It is no longer
+  shipped, and a test now holds `token_estimate` to the serialized size of
+  exactly what ships, with and without inclusion reasons.
 - **Class capsules recalled about one dependency in eight.** A class holds
   almost no edges of its own: its collaborators are named in its methods and,
   for injected dependencies, in its constructor's parameter types, and those
@@ -104,6 +109,27 @@ re-embeds it against the stored corpus. Nothing else is lost.
 
 ### Changed
 
+- **A session lists only the tools it can call.** Every listed tool's schema
+  rides in the model's context on every turn, and the 61 schemas came to
+  49,360 bytes — about 12,300 tokens per turn, before any question is asked.
+  Seventeen of those tools are refused outright while
+  `SCG_MCP_MUTATIONS_ENABLED` is off, which is the default, so they are no
+  longer registered until it is on; the server's connect message tells the
+  session once that they exist and where the switch is. A default session now
+  lists 44 tools at 28,491 bytes, about 7,100 tokens per turn.
+- **`_auth_token` is part of a tool's schema only when a secret exists for it
+  to match.** Without `SCG_MCP_SECRET` or `SCG_MCP_ADMIN_SECRET` the field was
+  6,588 bytes of every tool list, describing a check that never ran. With
+  mutations enabled and no secret, the full 61-tool list is now 42,745 bytes.
+- **Responses are compact JSON.** Pretty-printing was a tenth of every capsule
+  and a twenty-fifth of every smart context in whitespace, measured on a real
+  repository: a capsule that cost 14,558 bytes now costs 12,507 for the same
+  content.
+- **Capsules ship inclusion reasons only on request.** The one-line reason
+  attached to every context node was 646 bytes of a 14.5 KB capsule, prose the
+  consumer never acts on. `scg_compile_context_capsule` takes `explain: true`
+  to attach them; by default they are neither shipped nor priced, and the
+  cache never serves an explained capsule to a plain request.
 - **Semantic vectors are stored packed, and a MinHash signature only where it
   carries signal.** On a database of 584,411 symbol versions `semantic_vectors`
   held 5,857 MB, 2,928 MB of it the signature column, 2,360 MB of that on the
@@ -163,7 +189,9 @@ re-embeds it against the stored corpus. Nothing else is lost.
 - A test fails when `db/schema.sql` is older than the newest migration; the
   file had been generated before migration 026 existed and shipped without it.
 - The CI cold-start smoke fails on any error-level log line. The retention
-  race above logged four while every existing check passed.
+  race above logged four while every existing check passed. It also fails if
+  a mutation tool is listed while mutations are off, and records the size of
+  the tool list.
 - `.env.example` documents `SCG_TS_ISOLATED`, `SCG_INDEX_CONSTRUCTORS` and
   `SCG_CAPSULE_MEMBER_DEPS`.
 

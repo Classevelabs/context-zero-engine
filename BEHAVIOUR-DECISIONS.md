@@ -178,6 +178,59 @@ lines in the startup log of a session that only listed tools.
 
 ---
 
+## 2026-09-06 — A session lists only the tools it can call
+
+**Decision.** `registerTool` skips the 17 mutation tools while
+`SCG_MCP_MUTATIONS_ENABLED` is off, and the server's `instructions` say so
+once at connect. `_auth_token` is added to a schema only when
+`SCG_MCP_SECRET` or `SCG_MCP_ADMIN_SECRET` is set. The blocked-call check in
+the tool wrapper stays as defence in depth.
+
+**Why it is not arbitrary.** A listed tool's schema is in the model's context
+on every turn. The 61 schemas were 49,360 bytes, about 12,300 tokens per turn,
+more than three capsules' worth before any question is asked — and the
+founder's own sessions used more tokens with the engine than without it. The
+17 mutation tools were refused outright while listed, and the auth field
+described a check that never ran without a secret. Listing what cannot be
+called bought nothing; unlisting it without a note would leave a session
+unable to learn why ingestion is missing, so the note carries the explanation
+once instead of 17 schemas every turn.
+
+**Verified against.** `mcp-security.test.ts` (listing rule, auth-field rule,
+note text); the cold-start smoke under both configurations: 44 tools at
+28,491 bytes with mutations off and the note present, 61 tools at 42,745
+bytes with them on; CI fails if a mutation tool is listed while they are off.
+
+**Regression looks like.** A default session's tool list back near 50 KB, or
+`scg_ingest_repo` visible to a client that cannot call it.
+
+---
+
+## 2026-09-06 — A capsule ships exactly what it prices, and reasons only on request
+
+**Decision.** Responses are compact JSON. `inclusion_reason` is attached to
+context nodes only when `scg_compile_context_capsule` is called with
+`explain: true`, the cache key includes that flag, and the compilation record's
+id is not shipped. `token_estimate` is the serialized size of the capsule as
+it leaves the compiler, held by a test in both modes.
+
+**Why it is not arbitrary.** Pretty-printing was a tenth of every capsule in
+whitespace; inclusion reasons were 646 bytes of prose per capsule that no
+consumer acts on; the compilation id was attached after pricing, so every
+capsule was 14 tokens larger than it claimed. A budget is a promise about what
+the client pays, and each of these broke it a little. Measured on twelve real
+targets: 14,558 bytes per capsule to 12,507, paid tokens equal to priced.
+
+**Verified against.** `integration/capsule.test.ts` (no reasons by default,
+reasons under explain, estimate equals shipped size, cache separation);
+`mcp-bridge-handlers.test.ts` (compact text, explain passed through);
+`measure-payload` run on the local database.
+
+**Regression looks like.** A capsule's `token_estimate` below the tokens the
+client is billed for, or newline-indented JSON in a tool result.
+
+---
+
 ## 2026-09-05 — A container capsule draws its dependencies from its members; a callable never does
 
 **Decision.** For a target of kind `class`, `interface` or `enum`,

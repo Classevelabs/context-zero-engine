@@ -549,3 +549,54 @@ describe("Capsule Integration — Member-dependency traversal gate", () => {
     expect(depSql(cap.sqls)).not.toContain("scope")
   })
 })
+
+// Inclusion reasons are bookkeeping the consumer never acts on: 646 bytes of a
+// 14.5 KB capsule on a real repository. They ship only when asked for, and
+// because every node is priced as it is added, what is not attached is not
+// paid for — the estimate is the size of exactly what ships.
+describe("Capsule Integration — Inclusion reasons ship only on request", () => {
+  const compiler = new CapsuleCompiler()
+
+  beforeEach(() => {
+    mockQuery.mockReset()
+    capsuleCache.clear()
+  })
+
+  function mockWithDependencies(): void {
+    mockQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("sv.symbol_version_id = $1") && sql.includes("f.path as file_path")) {
+        return { rows: [makeTargetSymbolRow({ kind: "function" })], rowCount: 1 }
+      }
+      if (sql.includes("sr.src_symbol_version_id")) {
+        return { rows: makeDependencyRows(3), rowCount: 3 }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+  }
+
+  test("by default no node carries a reason, and the estimate is the shipped size", async () => {
+    mockWithDependencies()
+    const capsule = await compiler.compile("sv-001", "snap-001", "minimal")
+
+    expect(capsule.context_nodes.length).toBeGreaterThan(0)
+    for (const node of capsule.context_nodes) expect(node.inclusion_reason).toBeUndefined()
+    expect(capsule.token_estimate).toBe(compiler.serializedTokens(capsule))
+  })
+
+  test("explain: true attaches a reason to every node, priced in", async () => {
+    mockWithDependencies()
+    const capsule = await compiler.compile("sv-001", "snap-001", "minimal", undefined, undefined, { explain: true })
+
+    expect(capsule.context_nodes.length).toBeGreaterThan(0)
+    for (const node of capsule.context_nodes) expect(typeof node.inclusion_reason).toBe("string")
+    expect(capsule.token_estimate).toBe(compiler.serializedTokens(capsule))
+  })
+
+  test("an explained capsule is never served from cache to a plain request", async () => {
+    mockWithDependencies()
+    await compiler.compile("sv-001", "snap-001", "minimal", undefined, undefined, { explain: true })
+    const plain = await compiler.compile("sv-001", "snap-001", "minimal")
+
+    for (const node of plain.context_nodes) expect(node.inclusion_reason).toBeUndefined()
+  })
+})

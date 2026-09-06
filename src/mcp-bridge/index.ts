@@ -26,7 +26,13 @@ import { transactionalChangeEngine } from "../transactional-editor"
 import { features, logging, retention as retentionConfig, server as serverConfig, watcher as watcherConfig } from "../config"
 import { runRetentionPolicy } from "../services/retention-service"
 import { RetentionRunner } from "../retention-runner"
-import { isMutatingMcpTool } from "./security"
+import {
+  authTokenInSchema,
+  isMutatingMcpTool,
+  MUTATING_MCP_TOOLS,
+  shouldRegisterTool,
+  unlistedMutationToolsNote,
+} from "./security"
 import {
   handleResolveSymbol,
   handleGetSymbolDetails,
@@ -256,17 +262,24 @@ const SERVER_VERSION = serverConfig.version
 
 /** Tracks actual tool registration count — derived, never hardcoded */
 let toolsRegistered = 0
+let toolsUnlisted = 0
 let healthCheckTimerRef: ReturnType<typeof setInterval> | null = null
 let retentionTimerRef: ReturnType<typeof setInterval> | null = null
 let retentionRunner: RetentionRunner | null = null
 let activeWatcher: import("../watcher").Watcher | null = null
 
+// A tool the session cannot call is not listed (see shouldRegisterTool). The
+// mutation tools are the case: refused outright while the operator switch is
+// off, yet their 17 schemas rode in every turn's context. The session note
+// explains the omission once, at connect.
+const unlistedTools = features.enableMcpMutations ? [] : [...MUTATING_MCP_TOOLS]
 const server = new McpServer(
   { name: SERVER_NAME, version: SERVER_VERSION },
   {
     capabilities: {
       tools: {},
     },
+    ...(unlistedTools.length > 0 ? { instructions: unlistedMutationToolsNote(unlistedTools.length) } : {}),
   },
 )
 
@@ -299,13 +312,24 @@ interface McpToolResult {
 type McpToolHandler = (args: Record<string, unknown>) => Promise<McpToolResult>
 
 function registerTool(name: string, config: McpToolConfig, handler: McpToolHandler): void {
-  // Inject _auth_token into the input schema so the MCP SDK does not strip it
-  // before our auth wrapper runs (default zod object behaviour is to strip
-  // unknown keys).
-  const inputSchemaWithAuth: Record<string, z.ZodTypeAny> = {
-    ...config.inputSchema,
-    _auth_token: z.string().optional().describe("Authentication token (required when SCG_MCP_SECRET is set)"),
+  if (!shouldRegisterTool(name, { mutationsEnabled: features.enableMcpMutations })) {
+    toolsUnlisted++
+    return
   }
+
+  // _auth_token is part of the input schema only when a secret exists for it
+  // to match — it is there so the MCP SDK does not strip it before the auth
+  // wrapper reads it (zod objects drop unknown keys). Without a secret the
+  // field was 6.6 KB of every tool list for a check that never ran.
+  const inputSchemaWithAuth: Record<string, z.ZodTypeAny> = authTokenInSchema({
+    secret: MCP_SECRET,
+    adminSecret: MCP_ADMIN_SECRET,
+  })
+    ? {
+        ...config.inputSchema,
+        _auth_token: z.string().optional().describe("Authentication token (required when SCG_MCP_SECRET is set)"),
+      }
+    : { ...config.inputSchema }
   const finalConfig: McpToolConfig = { ...config, inputSchema: inputSchemaWithAuth }
 
   // Wrap the handler to inject tool-name-aware auth + rate limiting
@@ -577,6 +601,10 @@ registerTool(
         .max(100000)
         .optional()
         .describe("Maximum token budget (100-100000). Default: 8000"),
+      explain: z
+        .boolean()
+        .optional()
+        .describe("Attach a one-line reason to every context node. Default: false"),
     },
   },
   async (args: Record<string, unknown>) => safeTool(handleCompileContextCapsule)(args),
@@ -1695,6 +1723,7 @@ async function main(): Promise<void> {
       server: SERVER_NAME,
       version: SERVER_VERSION,
       tools_registered: toolsRegistered,
+      tools_unlisted: toolsUnlisted,
     })
   } catch (err: unknown) {
     log.error("Failed to start MCP bridge", err)

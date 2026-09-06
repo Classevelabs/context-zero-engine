@@ -156,7 +156,9 @@ SCG_MCP_MUTATIONS_ENABLED=true
 
 This grants the connected MCP client authority to ingest and change allowed
 repositories. It is an operator-level trust decision, not a model-supplied
-tool argument.
+tool argument. While it is off, the 17 mutation tools are not listed to the
+client at all — a listed tool's schema is carried on every model turn — and
+the server's connect message tells the session where the switch is.
 
 In an MCP client, call:
 

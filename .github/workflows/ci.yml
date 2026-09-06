@@ -134,6 +134,14 @@ jobs:
             || { echo "::error::initialize did not return a protocolVersion"; exit 1; }
           grep -q '"tools"' /tmp/cz-mcp.json \
             || { echo "::error::tools/list returned no tool surface"; exit 1; }
+
+          # Mutations are off in this environment, so the mutation tools must
+          # not be listed: a listed tool's schema is paid for on every model
+          # turn, and these are refused outright until an operator enables them.
+          if grep -q '"name":"scg_ingest_repo"' /tmp/cz-mcp.json; then
+            echo "::error::mutation tools are listed while SCG_MCP_MUTATIONS_ENABLED is off"; exit 1
+          fi
+          echo "tools/list bytes: $(wc -c < /tmp/cz-mcp.json)"
           grep -q 'DB health check passed' /tmp/cz-mcp.err \
             || { echo "::error::bridge did not report a passing DB health check at startup"; exit 1; }
 

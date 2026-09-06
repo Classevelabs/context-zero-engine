@@ -115,6 +115,15 @@ interface SymbolRow {
   confidence: number
 }
 
+export interface CompileOptions {
+  /**
+   * Attach a one-line reason to every context node. Bookkeeping, off by
+   * default: it cost 646 bytes of a 14.5 KB capsule on a real repository, for
+   * prose the consumer never acts on.
+   */
+  explain?: boolean
+}
+
 export class CapsuleCompiler {
   /**
    * Compile a context capsule for a target symbol.
@@ -129,7 +138,9 @@ export class CapsuleCompiler {
     mode: CapsuleMode = "standard",
     tokenBudget?: number,
     repoBasePath?: string,
+    options: CompileOptions = {},
   ): Promise<ContextCapsule> {
+    const explain = options.explain === true
     if (!Object.prototype.hasOwnProperty.call(MODE_BUDGETS, mode)) {
       throw new Error("Invalid capsule mode")
     }
@@ -138,7 +149,8 @@ export class CapsuleCompiler {
       : MODE_BUDGETS[mode]
 
     // Check capsuleCache — keyed on symbol+snapshot+mode+budget
-    const cacheKey = `capsule:${symbolVersionId}:${snapshotId}:${mode}:${effectiveBudget}`
+    // The shape differs with `explain`, so the two never share a cache entry.
+    const cacheKey = `capsule:${symbolVersionId}:${snapshotId}:${mode}:${effectiveBudget}:${explain ? "explain" : "plain"}`
     const cached = capsuleCache.get(cacheKey) as ContextCapsule | undefined
     if (cached) return cached
 
@@ -294,6 +306,9 @@ export class CapsuleCompiler {
     // source is already in the capsule is never pasted a second time: the
     // repeat ships as a one-line signature that names where it already is.
     const includedWithCode = new Set<string>()
+    // A reason is attached only when asked for. Every node is priced as it is
+    // added, so a reason that is not attached is not paid for either.
+    const reason = (text: string): Pick<ContextNode, "inclusion_reason"> => (explain ? { inclusion_reason: text } : {})
     const addNodeBudgeted = (node: ContextNode, category: string, rawRow?: SymbolRow): boolean => {
       const repeat = node.symbol_id !== null && node.symbol_id !== undefined && includedWithCode.has(node.symbol_id)
       const hasCode = Boolean(node.code) && !repeat
@@ -314,7 +329,7 @@ export class CapsuleCompiler {
           enriched: {
             ...node,
             resolution: "full_source",
-            inclusion_reason: `Included as ${category} — full source fits budget`,
+            ...reason(`Included as ${category} — full source fits budget`),
           },
           resolution: "full_source",
           reason: `Direct ${category} via ${rawRow?.relation_type || category} relation`,
@@ -327,7 +342,7 @@ export class CapsuleCompiler {
           enriched: {
             ...node,
             resolution: "contract_summary",
-            inclusion_reason: `Included as ${category} — summary content (no source code available)`,
+            ...reason(`Included as ${category} — summary content (no source code available)`),
           },
           resolution: "contract_summary",
           reason: `Direct ${category} — no source code, included at summary level`,
@@ -342,9 +357,11 @@ export class CapsuleCompiler {
             code: null,
             summary: signatureText || node.summary,
             resolution: "signature_only",
-            inclusion_reason: repeat
-              ? `Included as ${category} — source already in this capsule (deduplicated)`
-              : `Included as ${category} — degraded to signature (budget)`,
+            ...reason(
+              repeat
+                ? `Included as ${category} — source already in this capsule (deduplicated)`
+                : `Included as ${category} — degraded to signature (budget)`,
+            ),
           },
           resolution: "signature_only",
           reason: repeat
@@ -360,7 +377,7 @@ export class CapsuleCompiler {
             ...node,
             code: null,
             resolution: "contract_summary",
-            inclusion_reason: `Included as ${category} — contract summary only (budget)`,
+            ...reason(`Included as ${category} — contract summary only (budget)`),
           },
           resolution: "contract_summary",
           reason: `Budget tight — degraded to contract_summary`,
@@ -374,7 +391,7 @@ export class CapsuleCompiler {
           code: null,
           summary: null,
           resolution: "name_only",
-          inclusion_reason: `Included as ${category} — name only (budget)`,
+          ...reason(`Included as ${category} — name only (budget)`),
         },
         resolution: "name_only",
         reason: `Budget tight — degraded to name_only`,
@@ -491,7 +508,7 @@ export class CapsuleCompiler {
             summary: `Dispatch: ${dispatch.chain} -> ${dispatch.resolved_target} (${dispatch.resolution_method}, confidence: ${dispatch.confidence.toFixed(2)})`,
             relevance: dispatch.confidence,
             resolution: "contract_summary",
-            inclusion_reason: `Dispatch chain resolution for ${dispatch.chain}`,
+            ...reason(`Dispatch chain resolution for ${dispatch.chain}`),
           }
           const dispatchTokens = this.serializedTokens(dispatchNode) + 1
           if (usedTokens + dispatchTokens <= effectiveBudget) {
@@ -525,7 +542,7 @@ export class CapsuleCompiler {
               : "No contradictions"),
           relevance: 0.75,
           resolution: "contract_summary",
-          inclusion_reason: `Target belongs to concept family "${family.family_name}"`,
+          ...reason(`Target belongs to concept family "${family.family_name}"`),
         }
         const familyTokens = this.serializedTokens(familyNode) + 1
         if (usedTokens + familyTokens <= effectiveBudget) {
@@ -585,7 +602,7 @@ export class CapsuleCompiler {
           summary: effectSummary,
           relevance: 0.88,
           resolution: "effect_summary",
-          inclusion_reason: "Typed effect signature for target symbol",
+          ...reason("Typed effect signature for target symbol"),
           effect_signature: effectSummary,
         }
         const effectTokens = this.serializedTokens(effectNode) + 1
@@ -632,8 +649,11 @@ export class CapsuleCompiler {
     this.enforceBudget(capsule, effectiveBudget)
     capsule.token_estimate = this.serializedTokens(capsule)
 
-    // Persist compilation metadata for debugging and improvement
-    const compilationId = await this.persistCompilation(
+    // Persist compilation metadata for debugging and improvement. The row's id
+    // is not shipped: nothing reads it back through any tool, and attaching it
+    // here — after the estimate was taken — made every capsule 14 tokens larger
+    // than its own token_estimate said.
+    await this.persistCompilation(
       symbolVersionId,
       snapshotId,
       mode,
@@ -644,9 +664,6 @@ export class CapsuleCompiler {
       inclusionRationale,
       fetchHandles,
     )
-    if (compilationId) {
-      capsule.compilation_id = compilationId
-    }
 
     timer({ nodes: contextNodes.length, tokens: usedTokens, omissions: omissionRationale.length })
     capsuleCache.set(cacheKey, capsule)
@@ -830,7 +847,7 @@ export class CapsuleCompiler {
       if (node.code) {
         node.code = null
         node.resolution = "signature_only"
-        node.inclusion_reason = `${node.inclusion_reason ?? "Included"} (degraded by final budget pass)`
+        if (node.inclusion_reason) node.inclusion_reason = `${node.inclusion_reason} (degraded by final budget pass)`
       }
     }
     while (over() && capsule.context_nodes.length > 0) {
