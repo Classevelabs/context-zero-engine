@@ -66,6 +66,15 @@ export async function resolveSymbol(
     sql += ` AND sv.snapshot_id = $${paramIdx}`
     params.push(snapshotId)
     paramIdx++
+  } else {
+    // Without a snapshot the join returned one row per snapshot per symbol —
+    // up to the retention cap of them, identical but for their version ids —
+    // so a name resolved to a list of the same symbol. The latest indexed
+    // snapshot is what a caller who names none means by "the repository".
+    sql += ` AND sv.snapshot_id = (
+            SELECT snap.snapshot_id FROM snapshots snap
+            WHERE snap.repo_id = $2 AND snap.index_status IN ('complete', 'partial')
+            ORDER BY snap.created_at DESC LIMIT 1)`
   }
 
   if (kindFilter) {

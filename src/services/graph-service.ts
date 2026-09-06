@@ -302,7 +302,7 @@ export async function explainRelation(options: ExplainRelationOptions): Promise<
                eb.contract_score, eb.test_score, eb.history_score,
                eb.contradiction_flags
         FROM inferred_relations ir
-        LEFT JOIN evidence_bundles eb ON eb.inferred_relation_id = ir.inferred_relation_id
+        LEFT JOIN evidence_bundles eb ON eb.evidence_bundle_id = ir.evidence_bundle_id
         WHERE (ir.src_symbol_version_id = $1 AND ir.dst_symbol_version_id = $2)
            OR (ir.src_symbol_version_id = $2 AND ir.dst_symbol_version_id = $1)
     `,
@@ -776,14 +776,16 @@ export async function reviewHomolog(options: ReviewHomologOptions): Promise<Revi
 
   const previousState = typeof currentRow.review_state === "string" ? currentRow.review_state : "pending"
 
-  // Step 2: Update review_state
+  // Step 2: Record the review — state, when, and by whom (migration 027).
+  // This wrote `updated_at`, a column the table never had, so every review
+  // failed on the column and none was ever recorded.
   const updateResult = await db.query(
     `
         UPDATE inferred_relations
-        SET review_state = $2, updated_at = NOW()
+        SET review_state = $2, reviewed_at = NOW(), reviewed_by = $3
         WHERE inferred_relation_id = $1
     `,
-    [inferred_relation_id, review_state],
+    [inferred_relation_id, review_state, reviewer ?? null],
   )
 
   const updated = (updateResult.rowCount ?? 0) > 0

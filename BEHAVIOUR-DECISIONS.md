@@ -178,6 +178,94 @@ lines in the startup log of a session that only listed tools.
 
 ---
 
+## 2026-09-06 — Every column the engine's SQL names is checked against the schema
+
+**Decision.** `sql-schema-contract.test.ts` parses `db/schema.sql` into tables
+and columns, applying each migration's column changes in document order, and
+scans every SQL template literal under `src/` for `alias.column`,
+`UPDATE … SET column` and `INSERT INTO table (columns)`. Any column the schema
+lacks fails the suite. Aliases bound to subqueries or CTEs are skipped.
+
+**Why it is not arbitrary.** Two tools had been broken since they were
+written — `scg_explain_relation` joined on a column that did not exist and
+`scg_review_homolog` set one — and no unit test could see it: the driver is
+mocked, so a wrong column name is only ever found by PostgreSQL, at the
+moment a user calls the tool. Across 384 literals the checker reports exactly
+those two and nothing else, which is what makes it a gate rather than noise.
+
+**Verified against.** Its own toy-schema cases; the two real defects before
+their repair; a clean run after.
+
+**Regression looks like.** A tool answering "column … does not exist" after a
+migration renames or drops something; the suite fails first.
+
+---
+
+## 2026-09-06 — A test's invariant belongs to the symbols the test exercises
+
+**Decision.** `mineInvariantsFromTests` looks up each test symbol's outgoing
+structural edges in one query per thousand tests and writes an `explicit_test`
+invariant on each reached symbol, named `test:<test> asserts behavior of
+<target>`. A test that reaches nothing writes nothing; a test reaching another
+test is skipped.
+
+**Why it is not arbitrary.** Scoped to the test symbol itself, the invariant
+was invisible to `getInvariantsForSymbol(target)` and to every capsule of the
+target, and blast radius — which reports a target's own invariants at
+critical for strength 0.9 — marked the test critical for asserting itself.
+
+**Verified against.** `contracts.test.ts` scoping tests. Invariant counts on
+the next full ingest change: they now count coverage of targets, not tests.
+
+**Regression looks like.** `scg_get_invariants` on a well-tested function
+returning nothing test-derived, and test symbols appearing as critical
+contract impacts in blast radius.
+
+---
+
+## 2026-09-06 — Without a snapshot, the latest indexed one
+
+**Decision.** `resolveSymbol` with no snapshot restricts to the repository's
+newest snapshot whose status is complete or partial; `searchCode` scans that
+snapshot's files and reports `files_truncated` past 10,000; the newest
+snapshot for invariant lookup is chosen by `created_at`, not by sorting ids.
+
+**Why it is not arbitrary.** Joining symbol versions without a snapshot filter
+returned one row per snapshot per symbol, identical but for version ids; the
+file union kept files deleted since the earliest snapshot searchable; and
+`ORDER BY <uuid> DESC` is a random choice dressed as "latest". A caller who
+names no snapshot means the repository as it is now.
+
+**Verified against.** `services.test.ts` and `contracts.test.ts` SQL
+assertions, and the schema-contract suite for the columns used.
+
+**Regression looks like.** Duplicate rows from `scg_resolve_symbol`, search
+hits in files that no longer exist, or invariants from an old snapshot.
+
+---
+
+## 2026-09-06 — A task's candidates come from the names it mentions
+
+**Decision.** `planChange` extracts quoted spans, code-shaped words and
+non-prose words from the task, resolves each on its own and keeps the best
+match per symbol version; if nothing resolves it runs the task through
+semantic search over code bodies; the plan's first assumption names the route.
+The prose word list is a filter on English, not a table of expected inputs:
+a code-shaped word is always a mention regardless of it.
+
+**Why it is not arbitrary.** The whole sentence was handed to trigram name
+similarity, so the candidates for a forty-character task were the symbol
+names sharing the most letters with English. Nothing about that improves with
+a better sentence.
+
+**Verified against.** `planning-service.test.ts`: extraction cases, per-name
+resolution, best-match merge, semantic fallback, honest failure.
+
+**Regression looks like.** `scg_plan_change` returning candidates whose names
+merely resemble the words of the request.
+
+---
+
 ## 2026-09-06 — A session lists only the tools it can call
 
 **Decision.** `registerTool` skips the 17 mutation tools while

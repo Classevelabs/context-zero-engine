@@ -545,7 +545,7 @@ export class TransactionalChangeEngine {
       const lockedTargets = VALID_TRANSITIONS[lockedState] ?? []
       if (!lockedTargets.includes("rolled_back")) {
         throw UserFacingError.badRequest(
-          `Cannot rollback transaction in state '${lockedState}' â€” only non-terminal states can be rolled back`,
+          `Cannot rollback transaction in state '${lockedState}' — only non-terminal states can be rolled back`,
         )
       }
 

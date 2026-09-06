@@ -133,6 +133,32 @@ describe("resolveSymbol", () => {
     expect(params[1]).toBe("repo-abc")
   })
 
+  test("restricts to the repository's latest indexed snapshot when none is given", async () => {
+    // Without this the join returned one row per snapshot per symbol — up to
+    // the retention cap of identical rows differing only in version id.
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
+    // A query of its own: resolve results are cached by their parameters.
+    await resolveSymbol("latestSnapshotProbe", "repo-abc")
+
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain("ORDER BY snap.created_at DESC LIMIT 1")
+    expect(sql).toContain("snap.index_status IN ('complete', 'partial')")
+    expect(sql).toContain("snap.repo_id = $2")
+    expect(params).toEqual(["latestSnapshotProbe", "repo-abc", 10])
+  })
+
+  test("uses the given snapshot and no other when one is named", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
+    await resolveSymbol("namedSnapshotProbe", "repo-abc", "snap-9")
+
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain("sv.snapshot_id = $3")
+    expect(sql).not.toContain("ORDER BY snap.created_at")
+    expect(params[2]).toBe("snap-9")
+  })
+
   test("returns empty array when no matches found", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
@@ -535,6 +561,29 @@ describe("searchCode", () => {
     expect(result.matches[0]!.file).toBe("src/index.ts")
     expect(result.matches[0]!.line).toBe(1)
     expect(result.matches[0]!.context).toContain("express")
+    expect(result.files_truncated).toBeUndefined()
+
+    // The files come from the latest indexed snapshot only: the union of every
+    // snapshot kept files deleted long ago searchable.
+    const [sql, params] = mockQuery.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain("ORDER BY snap.created_at DESC LIMIT 1")
+    expect(sql).not.toContain("DISTINCT")
+    expect(params).toEqual(["repo-1", 10_001])
+  })
+
+  test("says so when the repository has more files than a search will scan", async () => {
+    ;(coreDataService.getRepository as jest.Mock).mockResolvedValueOnce({
+      repo_id: "repo-1",
+      base_path: "/repos/alpha",
+    })
+    // One row past the cap is the signal; the cap itself used to be silent.
+    const rows = Array.from({ length: 10_001 }, (_, i) => ({ path: `src/f${i}.ts` }))
+    mockQuery.mockResolvedValueOnce({ rows, rowCount: rows.length })
+    ;(fsp.readFile as jest.Mock).mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" }))
+
+    const result = await searchCode("repo-1", "express", { filePattern: "src/f10000.ts" })
+
+    expect(result.files_truncated).toBe(true)
   })
 
   test("handles regex patterns", async () => {

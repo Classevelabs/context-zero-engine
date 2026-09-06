@@ -9,7 +9,7 @@
 
 import { db } from "../db-driver"
 import { firstRow } from "../db-driver/result"
-import { resolveSymbol } from "./symbol-service"
+import { resolveSymbol, type ResolvedSymbol } from "./symbol-service"
 import { blastRadiusEngine } from "../analysis-engine/blast-radius"
 import { behavioralEngine } from "../analysis-engine/behavioral"
 import { contractEngine } from "../analysis-engine/contracts"
@@ -105,6 +105,56 @@ const PROPAGATION_VALID_STATES: TransactionState[] = ["propagation_pending", "va
  * 4. Recommends a capsule mode based on impact severity
  * 5. Returns a structured plan with confidence scores
  */
+/**
+ * Words that describe rather than name. A word on this list is prose unless
+ * it is also code-shaped (an inner capital, an underscore, a dotted path).
+ */
+const PROSE_WORDS = new Set([
+  "the", "and", "for", "with", "when", "that", "this", "from", "into", "then", "than", "should", "would", "could",
+  "make", "add", "fix", "change", "update", "remove", "delete", "rename", "move", "refactor", "handle", "check",
+  "function", "method", "class", "helper", "module", "file", "code", "error", "errors", "bug", "issue", "logic",
+  "call", "calls", "use", "uses", "using", "return", "returns", "value", "values", "type", "types", "test", "tests",
+  "before", "after", "where", "while", "also", "only", "each", "every", "some", "more", "less", "same", "other",
+  "new", "old", "all", "any", "not", "but", "its", "our", "your", "their", "there", "here", "have", "has", "had",
+  "does", "doing", "done", "been", "being", "will", "must", "need", "needs", "want", "wants", "please", "about",
+  "over", "under", "between", "through", "without", "within", "instead", "because", "still", "just", "very",
+  "which", "what", "them", "they", "then", "into", "onto", "like", "such", "made", "makes", "take", "takes",
+])
+
+/**
+ * Words in a task description that name code rather than describe it.
+ *
+ * planChange resolved its candidates by handing the whole task sentence to
+ * name similarity, so "add a retry to the fetch helper when the token expires"
+ * was compared, as one string, against every symbol name and came back with
+ * whichever names shared the most trigrams with forty characters of English.
+ * The names a person writes into a task are recognisable on their own: a
+ * quoted or backticked span, a camelCase or snake_case identifier, a dotted
+ * path, or a bare word that is not ordinary prose. Each is resolved by itself.
+ */
+export function symbolMentionsInTask(task: string, limit = 8): string[] {
+  const mentions: string[] = []
+  const seen = new Set<string>()
+  const take = (raw: string): void => {
+    const text = raw.trim()
+    if (text.length < 2 || text.length > 120) return
+    const key = text.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    mentions.push(text)
+  }
+
+  // A quoted or backticked span is the author pointing at a name.
+  for (const m of task.matchAll(/`([^`]+)`|"([^"]+)"|'([^']+)'/g)) take(m[1] ?? m[2] ?? m[3] ?? "")
+
+  for (const m of task.matchAll(/[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*/g)) {
+    const word = m[0]
+    const codeShaped = /[a-z][A-Z]/.test(word) || word.includes("_") || word.includes(".") || word.includes("$")
+    if (codeShaped || (word.length >= 4 && !PROSE_WORDS.has(word.toLowerCase()))) take(word)
+  }
+  return mentions.slice(0, limit)
+}
+
 export async function planChange(options: PlanChangeOptions): Promise<ChangePlan> {
   const timer = log.startTimer("planChange", {
     repoId: options.repo_id,
@@ -113,21 +163,57 @@ export async function planChange(options: PlanChangeOptions): Promise<ChangePlan
 
   const maxCandidates = Math.min(Math.max(options.max_candidates ?? DEFAULT_MAX_CANDIDATES, 1), MAX_CANDIDATES_LIMIT)
 
-  // Step 1: Resolve target symbol candidates from task description
-  const resolved = await resolveSymbol(
-    options.task_description,
-    options.repo_id,
-    options.snapshot_id,
-    options.scope_constraints?.kind_filter,
-    maxCandidates,
-  )
+  // Step 1: Resolve target symbol candidates from the names the task mentions,
+  // each on its own; the best match per symbol version wins.
+  const mentions = symbolMentionsInTask(options.task_description)
+  const byVersion = new Map<string, ResolvedSymbol>()
+  for (const mention of mentions) {
+    const found = await resolveSymbol(
+      mention,
+      options.repo_id,
+      options.snapshot_id,
+      options.scope_constraints?.kind_filter,
+      maxCandidates,
+    )
+    for (const symbol of found.symbols) {
+      const previous = byVersion.get(symbol.symbol_version_id)
+      if (!previous || symbol.name_sim > previous.name_sim) byVersion.set(symbol.symbol_version_id, symbol)
+    }
+  }
+  let candidates = [...byVersion.values()].sort((a, b) => b.name_sim - a.name_sim)
+  let candidateSource = `names in the task: ${mentions.join(", ")}`
 
-  if (resolved.symbols.length === 0) {
+  if (candidates.length === 0) {
+    // Nothing in the task names a symbol the index knows. Fall back to what
+    // the code does rather than what it is called: the body-view search over
+    // the whole task, which is what the task was describing all along.
+    const { semanticEngine } = await import("../semantic-engine")
+    const hits = await semanticEngine.searchByQuery(options.task_description, options.snapshot_id, maxCandidates)
+    if (hits.length > 0) {
+      const similarity = new Map(hits.map((hit) => [hit.svId, hit.similarity]))
+      const hydrated = await db.query(
+        `
+            SELECT sv.symbol_version_id, s.symbol_id, s.canonical_name, s.kind, s.stable_key,
+                   sv.signature, sv.visibility, f.path AS file_path
+            FROM symbol_versions sv
+            JOIN symbols s ON s.symbol_id = sv.symbol_id
+            JOIN files f ON f.file_id = sv.file_id
+            WHERE sv.symbol_version_id = ANY($1::uuid[])
+        `,
+        [hits.map((hit) => hit.svId)],
+      )
+      candidates = (hydrated.rows as Omit<ResolvedSymbol, "name_sim">[])
+        .map((row) => ({ ...row, name_sim: similarity.get(row.symbol_version_id) ?? 0 }))
+        .sort((a, b) => b.name_sim - a.name_sim)
+      candidateSource = "semantic search over the task description"
+    }
+  }
+
+  if (candidates.length === 0) {
     throw UserFacingError.badRequest(`No symbol candidates found for task: "${options.task_description}"`)
   }
 
   // Optional: filter by file pattern if scope constraint is provided
-  let candidates = resolved.symbols
   if (options.scope_constraints?.file_pattern) {
     const pattern = options.scope_constraints.file_pattern
     const filtered = candidates.filter((s) => s.file_path.includes(pattern))
@@ -211,7 +297,7 @@ export async function planChange(options: PlanChangeOptions): Promise<ChangePlan
       : 0
 
   // Build assumptions based on analysis results
-  const assumptions: string[] = []
+  const assumptions: string[] = [`Candidates resolved from ${candidateSource}`]
   if (options.scope_constraints?.kind_filter) {
     assumptions.push(`Filtered to symbol kind: ${options.scope_constraints.kind_filter}`)
   }

@@ -617,6 +617,7 @@ Fields:
 - `relation_type`
 - `confidence`
 - `review_state`
+- `reviewed_at`, `reviewed_by` — when and by whom `review_state` was last set through a review; NULL until then
 - `evidence_bundle_id`
 - `valid_from_snapshot_id`
 - `valid_to_snapshot_id`

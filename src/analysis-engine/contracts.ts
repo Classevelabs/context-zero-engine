@@ -63,6 +63,46 @@ export class ContractEngine {
   }
 
   /**
+   * The symbols each test symbol reaches through its outgoing structural
+   * edges, keyed by the test's symbol version id. One query per chunk of
+   * tests, never one per test.
+   */
+  private async loadTestTargets(
+    testVersionIds: string[],
+  ): Promise<Map<string, { symbol_version_id: string; symbol_id: string; canonical_name: string }[]>> {
+    const targets = new Map<string, { symbol_version_id: string; symbol_id: string; canonical_name: string }[]>()
+    const CHUNK = 1000
+    for (let i = 0; i < testVersionIds.length; i += CHUNK) {
+      const chunk = testVersionIds.slice(i, i + CHUNK)
+      const result = await db.query(
+        `SELECT sr.src_symbol_version_id AS test_sv, sv.symbol_version_id, s.symbol_id, s.canonical_name
+           FROM structural_relations sr
+           JOIN symbol_versions sv ON sv.symbol_version_id = sr.dst_symbol_version_id
+           JOIN symbols s ON s.symbol_id = sv.symbol_id
+          WHERE sr.src_symbol_version_id = ANY($1::uuid[])`,
+        [chunk],
+      )
+      for (const row of result.rows as {
+        test_sv: string
+        symbol_version_id: string
+        symbol_id: string
+        canonical_name: string
+      }[]) {
+        const list = targets.get(row.test_sv) ?? []
+        if (!list.some((t) => t.symbol_id === row.symbol_id)) {
+          list.push({
+            symbol_version_id: row.symbol_version_id,
+            symbol_id: row.symbol_id,
+            canonical_name: row.canonical_name,
+          })
+        }
+        targets.set(row.test_sv, list)
+      }
+    }
+    return targets
+  }
+
+  /**
    * Mine invariants from test files in the snapshot.
    * Looks for assertion patterns, schema definitions, and security constraints.
    */
@@ -83,28 +123,38 @@ export class ContractEngine {
         sv.file_path.includes("__tests__"),
     )
 
+    // A test asserts the behaviour of the symbols it exercises, so the
+    // invariant belongs on those symbols — the ones getInvariantsForSymbol and
+    // blast radius are asked about. Scoped to the test itself it was invisible
+    // to its target and marked the test critical in every blast radius that
+    // touched it. The targets are the test's outgoing edges; a test that
+    // reaches nothing in the graph asserts nothing the graph can attach.
+    const testVersionIds = new Set(testSymbols.map((sv) => sv.symbol_version_id))
+    const targetsByTest = await this.loadTestTargets([...testVersionIds])
+
     for (const testSv of testSymbols) {
-      // Each test symbol generates an explicit_test invariant
-      // linked to the symbols it references
-      statements.push({
-        text: `INSERT INTO invariants (invariant_id, repo_id, scope_symbol_id, scope_level, expression, source_type, strength, validation_method, last_verified_snapshot_id)
+      for (const target of targetsByTest.get(testSv.symbol_version_id) ?? []) {
+        if (testVersionIds.has(target.symbol_version_id)) continue // a test reaching another test
+        statements.push({
+          text: `INSERT INTO invariants (invariant_id, repo_id, scope_symbol_id, scope_level, expression, source_type, strength, validation_method, last_verified_snapshot_id)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                        ON CONFLICT (repo_id, COALESCE(scope_symbol_id, '00000000-0000-0000-0000-000000000000'::uuid), expression)
                        DO UPDATE SET strength = GREATEST(invariants.strength, EXCLUDED.strength),
                                      last_verified_snapshot_id = EXCLUDED.last_verified_snapshot_id`,
-        params: [
-          uuidv4(),
-          repoId,
-          testSv.symbol_id,
-          "symbol",
-          `test:${testSv.canonical_name} asserts behavior of target symbol`,
-          "explicit_test",
-          0.9,
-          "test_execution",
-          snapshotId,
-        ],
-      })
-      count++
+          params: [
+            uuidv4(),
+            repoId,
+            target.symbol_id,
+            "symbol",
+            `test:${testSv.canonical_name} asserts behavior of ${target.canonical_name}`,
+            "explicit_test",
+            0.9,
+            "test_execution",
+            snapshotId,
+          ],
+        })
+        count++
+      }
     }
 
     // Mine schema invariants from validator/schema symbols
@@ -386,6 +436,8 @@ export class ContractEngine {
     // Return only invariants verified against the most recent snapshot.
     // This filters out stale invariants from older, potentially buggy indexing
     // runs (e.g., cross-language false positives from parse-error snapshots).
+    // "Most recent" is the snapshot's creation time: ordering by the snapshot
+    // id sorted random UUIDs and picked an arbitrary snapshot's set.
     const result = await db.query(
       `
             SELECT i.* FROM invariants i
@@ -393,8 +445,9 @@ export class ContractEngine {
             AND i.last_verified_snapshot_id = (
                 SELECT i2.last_verified_snapshot_id
                 FROM invariants i2
+                JOIN snapshots snap ON snap.snapshot_id = i2.last_verified_snapshot_id
                 WHERE i2.scope_symbol_id = $1
-                ORDER BY i2.last_verified_snapshot_id DESC
+                ORDER BY snap.created_at DESC
                 LIMIT 1
             )
             ORDER BY i.strength DESC`,

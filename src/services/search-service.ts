@@ -29,6 +29,8 @@ export interface SearchCodeResult {
   matches: SearchMatch[]
   /** True when the scan stopped early on the time budget — results are partial. */
   timed_out?: boolean
+  /** True when the repository has more indexed files than a search will scan — results are partial. */
+  files_truncated?: boolean
 }
 
 /**
@@ -47,6 +49,8 @@ const MAX_SEARCH_PATTERN_LENGTH = 2_000
 const MAX_FILE_PATTERN_LENGTH = 2_000
 const MAX_SEARCH_RESULTS = 100
 const MAX_CONTEXT_LINES = 5
+/** Files a search will scan. Past this the result says so instead of silently stopping short. */
+const MAX_SEARCH_FILES = 10_000
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
   return typeof value === "number" && Number.isFinite(value)
@@ -299,16 +303,23 @@ export async function searchCode(
   const basePath = repo.base_path as string
   if (!basePath) throw UserFacingError.badRequest("Repository base path not configured")
 
-  // Get indexed files
+  // The files of the repository's latest indexed snapshot. The union of every
+  // snapshot kept a file deleted since the earliest one searchable, and the
+  // cap truncated a large repository's list with nothing to say so.
   const filesResult = await db.query(
     `
-        SELECT DISTINCT f.path FROM files f
-        JOIN snapshots snap ON snap.snapshot_id = f.snapshot_id
-        WHERE snap.repo_id = $1 ORDER BY f.path
-        LIMIT 10000
+        SELECT f.path FROM files f
+        WHERE f.snapshot_id = (
+            SELECT snap.snapshot_id FROM snapshots snap
+            WHERE snap.repo_id = $1 AND snap.index_status IN ('complete', 'partial')
+            ORDER BY snap.created_at DESC LIMIT 1)
+        ORDER BY f.path
+        LIMIT $2
     `,
-    [repoId],
+    [repoId, MAX_SEARCH_FILES + 1],
   )
+  const filesTruncated = filesResult.rows.length > MAX_SEARCH_FILES
+  if (filesTruncated) filesResult.rows.length = MAX_SEARCH_FILES
 
   let { regex, mode: searchMode } = buildSafeRegex(pattern, log)
 
@@ -340,7 +351,7 @@ export async function searchCode(
   }
 
   if (files.length === 0) {
-    return { pattern, mode: searchMode, total_matches: 0, matches: [] }
+    return { pattern, mode: searchMode, total_matches: 0, matches: [], ...(filesTruncated ? { files_truncated: true } : {}) }
   }
 
   const scanParams: ScanParams = {
@@ -401,5 +412,6 @@ export async function searchCode(
     total_matches: matches.length,
     matches,
     ...(timedOut ? { timed_out: true } : {}),
+    ...(filesTruncated ? { files_truncated: true } : {}),
   }
 }

@@ -15,6 +15,44 @@ re-embeds it against the stored corpus. Nothing else is lost.
 
 ### Fixed
 
+- **`scg_explain_relation` had never once answered.** Its query joined
+  `evidence_bundles` on `inferred_relation_id`, a column that table does not
+  have; the relation row carries `evidence_bundle_id`. Every call failed with
+  "column eb.inferred_relation_id does not exist". It joins on the id the row
+  carries.
+- **`scg_review_homolog` had never once recorded a review.** It set
+  `updated_at` on `inferred_relations`, a column the table never had, so the
+  update failed on every call; the reviewer's name was accepted, logged, and
+  dropped. Migration 027 adds `reviewed_at` and `reviewed_by`, and a review
+  writes the state, the time and the reviewer.
+- **A test's invariant sat on the test, not on what it tests.** Test-derived
+  invariants were scoped to the test symbol with the expression "asserts
+  behavior of target symbol", so the target never saw them and blast radius
+  marked the test critical for asserting itself. They now attach to each
+  symbol the test reaches through its edges, named after both; a test that
+  reaches nothing asserts nothing the graph can attach.
+- **Invariant lookup picked an arbitrary snapshot's set.** "Most recent" was
+  computed by sorting `last_verified_snapshot_id`, a random UUID. It is now the
+  snapshot's creation time.
+- **Resolving a symbol without a snapshot returned one row per snapshot.** Up
+  to the retention cap of identical rows differing only in version id. Without
+  a snapshot, the repository's latest indexed snapshot is meant, and now used.
+- **Code search unioned every snapshot's files and truncated in silence.** A
+  file deleted since the earliest kept snapshot stayed searchable, and a
+  repository past the 10,000-file cap lost the rest with nothing to say so.
+  Search scans the latest indexed snapshot and reports `files_truncated` when
+  it stops short.
+- **`scg_plan_change` resolved candidates from the whole task sentence.** The
+  sentence was handed to name similarity as one string, so forty characters of
+  prose were compared against every symbol name and the candidates were
+  whichever names shared the most trigrams with the English. The names a task
+  mentions — quoted spans, camelCase and snake_case words, dotted paths, words
+  that are not ordinary prose — are now resolved one by one, the best match per
+  symbol kept; when none resolves, the task is run through semantic search over
+  code bodies instead. The plan's assumptions say which route produced the
+  candidates.
+- **A mangled dash in the rollback error.** An em dash written through the
+  wrong code page reached the message as three stray characters.
 - **A capsule shipped 14 tokens more than its own estimate said.** The row id
   of the persisted compilation record was attached after the estimate was
   taken, and nothing reads that id back through any tool. It is no longer
@@ -188,6 +226,12 @@ re-embeds it against the stored corpus. Nothing else is lost.
   side.
 - A test fails when `db/schema.sql` is older than the newest migration; the
   file had been generated before migration 026 existed and shipped without it.
+- A test reads every SQL literal in the source and checks each column it
+  names — `alias.column`, `UPDATE … SET column`, `INSERT INTO table (columns)`
+  — against the shipped schema. The driver is mocked in unit tests, so a column
+  that does not exist was only ever found by PostgreSQL, in production. Across
+  384 literals it found exactly the two broken tools above and nothing else.
+- Migration 027: `inferred_relations.reviewed_at` and `reviewed_by`.
 - The CI cold-start smoke fails on any error-level log line. The retention
   race above logged four while every existing check passed. It also fails if
   a mutation tool is listed while mutations are off, and records the size of
