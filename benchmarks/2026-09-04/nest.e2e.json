@@ -1,0 +1,422 @@
+{
+  "repo": "E:/cz-bench-corpus/repos/nest",
+  "name": "nest",
+  "source": {
+    "bytes": 4085987,
+    "files": 1842,
+    "lines": 134763
+  },
+  "ingest": {
+    "coldMs": 153434,
+    "coldPeakRss": 531759104,
+    "warmMs": 2689,
+    "warmVectorsAdded": 0,
+    "incrementalMs": 5922
+  },
+  "storage": {
+    "totals": {
+      "db": "108246707",
+      "heap": "45113344",
+      "idx": "52453376",
+      "toast": "1114112"
+    },
+    "counts": {
+      "snapshots": "1",
+      "symbols": "10086",
+      "versions": "10086",
+      "distinct_bodies": "8323",
+      "vectors": "50430",
+      "relations": "20109",
+      "idf_rows": "5"
+    },
+    "tables": [
+      {
+        "name": "semantic_vectors",
+        "rows": "50430",
+        "heap": "11796480",
+        "idx": "13574144",
+        "total": "25395200"
+      },
+      {
+        "name": "symbols",
+        "rows": "10086",
+        "heap": "4333568",
+        "idx": "9994240",
+        "total": "14368768"
+      },
+      {
+        "name": "symbol_versions",
+        "rows": "9912",
+        "heap": "7315456",
+        "idx": "6447104",
+        "total": "14082048"
+      },
+      {
+        "name": "invariants",
+        "rows": "18631",
+        "heap": "3735552",
+        "idx": "5079040",
+        "total": "8855552"
+      },
+      {
+        "name": "structural_relations",
+        "rows": "19634",
+        "heap": "3858432",
+        "idx": "3915776",
+        "total": "7806976"
+      },
+      {
+        "name": "effect_signatures",
+        "rows": "9912",
+        "heap": "3424256",
+        "idx": "2572288",
+        "total": "6037504"
+      },
+      {
+        "name": "symbol_lineage",
+        "rows": "7937",
+        "heap": "2162688",
+        "idx": "2891776",
+        "total": "5095424"
+      },
+      {
+        "name": "test_artifacts",
+        "rows": "5332",
+        "heap": "1875968",
+        "idx": "2072576",
+        "total": "3989504"
+      },
+      {
+        "name": "behavioral_profiles",
+        "rows": "9912",
+        "heap": "2711552",
+        "idx": "1048576",
+        "total": "3801088"
+      },
+      {
+        "name": "temporal_risk_scores",
+        "rows": "10086",
+        "heap": "1425408",
+        "idx": "2121728",
+        "total": "3571712"
+      },
+      {
+        "name": "files",
+        "rows": "2704",
+        "heap": "786432",
+        "idx": "811008",
+        "total": "1638400"
+      },
+      {
+        "name": "dispatch_edges",
+        "rows": "2152",
+        "heap": "540672",
+        "idx": "696320",
+        "total": "1277952"
+      },
+      {
+        "name": "contract_profiles",
+        "rows": "2682",
+        "heap": "827392",
+        "idx": "344064",
+        "total": "1212416"
+      },
+      {
+        "name": "class_hierarchy",
+        "rows": "1700",
+        "heap": "180224",
+        "idx": "368640",
+        "total": "581632"
+      }
+    ],
+    "vectorCols": {
+      "sparse": "1287556",
+      "minhash": "4659480",
+      "bands": "767550",
+      "with_sig": "9030"
+    },
+    "versionCols": {
+      "body_source": "3394915",
+      "signature": "428472",
+      "hashes": "1966770",
+      "summary": "10086"
+    },
+    "idxTop": [
+      {
+        "tbl": "semantic_vectors",
+        "name": "idx_semantic_vectors_band_keys",
+        "bytes": "8003584",
+        "scans": "0"
+      },
+      {
+        "tbl": "symbols",
+        "name": "idx_symbols_canonical_name_trgm",
+        "bytes": "5095424",
+        "scans": "0"
+      },
+      {
+        "tbl": "symbols",
+        "name": "symbols_repo_id_stable_key_key",
+        "bytes": "2891776",
+        "scans": "10088"
+      },
+      {
+        "tbl": "invariants",
+        "name": "idx_invariants_dedup",
+        "bytes": "2867200",
+        "scans": "18631"
+      },
+      {
+        "tbl": "semantic_vectors",
+        "name": "idx_semantic_vectors_token_hashes",
+        "bytes": "2818048",
+        "scans": "0"
+      },
+      {
+        "tbl": "semantic_vectors",
+        "name": "semantic_vectors_pkey",
+        "bytes": "2326528",
+        "scans": "51474"
+      },
+      {
+        "tbl": "structural_relations",
+        "name": "structural_relations_src_symbol_version_id_dst_symbol_versi_key",
+        "bytes": "1785856",
+        "scans": "78764"
+      },
+      {
+        "tbl": "test_artifacts",
+        "name": "idx_ta_related_symbols",
+        "bytes": "1572864",
+        "scans": "0"
+      },
+      {
+        "tbl": "symbol_versions",
+        "name": "idx_sv_snapshot_ast_hash",
+        "bytes": "1400832",
+        "scans": "0"
+      },
+      {
+        "tbl": "symbol_versions",
+        "name": "idx_sv_snapshot_normalized_ast_hash",
+        "bytes": "1310720",
+        "scans": "0"
+      }
+    ],
+    "unused": {
+      "bytes": "30556160",
+      "n": "72"
+    }
+  },
+  "queries": [
+    {
+      "name": "scg_snapshot_stats",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 803,
+      "p50": 19.9247,
+      "p95": 27.167,
+      "p99": 35.8597,
+      "max": 35.8597
+    },
+    {
+      "name": "scg_codebase_overview",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 14077,
+      "p50": 51.9111,
+      "p95": 75.6709,
+      "p99": 106.1194,
+      "max": 106.1194
+    },
+    {
+      "name": "scg_resolve_symbol",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 4964,
+      "p50": 4.5046,
+      "p95": 60.7521,
+      "p99": 64.842,
+      "max": 64.842
+    },
+    {
+      "name": "scg_get_symbol_details",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 16830,
+      "p50": 1.4733,
+      "p95": 2.4053,
+      "p99": 3.3975,
+      "max": 3.3975
+    },
+    {
+      "name": "scg_get_neighbors",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 49822,
+      "p50": 9.95,
+      "p95": 15.0873,
+      "p99": 18.6726,
+      "max": 18.6726
+    },
+    {
+      "name": "scg_get_symbol_relations",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 13700,
+      "p50": 0.3877,
+      "p95": 0.7042,
+      "p99": 3.4453,
+      "max": 3.4453
+    },
+    {
+      "name": "scg_get_behavioral_profile",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 549,
+      "p50": 0.1868,
+      "p95": 0.3051,
+      "p99": 0.3631,
+      "max": 0.3631
+    },
+    {
+      "name": "scg_get_contract_profile",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 508,
+      "p50": 0.5404,
+      "p95": 1.0996,
+      "p99": 1.2055,
+      "max": 1.2055
+    },
+    {
+      "name": "scg_get_effect_signature",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 375,
+      "p50": 0.2432,
+      "p95": 0.477,
+      "p99": 0.7514,
+      "max": 0.7514
+    },
+    {
+      "name": "scg_get_tests",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 153,
+      "p50": 3.057,
+      "p95": 3.8158,
+      "p99": 4.3136,
+      "max": 4.3136
+    },
+    {
+      "name": "scg_get_invariants",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 7009,
+      "p50": 0.6949,
+      "p95": 1.0357,
+      "p99": 1.114,
+      "max": 1.114
+    },
+    {
+      "name": "scg_get_temporal_risk",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 704,
+      "p50": 0.2468,
+      "p95": 0.4461,
+      "p99": 0.5689,
+      "max": 0.5689
+    },
+    {
+      "name": "scg_read_source",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 15598,
+      "p50": 0.5892,
+      "p95": 0.9191,
+      "p99": 1.0087,
+      "max": 1.0087
+    },
+    {
+      "name": "scg_search_code",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 8093,
+      "p50": 19.0653,
+      "p95": 61.6381,
+      "p99": 68.5728,
+      "max": 68.5728
+    },
+    {
+      "name": "scg_semantic_search",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 7507,
+      "p50": 21.7065,
+      "p95": 51.0782,
+      "p99": 69.4454,
+      "max": 69.4454
+    },
+    {
+      "name": "scg_find_homologs",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 68,
+      "p50": 81.0018,
+      "p95": 128.2012,
+      "p99": 138.7771,
+      "max": 138.7771
+    },
+    {
+      "name": "scg_blast_radius",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 39925,
+      "p50": 3.6428,
+      "p95": 11.1393,
+      "p99": 23.5987,
+      "max": 23.5987
+    },
+    {
+      "name": "scg_compile_context_capsule",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 30121,
+      "p50": 5.6463,
+      "p95": 16.2571,
+      "p99": 20.8724,
+      "max": 20.8724
+    },
+    {
+      "name": "scg_smart_context",
+      "ok": 40,
+      "failed": 0,
+      "firstError": null,
+      "avgBytes": 55736,
+      "p50": 4.8451,
+      "p95": 10.7746,
+      "p99": 31.3211,
+      "max": 31.3211
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+{
+  "repo": "context-zero-engine",
+  "shared_universe_files": 169,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 773010,
+  "corpus_load_ms": 93,
+  "tasks": 29,
+  "tasks_attempted": 29,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 3,
+      "lines_of_code": 2833,
+      "tokens": 28166
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 677,
+      "tokens": 7903
+    },
+    "tokens_saved_pct": 71.9
+  },
+  "cost": {
+    "avg_capsule_tokens": 6032,
+    "naive_grep_read_tokens": 927926,
+    "contextzero_tokens": 174935,
+    "reduction_vs_naive": 5.3,
+    "naive_all_referencing_tokens": 927926,
+    "reduction_vs_all_referencing": 5.3,
+    "oracle_file_tokens": 512687,
+    "reduction_vs_oracle": 2.9,
+    "reduction_vs_oracle_median": 2.6
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 201,
+    "avg_per_task": 6.9,
+    "of_which_indexed_as_symbols_pct": 97.5,
+    "internal_imports_seen": 115,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 13.4,
+    "contextzero_recall_incl_failures_pct": 13.4,
+    "contextzero_recall_of_indexed_pct": 13.8,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 13,
+    "tied": 16,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 17.2
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 17.2
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 44.8,
+      "file_reading": 41.4
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 0.56,
+    "file_reading": 0.13
+  },
+  "capsule_composition": {
+    "avg_nodes": 7.8,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 75.4,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 0,
+    "contract_or_invariant_pct": 0,
+    "linked_test_pct": 13.8,
+    "effect_entries_total": 0,
+    "share_of_capsule_tokens_pct": 0,
+    "read_from_the_body_itself_pct": 0,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 0
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 17,
+    "p90_ms": 21
+  },
+  "weakest_tasks": [
+    {
+      "name": "DispatchResolver",
+      "imports_used": 7,
+      "indexed": 6,
+      "delivered": 0,
+      "nodes": 5,
+      "spent": 7917
+    },
+    {
+      "name": "DeepContractSynthesizer",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 5,
+      "spent": 7914
+    },
+    {
+      "name": "SemanticEngine",
+      "imports_used": 25,
+      "indexed": 25,
+      "delivered": 0,
+      "nodes": 3,
+      "spent": 7942
+    },
+    {
+      "name": "CapsuleCompiler",
+      "imports_used": 12,
+      "indexed": 12,
+      "delivered": 0,
+      "nodes": 4,
+      "spent": 7952
+    },
+    {
+      "name": "ConceptFamilyEngine",
+      "imports_used": 7,
+      "indexed": 7,
+      "delivered": 0,
+      "nodes": 3,
+      "spent": 7943
+    },
+    {
+      "name": "TemporalEngine",
+      "imports_used": 11,
+      "indexed": 10,
+      "delivered": 0,
+      "nodes": 6,
+      "spent": 7923
+    },
+    {
+      "name": "HomologInferenceEngine",
+      "imports_used": 27,
+      "indexed": 27,
+      "delivered": 1,
+      "nodes": 5,
+      "spent": 7884
+    },
+    {
+      "name": "TransactionalChangeEngine",
+      "imports_used": 26,
+      "indexed": 26,
+      "delivered": 1,
+      "nodes": 4,
+      "spent": 7885
+    }
+  ]
+}

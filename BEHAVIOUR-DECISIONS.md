@@ -15,6 +15,36 @@ against, and how a regression would show up to somebody using the engine.
 
 ---
 
+## 2026-09-06 — A qualified call resolves through the file's imports
+
+**Decision.** In `computeRelationsFromRaw`, after the owner-member lookup and
+before the scope ladder, `pkg.member` is resolved by taking the file's
+import whose last segment is `pkg`, mapping that import path to a file or
+directory of the snapshot by its longest trailing segments, and looking the
+member up there; only a unique match counts.
+
+**Why it is not arbitrary.** The imports are the file's own statement of
+what `pkg` means. Falling to the repository-wide bare name was a guess
+presented as a measurement, and in a repository with two `Unmarshal` or two
+`helper` it was no edge at all. Suffix matching avoids needing the module
+root (go.mod, a Python source root, a Java package prefix), which the engine
+does not know and should not have to. What the adapter does not emit — an
+explicit alias in Go, `import x as y` in Python — still falls through to the
+ladder, as before.
+
+**Verified against.** Unit test: an ambiguous `Unmarshal` resolves to the
+imported package's file, a sibling file of that package resolves too, and a
+Python `util.helper` resolves to the imported module over a same-named
+helper elsewhere. Observed on gin's library code (23 targets): 50% of indexed
+dependencies delivered, with the two misses named by the benchmark's
+diagnosis.
+
+**Regression looks like.** Qualified calls to same-named exports in different
+packages disappear from the graph again; the benchmark's `no_edge_samples`
+fill with `pkg.member` dependencies.
+
+---
+
 ## 2026-09-06 — Relations resolve once per snapshot, and every engine inserts in bulk
 
 **Decision.** `computeRelationsFromRaw` runs once per ingest over every

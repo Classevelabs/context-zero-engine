@@ -425,6 +425,16 @@ for (const r of defRes.rows) {
 // CZ_BENCH_KIND restricts the target population to one symbol kind (e.g. class)
 // so the class-capsule DI gap can be measured apart from methods/functions,
 // which have no dotted members for a traversal fix to reach.
+// "Change this function" is asked of library code, not of its tests; a test
+// function's dependencies are the fixtures beside it and the standard
+// library, which says nothing about the graph. Tests are excluded from the
+// target population unless CZ_BENCH_INCLUDE_TESTS=1.
+const TEST_FILTER =
+  process.env.CZ_BENCH_INCLUDE_TESTS === "1"
+    ? ""
+    : " AND f.path NOT LIKE '%\_test.%' AND f.path NOT LIKE '%.test.%' AND f.path NOT LIKE '%.spec.%'" +
+      " AND f.path NOT LIKE '%/tests/%' AND f.path NOT LIKE '%/test/%' AND f.path NOT LIKE '%__tests__%'" +
+      " AND f.path NOT LIKE 'tests/%' AND f.path NOT LIKE 'test/%' AND f.path NOT LIKE '%/test\_%' AND f.path NOT LIKE 'test\_%'"
 const KINDS = process.env.CZ_BENCH_KIND
   ? process.env.CZ_BENCH_KIND.split(",").map((k) => "'" + k.trim().replace(/'/g, "") + "'").join(",")
   : "'function','method','class'"
@@ -434,6 +444,7 @@ const targets = await db.query(
     " FROM symbol_versions sv LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref JOIN symbols s USING(symbol_id) JOIN files f ON f.file_id = sv.file_id" +
     " WHERE f.snapshot_id = $1 AND s.kind IN (" + KINDS + ")" +
     " AND LENGTH(COALESCE(sb.body_source,'')) > 500 AND LENGTH(s.canonical_name) >= $3" +
+    TEST_FILTER +
     " ORDER BY " + TARGET_ORDER + " LIMIT $2",
   [snapshotId, N, MIN_NAME],
 )

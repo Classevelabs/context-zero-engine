@@ -1,0 +1,158 @@
+{
+  "repo": "gh-cli",
+  "shared_universe_files": 937,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 2093661,
+  "corpus_load_ms": 877,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 2,
+      "lines_of_code": 1124,
+      "tokens": 9133
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 196,
+      "tokens": 2220
+    },
+    "tokens_saved_pct": 75.7
+  },
+  "cost": {
+    "avg_capsule_tokens": 2839,
+    "naive_grep_read_tokens": 962537,
+    "contextzero_tokens": 170310,
+    "reduction_vs_naive": 5.7,
+    "naive_all_referencing_tokens": 962537,
+    "reduction_vs_all_referencing": 5.7,
+    "oracle_file_tokens": 689607,
+    "reduction_vs_oracle": 4,
+    "reduction_vs_oracle_median": 3.8
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 102,
+    "avg_per_task": 1.7,
+    "of_which_indexed_as_symbols_pct": 99,
+    "internal_imports_seen": 258,
+    "internal_imports_unresolved_pct": 0.4,
+    "contextzero_recall_overall_pct": 78.4,
+    "contextzero_recall_incl_failures_pct": 78.4,
+    "contextzero_recall_of_indexed_pct": 79.2,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 30,
+    "tied": 30,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 28.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 28.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 86.7,
+      "file_reading": 35
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.48,
+    "file_reading": 0.32
+  },
+  "capsule_composition": {
+    "avg_nodes": 7.8,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 35.5,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 33.3,
+    "contract_or_invariant_pct": 93.3,
+    "linked_test_pct": 0,
+    "effect_entries_total": 30,
+    "share_of_capsule_tokens_pct": 0.8,
+    "read_from_the_body_itself_pct": 46.7,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 60
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 13,
+    "p90_ms": 15
+  },
+  "weakest_tasks": [
+    {
+      "name": "deferredUpdateIssueOptions",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 3,
+      "nodes": 7,
+      "spent": 4298
+    },
+    {
+      "name": "officialExtensionStubRun",
+      "imports_used": 6,
+      "indexed": 6,
+      "delivered": 4,
+      "nodes": 15,
+      "spent": 2993
+    },
+    {
+      "name": "executeLocalRepoSync",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 9,
+      "spent": 3588
+    },
+    {
+      "name": "searchPullRequests",
+      "imports_used": 9,
+      "indexed": 9,
+      "delivered": 7,
+      "nodes": 13,
+      "spent": 3792
+    },
+    {
+      "name": "mapRepoNamesToIDs",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 4,
+      "nodes": 7,
+      "spent": 1985
+    },
+    {
+      "name": "printOpenSSHConfig",
+      "imports_used": 7,
+      "indexed": 7,
+      "delivered": 6,
+      "nodes": 21,
+      "spent": 5489
+    },
+    {
+      "name": "reviewerSearchFunc",
+      "imports_used": 7,
+      "indexed": 7,
+      "delivered": 6,
+      "nodes": 9,
+      "spent": 4210
+    },
+    {
+      "name": "fetchDraftRelease",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 3,
+      "nodes": 12,
+      "spent": 2220
+    }
+  ]
+}

@@ -1,0 +1,150 @@
+{
+  "repo": "flask",
+  "shared_universe_files": 83,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 151956,
+  "corpus_load_ms": 23,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 3,
+      "lines_of_code": 1832,
+      "tokens": 18221
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 88,
+      "tokens": 1386
+    },
+    "tokens_saved_pct": 92.4
+  },
+  "cost": {
+    "avg_capsule_tokens": 1572,
+    "naive_grep_read_tokens": 1404256,
+    "contextzero_tokens": 94290,
+    "reduction_vs_naive": 14.9,
+    "naive_all_referencing_tokens": 1404256,
+    "reduction_vs_all_referencing": 14.9,
+    "oracle_file_tokens": 765770,
+    "reduction_vs_oracle": 8.1,
+    "reduction_vs_oracle_median": 10.3
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 122,
+    "avg_per_task": 2,
+    "of_which_indexed_as_symbols_pct": 53.3,
+    "internal_imports_seen": 744,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 13.1,
+    "contextzero_recall_incl_failures_pct": 13.1,
+    "contextzero_recall_of_indexed_pct": 23.1,
+    "file_reading_recall_overall_pct": 7.4,
+    "contextzero_beats_files": 11,
+    "tied": 45,
+    "file_reading_beats_contextzero": 4
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 3.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 3.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 63.3,
+      "file_reading": 36.7
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.85,
+    "file_reading": 0.37
+  },
+  "capsule_composition": {
+    "avg_nodes": 4.9,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 19.6,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 53.3,
+    "contract_or_invariant_pct": 81.7,
+    "linked_test_pct": 0,
+    "effect_entries_total": 81,
+    "share_of_capsule_tokens_pct": 3.5,
+    "read_from_the_body_itself_pct": 35.8,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 40.6
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 10,
+    "p90_ms": 11
+  },
+  "weakest_tasks": [
+    {
+      "name": "process_response",
+      "imports_used": 5,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 7,
+      "spent": 1532
+    },
+    {
+      "name": "SessionInterface",
+      "imports_used": 4,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 0,
+      "spent": 2147
+    },
+    {
+      "name": "__init_subclass__",
+      "imports_used": 15,
+      "indexed": 14,
+      "delivered": 0,
+      "nodes": 4,
+      "spent": 1386
+    },
+    {
+      "name": "handle_exception",
+      "imports_used": 6,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 11,
+      "spent": 3090
+    },
+    {
+      "name": "SecureCookieSessionInterface",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 12,
+      "spent": 5015
+    },
+    {
+      "name": "register_blueprint",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 1,
+      "nodes": 3,
+      "spent": 2182
+    },
+    {
+      "name": "do_teardown_appcontext",
+      "imports_used": 5,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 7,
+      "spent": 1858
+    }
+  ]
+}

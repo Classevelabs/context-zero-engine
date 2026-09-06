@@ -67,7 +67,10 @@ after this batch: gin 17.6 s to 11.6 s, flask 28.6 s to 15.4 s, this engine
   each member's body, and spends the rest of the budget on what the class
   actually depends on. Measured on class targets before this: 57.7%
   dependency recall at 6,470 tokens, most of it spent on member bodies the
-  caller could fetch by handle. __SKELETON_MEASUREMENT__
+  caller could fetch by handle.
+  Measured on the same 29 class targets of this engine, same database,
+  12,000-token budget, switch off against on: 13.8% to 44.4% of 201 indexed
+  dependencies delivered, median capsule 7,903 to 7,912 tokens.
 - **A class's blast radius includes its members' callers.** The class node
   alone has almost no callers; its methods do. Class and interface targets
   now widen to their members before any dimension runs, and the report says
@@ -80,6 +83,19 @@ after this batch: gin 17.6 s to 11.6 s, flask 28.6 s to 15.4 s, this engine
   relative, module or member) and Go package imports resolved through
   go.mod, so recall is measured on the languages the engine indexes rather
   than stated for one and assumed for the rest.
+- **A qualified call resolves through the file's imports.** `json.Unmarshal`
+  in a Go file that imports `.../internal/json`, `util.helper` in a Python
+  file that imports `pkg.util`, a Java class imported by path: the name
+  before the dot is the package or module the file imports under that
+  name, and the member is looked up there. An import path is matched to the
+  snapshot's files and directories by its longest trailing segments, so no
+  module root has to be known. Before this, a qualified call fell to the
+  repository-wide bare name and was dropped whenever two packages exported
+  it.
+- **The benchmark's targets are library code.** Test functions are excluded
+  from the target population unless `CZ_BENCH_INCLUDE_TESTS=1`: a test's
+  dependencies are its fixtures and the standard library, which says
+  nothing about the graph, and on gin they were 37 of 60 targets.
 - **The benchmark counts what it could not answer.** A target the capsule
   compiler fails on, or answers with fewer than 50 tokens, used to vanish
   from the denominator; it is now a failed task, reported with its reason,

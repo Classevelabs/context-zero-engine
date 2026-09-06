@@ -2162,6 +2162,32 @@ describe("StructuralGraphEngine", () => {
         expect(persistedTargets()).toEqual(["sv-unique"])
       })
 
+      test("`pkg.member` resolves through the file's import to that package, not to an ambiguous bare name", async () => {
+        const { coreDataService } = require("../db-driver/core_data")
+        coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
+          { stable_key: "context.go::__module__", canonical_name: "context.go", symbol_version_id: "sv-mod" },
+          { stable_key: "context.go::Context.Bind", canonical_name: "Bind", symbol_version_id: "sv-bind" },
+          { stable_key: "internal/json/json.go::Unmarshal", canonical_name: "Unmarshal", symbol_version_id: "sv-json-unmarshal" },
+          { stable_key: "internal/json/sonic.go::Marshal", canonical_name: "Marshal", symbol_version_id: "sv-json-marshal" },
+          { stable_key: "binding/yaml.go::Unmarshal", canonical_name: "Unmarshal", symbol_version_id: "sv-yaml-unmarshal" },
+          { stable_key: "pkg/util.py::helper", canonical_name: "helper", symbol_version_id: "sv-py-helper" },
+          { stable_key: "other/util.py::helper", canonical_name: "helper", symbol_version_id: "sv-other-helper" },
+          { stable_key: "app.py::__module__", canonical_name: "app.py", symbol_version_id: "sv-app-mod" },
+          { stable_key: "app.py#main", canonical_name: "main", symbol_version_id: "sv-main" },
+        ])
+        const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
+          { source_key: "context.go::__module__", target_name: "github.com/gin-gonic/gin/internal/json", relation_type: "imports" as const },
+          // Unmarshal is ambiguous repository-wide; the import says which one.
+          { source_key: "context.go::Context.Bind", target_name: "json.Unmarshal", relation_type: "calls" as const },
+          // A sibling file of the imported package is the same package.
+          { source_key: "context.go::Context.Bind", target_name: "json.Marshal", relation_type: "calls" as const },
+          { source_key: "app.py::__module__", target_name: "pkg.util", relation_type: "imports" as const },
+          { source_key: "app.py#main", target_name: "util.helper", relation_type: "calls" as const },
+        ])
+        expect(n).toBe(3)
+        expect(persistedTargets()).toEqual(["sv-json-unmarshal", "sv-json-marshal", "sv-py-helper"])
+      })
+
       test("a chain resolves by the identifier it ends in, from the index, with no database lookup", async () => {
         // `strings.Split` names a package the index does not know; `Split` is
         // unique in the repository, so the chain lands on it without a query.

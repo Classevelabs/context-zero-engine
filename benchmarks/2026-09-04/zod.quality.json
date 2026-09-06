@@ -1,0 +1,151 @@
+{
+  "repo": "zod",
+  "shared_universe_files": 511,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 884706,
+  "corpus_load_ms": 162,
+  "tasks": 60,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 1,
+      "lines_of_code": 1867,
+      "tokens": 17880
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 214,
+      "tokens": 2669
+    },
+    "tokens_saved_pct": 85.1
+  },
+  "cost": {
+    "avg_capsule_tokens": 2986,
+    "naive_grep_read_tokens": 1673372,
+    "contextzero_tokens": 179180,
+    "reduction_vs_naive": 9.3,
+    "oracle_file_tokens": 2096282,
+    "reduction_vs_oracle": 11.7,
+    "reduction_vs_oracle_median": 8.4
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 144,
+    "avg_per_task": 2.4,
+    "of_which_indexed_as_symbols_pct": 97.9,
+    "internal_imports_seen": 348,
+    "internal_imports_unresolved_pct": 1.7,
+    "contextzero_recall_overall_pct": 58.3,
+    "contextzero_recall_of_indexed_pct": 59.6,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 32,
+    "tied": 28,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 16.7
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 16.7
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 83.3,
+      "file_reading": 15
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.42,
+    "file_reading": 0.16
+  },
+  "capsule_composition": {
+    "avg_nodes": 7.7,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 37.3,
+    "self_reported_vs_actual_tokens_pct": 99.5,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 40,
+    "contract_or_invariant_pct": 75,
+    "linked_test_pct": 5,
+    "effect_entries_total": 76,
+    "share_of_capsule_tokens_pct": 2,
+    "read_from_the_body_itself_pct": 48.7,
+    "propagated_around_a_call_cycle_pct": 11.8,
+    "distinct_effect_sets_pct": 41.7
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 18,
+    "p90_ms": 23
+  },
+  "weakest_tasks": [
+    {
+      "name": "JSONSchemaGenerator",
+      "imports_used": 11,
+      "indexed": 11,
+      "delivered": 0,
+      "nodes": 6,
+      "spent": 2161
+    },
+    {
+      "name": "makeResource",
+      "imports_used": 12,
+      "indexed": 11,
+      "delivered": 0,
+      "nodes": 7,
+      "spent": 2732
+    },
+    {
+      "name": "generateCheck",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 11,
+      "spent": 7923
+    },
+    {
+      "name": "convertBaseSchema",
+      "imports_used": 6,
+      "indexed": 6,
+      "delivered": 0,
+      "nodes": 15,
+      "spent": 7914
+    },
+    {
+      "name": "ZodIntersection",
+      "imports_used": 8,
+      "indexed": 7,
+      "delivered": 0,
+      "nodes": 15,
+      "spent": 5346
+    },
+    {
+      "name": "fileProcessor",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 2,
+      "nodes": 5,
+      "spent": 1225
+    },
+    {
+      "name": "literalProcessor",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 2,
+      "nodes": 5,
+      "spent": 1701
+    },
+    {
+      "name": "arrayProcessor",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 3,
+      "nodes": 6,
+      "spent": 2016
+    }
+  ]
+}

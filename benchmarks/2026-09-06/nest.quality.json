@@ -1,0 +1,158 @@
+{
+  "repo": "nest",
+  "shared_universe_files": 1918,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 1027008,
+  "corpus_load_ms": 1712,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 4,
+      "lines_of_code": 1090,
+      "tokens": 8681
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 159,
+      "tokens": 2187
+    },
+    "tokens_saved_pct": 74.8
+  },
+  "cost": {
+    "avg_capsule_tokens": 3697,
+    "naive_grep_read_tokens": 747571,
+    "contextzero_tokens": 221836,
+    "reduction_vs_naive": 3.4,
+    "naive_all_referencing_tokens": 821419,
+    "reduction_vs_all_referencing": 3.7,
+    "oracle_file_tokens": 361555,
+    "reduction_vs_oracle": 1.6,
+    "reduction_vs_oracle_median": 1.4
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 338,
+    "avg_per_task": 5.6,
+    "of_which_indexed_as_symbols_pct": 47,
+    "internal_imports_seen": 488,
+    "internal_imports_unresolved_pct": 0.4,
+    "contextzero_recall_overall_pct": 66.9,
+    "contextzero_recall_incl_failures_pct": 66.9,
+    "contextzero_recall_of_indexed_pct": 71.1,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 52,
+    "tied": 8,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 36.7
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 36.7
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 70,
+      "file_reading": 70
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.75,
+    "file_reading": 0.39
+  },
+  "capsule_composition": {
+    "avg_nodes": 13.7,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 46.2,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 13.3,
+    "contract_or_invariant_pct": 51.7,
+    "linked_test_pct": 51.7,
+    "effect_entries_total": 15,
+    "share_of_capsule_tokens_pct": 0.3,
+    "read_from_the_body_itself_pct": 73.3,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 100
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 16,
+    "p90_ms": 19
+  },
+  "weakest_tasks": [
+    {
+      "name": "SocketModule",
+      "imports_used": 25,
+      "indexed": 8,
+      "delivered": 0,
+      "nodes": 14,
+      "spent": 7898
+    },
+    {
+      "name": "handleStatusUpdates",
+      "imports_used": 8,
+      "indexed": 7,
+      "delivered": 2,
+      "nodes": 20,
+      "spent": 2830
+    },
+    {
+      "name": "createApplicationContext",
+      "imports_used": 5,
+      "indexed": 3,
+      "delivered": 1,
+      "nodes": 18,
+      "spent": 7993
+    },
+    {
+      "name": "NestFactoryStatic",
+      "imports_used": 33,
+      "indexed": 20,
+      "delivered": 7,
+      "nodes": 34,
+      "spent": 7719
+    },
+    {
+      "name": "RoutesMapper",
+      "imports_used": 17,
+      "indexed": 7,
+      "delivered": 4,
+      "nodes": 24,
+      "spent": 7962
+    },
+    {
+      "name": "resolveComponentHost",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 23,
+      "spent": 7856
+    },
+    {
+      "name": "GrpcExceptionFilter",
+      "imports_used": 10,
+      "indexed": 4,
+      "delivered": 3,
+      "nodes": 14,
+      "spent": 2272
+    },
+    {
+      "name": "SerializedGraph",
+      "imports_used": 19,
+      "indexed": 18,
+      "delivered": 14,
+      "nodes": 23,
+      "spent": 7906
+    }
+  ]
+}

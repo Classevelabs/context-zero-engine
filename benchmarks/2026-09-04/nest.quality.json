@@ -1,0 +1,151 @@
+{
+  "repo": "nest",
+  "shared_universe_files": 1918,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 1027008,
+  "corpus_load_ms": 1492,
+  "tasks": 60,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 4,
+      "lines_of_code": 890,
+      "tokens": 7063
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 141,
+      "tokens": 2243
+    },
+    "tokens_saved_pct": 68.2
+  },
+  "cost": {
+    "avg_capsule_tokens": 2831,
+    "naive_grep_read_tokens": 678831,
+    "contextzero_tokens": 169860,
+    "reduction_vs_naive": 4,
+    "oracle_file_tokens": 303182,
+    "reduction_vs_oracle": 1.8,
+    "reduction_vs_oracle_median": 1.4
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 356,
+    "avg_per_task": 5.9,
+    "of_which_indexed_as_symbols_pct": 46.9,
+    "internal_imports_seen": 415,
+    "internal_imports_unresolved_pct": 0.5,
+    "contextzero_recall_overall_pct": 22.8,
+    "contextzero_recall_of_indexed_pct": 21,
+    "file_reading_recall_overall_pct": 0.6,
+    "contextzero_beats_files": 37,
+    "tied": 23,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 43.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 43.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 81.7,
+      "file_reading": 60
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.47,
+    "file_reading": 0.53
+  },
+  "capsule_composition": {
+    "avg_nodes": 8.1,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 35.4,
+    "self_reported_vs_actual_tokens_pct": 99.5,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 11.7,
+    "contract_or_invariant_pct": 48.3,
+    "linked_test_pct": 51.7,
+    "effect_entries_total": 17,
+    "share_of_capsule_tokens_pct": 0.5,
+    "read_from_the_body_itself_pct": 58.8,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 100
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 16,
+    "p90_ms": 21
+  },
+  "weakest_tasks": [
+    {
+      "name": "InternalCoreModuleFactory",
+      "imports_used": 18,
+      "indexed": 16,
+      "delivered": 0,
+      "nodes": 4,
+      "spent": 1248
+    },
+    {
+      "name": "NestFactoryStatic",
+      "imports_used": 33,
+      "indexed": 17,
+      "delivered": 0,
+      "nodes": 1,
+      "spent": 2951
+    },
+    {
+      "name": "LazyModuleLoader",
+      "imports_used": 11,
+      "indexed": 9,
+      "delivered": 0,
+      "nodes": 6,
+      "spent": 3079
+    },
+    {
+      "name": "KafkaReplyPartitionAssigner",
+      "imports_used": 10,
+      "indexed": 8,
+      "delivered": 0,
+      "nodes": 3,
+      "spent": 2360
+    },
+    {
+      "name": "GrpcExceptionFilter",
+      "imports_used": 10,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 5,
+      "spent": 1216
+    },
+    {
+      "name": "SocketServerProvider",
+      "imports_used": 7,
+      "indexed": 4,
+      "delivered": 0,
+      "nodes": 8,
+      "spent": 2414
+    },
+    {
+      "name": "RecipesResolver",
+      "imports_used": 5,
+      "indexed": 4,
+      "delivered": 0,
+      "nodes": 1,
+      "spent": 490
+    },
+    {
+      "name": "NestedTransientController",
+      "imports_used": 5,
+      "indexed": 3,
+      "delivered": 0,
+      "nodes": 1,
+      "spent": 395
+    }
+  ]
+}

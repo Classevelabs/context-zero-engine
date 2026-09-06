@@ -1,0 +1,93 @@
+{
+  "repo": "okhttp",
+  "shared_universe_files": 692,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 1167915,
+  "corpus_load_ms": 656,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 1,
+      "lines_of_code": 1300,
+      "tokens": 10169
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 81,
+      "tokens": 1194
+    },
+    "tokens_saved_pct": 88.3
+  },
+  "cost": {
+    "avg_capsule_tokens": 2196,
+    "naive_grep_read_tokens": 1285325,
+    "contextzero_tokens": 131747,
+    "reduction_vs_naive": 9.8,
+    "naive_all_referencing_tokens": 1385524,
+    "reduction_vs_all_referencing": 10.5,
+    "oracle_file_tokens": 712557,
+    "reduction_vs_oracle": 5.4,
+    "reduction_vs_oracle_median": 3.7
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 0,
+    "avg_per_task": 0,
+    "of_which_indexed_as_symbols_pct": 0,
+    "internal_imports_seen": 0,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 0,
+    "contextzero_recall_incl_failures_pct": 0,
+    "contextzero_recall_of_indexed_pct": 0,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 0,
+    "tied": 60,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 16.7
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 16.7
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 28.3,
+      "file_reading": 16.7
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.04,
+    "file_reading": 0.23
+  },
+  "capsule_composition": {
+    "avg_nodes": 6.5,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 27.4,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 26.7,
+    "contract_or_invariant_pct": 76.7,
+    "linked_test_pct": 0,
+    "effect_entries_total": 24,
+    "share_of_capsule_tokens_pct": 0.8,
+    "read_from_the_body_itself_pct": 37.5,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 56.3
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 11,
+    "p90_ms": 14
+  },
+  "weakest_tasks": []
+}

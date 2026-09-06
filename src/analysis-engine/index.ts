@@ -99,6 +99,77 @@ export class StructuralGraphEngine {
     const unique = (bucket: string[] | undefined): string | undefined =>
       bucket && bucket.length === 1 ? bucket[0] : undefined
 
+    // Imports name the scope a qualified call reaches into. `json.Unmarshal`
+    // in a Go file that imports `.../internal/json` means the Unmarshal of
+    // that package, not whichever Unmarshal the repository has fewest of;
+    // the same holds for a Python module imported as a name and a Java
+    // class imported by path. An import path is matched to the snapshot's
+    // files and directories by its longest trailing segments, so the
+    // module root (go.mod, the source root, the package prefix) need not be
+    // known. Before this, gin delivered 8.3% of a symbol's indexed
+    // dependencies in a capsule: every cross-package call fell to the
+    // repository-wide bare name and most of those were ambiguous.
+    const fileBySuffix = new Map<string, string | null>()
+    const dirBySuffix = new Map<string, string | null>()
+    const addSuffixes = (map: Map<string, string | null>, pathValue: string): void => {
+      const segments = pathValue.split("/").filter(Boolean)
+      for (let k = 1; k <= segments.length; k++) {
+        const suffix = segments.slice(-k).join("/")
+        map.set(suffix, map.has(suffix) ? null : pathValue)
+      }
+    }
+    const seenFiles = new Set<string>()
+    const seenDirs = new Set<string>()
+    for (const sv of svRows) {
+      const { file, dir } = keyParts(sv.stable_key)
+      if (!seenFiles.has(file)) {
+        seenFiles.add(file)
+        addSuffixes(fileBySuffix, file.replace(/\.[^./]+$/, ""))
+      }
+      if (dir && !seenDirs.has(dir)) {
+        seenDirs.add(dir)
+        addSuffixes(dirBySuffix, dir)
+      }
+    }
+    /** The file or directory an import path denotes in this snapshot, by its longest matching tail. */
+    const importScope = (importPath: string): { file?: string; dir?: string } | undefined => {
+      const segments = importPath.split(/[/.\\]/).filter(Boolean)
+      for (let k = segments.length; k >= 1; k--) {
+        const suffix = segments.slice(-k).join("/")
+        const file = fileBySuffix.get(suffix)
+        if (file) return { file }
+        const dir = dirBySuffix.get(suffix)
+        if (dir) return { dir }
+      }
+      return undefined
+    }
+    // Per source file: the last segment of each import (the name the file
+    // uses for it) → the scope it denotes.
+    const importScopesByFile = new Map<string, Map<string, { file?: string; dir?: string }>>()
+    for (const rel of rawRelations) {
+      if (rel.relation_type !== "imports") continue
+      const { file } = keyParts(rel.source_key)
+      const scope = importScope(rel.target_name)
+      if (!scope) continue
+      const alias = rel.target_name.split(/[/.\\]/).filter(Boolean).pop()
+      if (!alias) continue
+      let scopes = importScopesByFile.get(file)
+      if (!scopes) importScopesByFile.set(file, (scopes = new Map()))
+      if (!scopes.has(alias)) scopes.set(alias, scope)
+    }
+    const throughImport = (sourceFile: string, alias: string, member: string): string | undefined => {
+      const scope = importScopesByFile.get(sourceFile)?.get(alias)
+      if (!scope) return undefined
+      if (scope.file) {
+        const direct = unique(byFileName.get(`${scope.file}\u0000${member}`))
+        if (direct) return direct
+        // A module file's directory package (Go): the member may live in a sibling.
+        const slash = scope.file.lastIndexOf("/")
+        return slash >= 0 ? unique(byDirName.get(`${scope.file.slice(0, slash)}\u0000${member}`)) : undefined
+      }
+      return scope.dir ? unique(byDirName.get(`${scope.dir}\u0000${member}`)) : undefined
+    }
+
     /**
      * Resolve a target from the in-memory maps, from the source symbol's own
      * scopes outward. Undefined means "not uniquely known here".
@@ -113,12 +184,15 @@ export class StructuralGraphEngine {
       const segments = rel.target_name.split(/::|\./).filter(Boolean)
       const last = segments[segments.length - 1]
       if (!last) return undefined
+      const { file, dir } = keyParts(rel.source_key)
       if (segments.length > 1) {
         // `Owner.member` — the owner named in the call, wherever it lives.
         const owned = unique(byOwnerName.get(`${segments[segments.length - 2]}.${last}`))
         if (owned) return owned
+        // `pkg.member` — the package or module this file imports under that name.
+        const imported = throughImport(file, segments[segments.length - 2]!, last)
+        if (imported) return imported
       }
-      const { file, dir } = keyParts(rel.source_key)
       return (
         unique(byFileName.get(`${file}\u0000${last}`)) ||
         unique(byDirName.get(`${dir}\u0000${last}`)) ||

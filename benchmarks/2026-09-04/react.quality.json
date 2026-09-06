@@ -1,0 +1,151 @@
+{
+  "repo": "react",
+  "shared_universe_files": 4578,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 6572634,
+  "corpus_load_ms": 1851,
+  "tasks": 60,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 2,
+      "lines_of_code": 3509,
+      "tokens": 28981
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 286,
+      "tokens": 3252
+    },
+    "tokens_saved_pct": 88.8
+  },
+  "cost": {
+    "avg_capsule_tokens": 3399,
+    "naive_grep_read_tokens": 3131066,
+    "contextzero_tokens": 203945,
+    "reduction_vs_naive": 15.4,
+    "oracle_file_tokens": 1970993,
+    "reduction_vs_oracle": 9.7,
+    "reduction_vs_oracle_median": 6.4
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 166,
+    "avg_per_task": 2.8,
+    "of_which_indexed_as_symbols_pct": 71.7,
+    "internal_imports_seen": 641,
+    "internal_imports_unresolved_pct": 0.2,
+    "contextzero_recall_overall_pct": 59.6,
+    "contextzero_recall_of_indexed_pct": 70.6,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 33,
+    "tied": 27,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 18.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 18.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 61.7,
+      "file_reading": 28.3
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.26,
+    "file_reading": 0.19
+  },
+  "capsule_composition": {
+    "avg_nodes": 7.6,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 42.5,
+    "self_reported_vs_actual_tokens_pct": 99.6,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 43.3,
+    "contract_or_invariant_pct": 88.3,
+    "linked_test_pct": 5,
+    "effect_entries_total": 60,
+    "share_of_capsule_tokens_pct": 1.5,
+    "read_from_the_body_itself_pct": 40,
+    "propagated_around_a_call_cycle_pct": 13.3,
+    "distinct_effect_sets_pct": 42.3
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 26,
+    "p90_ms": 30
+  },
+  "weakest_tasks": [
+    {
+      "name": "createFromReadableStream",
+      "imports_used": 5,
+      "indexed": 4,
+      "delivered": 0,
+      "nodes": 11,
+      "spent": 4922
+    },
+    {
+      "name": "matchSelector",
+      "imports_used": 7,
+      "indexed": 5,
+      "delivered": 1,
+      "nodes": 16,
+      "spent": 4161
+    },
+    {
+      "name": "pushComponentStack",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 1,
+      "nodes": 11,
+      "spent": 4896
+    },
+    {
+      "name": "serializeAsyncIterable",
+      "imports_used": 5,
+      "indexed": 4,
+      "delivered": 1,
+      "nodes": 8,
+      "spent": 3843
+    },
+    {
+      "name": "PruneScopesTransform",
+      "imports_used": 9,
+      "indexed": 3,
+      "delivered": 1,
+      "nodes": 5,
+      "spent": 4378
+    },
+    {
+      "name": "requestFormReset",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 3,
+      "nodes": 7,
+      "spent": 4618
+    },
+    {
+      "name": "getProfilingFlags",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 4,
+      "spent": 1375
+    },
+    {
+      "name": "preinitModule",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 16,
+      "spent": 7596
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "repo": "express",
+  "shared_universe_files": 141,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 142433,
+  "corpus_load_ms": 41,
+  "tasks": 3,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 1,
+      "lines_of_code": 135,
+      "tokens": 926
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 24,
+      "tokens": 462
+    },
+    "tokens_saved_pct": 50.1
+  },
+  "cost": {
+    "avg_capsule_tokens": 479,
+    "naive_grep_read_tokens": 3717,
+    "contextzero_tokens": 1436,
+    "reduction_vs_naive": 2.6,
+    "oracle_file_tokens": 2746,
+    "reduction_vs_oracle": 1.9,
+    "reduction_vs_oracle_median": 2
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 0,
+    "avg_per_task": 0,
+    "of_which_indexed_as_symbols_pct": 0,
+    "internal_imports_seen": 0,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 0,
+    "contextzero_recall_of_indexed_pct": 0,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 0,
+    "tied": 3,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 33.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 33.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 0,
+      "file_reading": 0
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 4.18,
+    "file_reading": 1.39
+  },
+  "capsule_composition": {
+    "avg_nodes": 3,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 6,
+    "self_reported_vs_actual_tokens_pct": 97.1,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 0,
+    "contract_or_invariant_pct": 100,
+    "linked_test_pct": 0,
+    "effect_entries_total": 0,
+    "share_of_capsule_tokens_pct": 0,
+    "read_from_the_body_itself_pct": 0,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 0
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 101,
+    "p90_ms": 213
+  },
+  "weakest_tasks": []
+}

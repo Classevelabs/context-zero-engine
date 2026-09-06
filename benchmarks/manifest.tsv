@@ -1,0 +1,17 @@
+zod	typescript	https://github.com/colinhacks/zod.git
+nest	typescript	https://github.com/nestjs/nest.git
+react	javascript	https://github.com/facebook/react.git
+express	javascript	https://github.com/expressjs/express.git
+django	python	https://github.com/django/django.git
+flask	python	https://github.com/pallets/flask.git
+gin	go	https://github.com/gin-gonic/gin.git
+gh-cli	go	https://github.com/cli/cli.git
+ripgrep	rust	https://github.com/BurntSushi/ripgrep.git
+tokio	rust	https://github.com/tokio-rs/tokio.git
+okhttp	java	https://github.com/square/okhttp.git
+gson	java	https://github.com/google/gson.git
+serilog	csharp	https://github.com/serilog/serilog.git
+sinatra	ruby	https://github.com/sinatra/sinatra.git
+fmt	cpp	https://github.com/fmtlib/fmt.git
+guzzle	php	https://github.com/guzzle/guzzle.git
+alamofire	swift	https://github.com/Alamofire/Alamofire.git

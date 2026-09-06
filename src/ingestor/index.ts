@@ -187,6 +187,16 @@ async function isNugetPackagesDir(dirPath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Append without a spread. `push(...items)` passes every element as an
+ * argument, and a large TypeScript batch (react: hundreds of thousands of
+ * raw relations) exceeds the call-stack argument limit, which lost the
+ * batch and left the snapshot partial.
+ */
+function appendAll<T>(target: T[], items: readonly T[]): void {
+  for (const item of items) target.push(item)
+}
+
 export class Ingestor {
   /** The latest complete snapshot of a repository on a branch, or null. Never throws: no parent means a full ingest. */
   private async latestCompleteSnapshot(repoId: string, branch: string): Promise<string | null> {
@@ -590,7 +600,7 @@ export class Ingestor {
             "typescript",
           )
           symbolsExtracted += counts.symbols
-          pendingRelations.push(...counts.rawRelations)
+          appendAll(pendingRelations, counts.rawRelations)
           behaviorHintsExtracted += counts.behaviorHints
           contractHintsExtracted += counts.contractHints
           const tsFailed = tsResult.failed_files?.length ?? 0
@@ -652,7 +662,7 @@ export class Ingestor {
                 "python",
               )
               symbolsExtracted += counts.symbols
-              pendingRelations.push(...counts.rawRelations)
+              appendAll(pendingRelations, counts.rawRelations)
               behaviorHintsExtracted += counts.behaviorHints
               contractHintsExtracted += counts.contractHints
               filesProcessed++
@@ -719,7 +729,7 @@ export class Ingestor {
             try {
               const counts = await this.persistExtractionResult(result, repoId, snapshotId, canonicalRepoPath, lang)
               symbolsExtracted += counts.symbols
-              pendingRelations.push(...counts.rawRelations)
+              appendAll(pendingRelations, counts.rawRelations)
               behaviorHintsExtracted += counts.behaviorHints
               contractHintsExtracted += counts.contractHints
               filesProcessed++
@@ -2260,7 +2270,7 @@ export class Ingestor {
           const tsResult = await extractFromTypeScript(tsPaths, tsconfigPath || undefined)
           const counts = await this.persistExtractionResult(tsResult, repoId, snapshotId, basePath, "typescript")
           symbolsUpdated += counts.symbols
-          pendingRelations.push(...counts.rawRelations)
+          appendAll(pendingRelations, counts.rawRelations)
           // The adapter isolates per-file failures internally, so a resolved
           // promise can still carry files it could not parse.
           for (const failedFile of tsResult.failed_files ?? []) recordFailedPath(failedFile)
@@ -2281,7 +2291,7 @@ export class Ingestor {
             try {
               const counts = await this.persistExtractionResult(pyResult, repoId, snapshotId, basePath, "python")
               symbolsUpdated += counts.symbols
-              pendingRelations.push(...counts.rawRelations)
+              appendAll(pendingRelations, counts.rawRelations)
             } catch (err) {
               log.error("Incremental Python persistence failed", err, { file: pyPath })
               recordFailedPath(pyPath)
@@ -2317,7 +2327,7 @@ export class Ingestor {
           if (result) {
             const counts = await this.persistExtractionResult(result, repoId, snapshotId, basePath, lang)
             symbolsUpdated += counts.symbols
-            pendingRelations.push(...counts.rawRelations)
+            appendAll(pendingRelations, counts.rawRelations)
           } else {
             // Null result is a failure, not an empty file — same silent-loss
             // hazard as the Python path above.

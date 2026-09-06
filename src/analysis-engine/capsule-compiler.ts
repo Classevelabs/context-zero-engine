@@ -60,6 +60,8 @@ const MAX_FALLBACK_SOURCE_BYTES = 2 * 1024 * 1024
 // range. Off restores the pre-member-traversal behaviour — the target's own
 // edges only — as a rollback switch.
 const CAPSULE_MEMBER_DEPS = process.env["SCG_CAPSULE_MEMBER_DEPS"] !== "0"
+/** A class or interface whose body would take more than a third of the budget ships as a skeleton; SCG_CAPSULE_CLASS_SKELETON=0 ships the full body. */
+const CAPSULE_CLASS_SKELETON = process.env["SCG_CAPSULE_CLASS_SKELETON"] !== "0"
 
 // Only container kinds aggregate their members' dependencies. A callable
 // (function, method, route handler) owns its dependencies on its own node, and
@@ -224,6 +226,7 @@ export class CapsuleCompiler {
     // 6,470 tokens, most of it spent on text the caller could fetch by handle.
     let skeletonMembers: FetchHandle[] = []
     if (
+      CAPSULE_CLASS_SKELETON &&
       (target.kind === "class" || target.kind === "interface") &&
       this.estimateTokens(targetCode) > effectiveBudget * SKELETON_SHARE
     ) {
