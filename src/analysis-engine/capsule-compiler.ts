@@ -122,6 +122,38 @@ export interface CompileOptions {
   explain?: boolean
 }
 
+/** Share of the budget a class body may take before the class ships as a skeleton. */
+const SKELETON_SHARE = 1 / 3
+
+interface SkeletonMember {
+  symbol_version_id: string
+  symbol_id: string
+  canonical_name: string
+  kind: string
+  signature: string
+  range_start_line: number
+  range_end_line: number
+  byte_length: number | null
+}
+
+/**
+ * The header of a class up to its first member, then one line per member
+ * carrying its signature, then the closing brace if the body had one.
+ */
+export function classSkeleton(code: string, codeStartLine: number, members: SkeletonMember[]): string {
+  const lines = code.split("\n")
+  const firstMember = members[0]!.range_start_line - codeStartLine
+  const header = lines.slice(0, Math.max(1, Math.min(firstMember, 8)))
+  const out = [...header]
+  for (const m of members) {
+    const sig = (m.signature || m.canonical_name).split("\n")[0]!.trim()
+    out.push(`  ${sig}  // ${m.kind}, lines ${m.range_start_line}-${m.range_end_line}, body by fetch handle`)
+  }
+  const last = lines[lines.length - 1]?.trim() ?? ""
+  if (last === "}" || last === "};" || last === "end") out.push(last)
+  return out.join("\n")
+}
+
 export class CapsuleCompiler {
   /**
    * Compile a context capsule for a target symbol.
@@ -183,6 +215,34 @@ export class CapsuleCompiler {
     }
     const targetSignature = truncateToTokens(target.signature, effectiveBudget)
 
+    // A class or interface whose body would take more than a third of the
+    // budget ships as a skeleton: its header, then one signature line per
+    // member, each member's full body reachable by a fetch handle. A large
+    // class's text is mostly member bodies, which are symbols of their own;
+    // inline they crowded out the dependencies the class actually uses.
+    // Measured on class targets before this: 57.7% dependency recall at
+    // 6,470 tokens, most of it spent on text the caller could fetch by handle.
+    let skeletonMembers: FetchHandle[] = []
+    if (
+      (target.kind === "class" || target.kind === "interface") &&
+      this.estimateTokens(targetCode) > effectiveBudget * SKELETON_SHARE
+    ) {
+      const members = await this.loadMembers(snapshotId, target)
+      if (members.length > 0) {
+        targetCode = classSkeleton(targetCode, target.range_start_line, members)
+        skeletonMembers = members.map((m) => ({
+          symbol_id: m.symbol_id,
+          symbol_version_id: m.symbol_version_id,
+          name: m.canonical_name,
+          file_path: target.file_path,
+          start_line: m.range_start_line,
+          end_line: m.range_end_line,
+          why_omitted: "Member body of a target shipped as a skeleton",
+          estimated_tokens: Math.ceil((m.byte_length ?? 0) / CHARS_PER_TOKEN),
+        }))
+      }
+    }
+
     // Serialized-cost accounting. The old accounting summed the raw text of
     // the pieces it chose and ignored everything else that shipped — JSON
     // structure, the effect array, the bookkeeping — so capsules reported
@@ -211,6 +271,14 @@ export class CapsuleCompiler {
     const chargeOmission = (message: string) => {
       omissionRationale.push(message)
       usedTokens += this.serializedTokens(message) + 1
+    }
+
+    if (skeletonMembers.length > 0) {
+      for (const handle of skeletonMembers) {
+        fetchHandles.push(handle)
+        usedTokens += this.serializedTokens(handle) + 1
+      }
+      chargeOmission(`Target ${target.kind} shipped as a skeleton: ${skeletonMembers.length} member bodies available by fetch handle`)
     }
 
     // BUG-006 FIX: If the target alone exceeds the token budget, truncate its
@@ -1035,6 +1103,30 @@ export class CapsuleCompiler {
         relevance: 0.9,
       },
     ]
+  }
+
+  /** The members declared inside a class or interface target, in source order. */
+  private async loadMembers(
+    snapshotId: string,
+    target: { symbol_id: string; canonical_name: string; file_path: string; range_start_line: number; range_end_line: number },
+  ): Promise<SkeletonMember[]> {
+    const result = await db.query(
+      `
+            SELECT sv.symbol_version_id, s.symbol_id, s.canonical_name, s.kind, sv.signature,
+                   sv.range_start_line, sv.range_end_line, sb.byte_length
+            FROM symbol_versions sv
+            JOIN symbols s ON s.symbol_id = sv.symbol_id
+            JOIN files f ON f.file_id = sv.file_id
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
+            WHERE sv.snapshot_id = $1 AND f.path = $2 AND s.parent_name = $3
+              AND sv.range_start_line >= $4 AND sv.range_end_line <= $5
+              AND s.symbol_id <> $6
+            ORDER BY sv.range_start_line
+            LIMIT 400
+        `,
+      [snapshotId, target.file_path, target.canonical_name, target.range_start_line, target.range_end_line, target.symbol_id],
+    )
+    return result.rows as SkeletonMember[]
   }
 
   public async loadHomologContext(snapshotId: string, svId: string): Promise<{ node: ContextNode; raw: SymbolRow }[]> {

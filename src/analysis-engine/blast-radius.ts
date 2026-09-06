@@ -36,6 +36,12 @@ export class BlastRadiusEngine {
       throw new Error(`Blast radius accepts at most ${BlastRadiusEngine.MAX_TARGETS} target identifiers`)
     }
     targetSymbolVersionIds = [...new Set(targetSymbolVersionIds)]
+    // A change to a class is a change to its members: their callers are the
+    // class's blast radius, and the class node alone has almost no callers of
+    // its own. Members are their own symbols, so the target set widens to
+    // them before any dimension runs.
+    const memberTargets = await this.membersOf(snapshotId, targetSymbolVersionIds)
+    if (memberTargets.length > 0) targetSymbolVersionIds = [...new Set([...targetSymbolVersionIds, ...memberTargets])]
     depth = Number.isFinite(depth)
       ? Math.min(Math.max(1, Math.trunc(depth)), BlastRadiusEngine.MAX_INTERNAL_DEPTH)
       : 2
@@ -67,6 +73,7 @@ export class BlastRadiusEngine {
 
     const report: BlastRadiusReport = {
       target_symbols: targetSymbolVersionIds,
+      member_targets: memberTargets.length,
       structural_impacts: structural,
       behavioral_impacts: behavioral,
       contract_impacts: contract,
@@ -78,6 +85,27 @@ export class BlastRadiusEngine {
 
     timer({ total_impacts: totalCount, validation_scope: validationScope })
     return report
+  }
+
+  /** Symbol versions declared inside the given class or interface targets, in the same snapshot and file. */
+  private async membersOf(snapshotId: string, targetIds: string[]): Promise<string[]> {
+    if (targetIds.length === 0) return []
+    const result = await db.query(
+      `
+            SELECT m.symbol_version_id
+            FROM symbol_versions t
+            JOIN symbols ts ON ts.symbol_id = t.symbol_id AND ts.kind IN ('class', 'interface')
+            JOIN symbol_versions m
+              ON m.snapshot_id = t.snapshot_id AND m.file_id = t.file_id
+             AND m.range_start_line >= t.range_start_line AND m.range_end_line <= t.range_end_line
+             AND m.symbol_version_id <> t.symbol_version_id
+            JOIN symbols ms ON ms.symbol_id = m.symbol_id AND ms.parent_name = ts.canonical_name
+            WHERE t.snapshot_id = $1 AND t.symbol_version_id = ANY($2::uuid[])
+            LIMIT 500
+        `,
+      [snapshotId, targetIds],
+    )
+    return (result.rows as { symbol_version_id: string }[]).map((r) => r.symbol_version_id)
   }
 
   /**

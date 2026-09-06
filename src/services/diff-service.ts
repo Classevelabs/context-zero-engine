@@ -47,6 +47,7 @@ export interface SemanticChange {
     | "purity"
     | "validation"
     | "resource_access"
+    | "members"
   changed: boolean
   before: string
   after: string
@@ -99,16 +100,24 @@ export interface ContractDiffResult {
 // ────────── Internal helpers ──────────
 
 /** Load symbol version metadata (name, signature, body_hash). */
-async function loadSymbolVersion(symbolVersionId: string): Promise<{
+interface LoadedVersion {
   symbol_version_id: string
   canonical_name: string
   signature: string
   body_hash: string
   symbol_id: string
-}> {
+  kind: string
+  snapshot_id: string
+  file_id: string
+  range_start_line: number
+  range_end_line: number
+}
+
+async function loadSymbolVersion(symbolVersionId: string): Promise<LoadedVersion> {
   const result = await db.query(
-    `SELECT sv.symbol_version_id, sv.signature, sv.body_hash,
-                s.canonical_name, s.symbol_id
+    `SELECT sv.symbol_version_id, sv.signature, sv.body_hash, sv.snapshot_id, sv.file_id,
+                sv.range_start_line, sv.range_end_line,
+                s.canonical_name, s.symbol_id, s.kind
          FROM symbol_versions sv
          JOIN symbols s ON s.symbol_id = sv.symbol_id
          WHERE sv.symbol_version_id = $1`,
@@ -124,6 +133,55 @@ async function loadSymbolVersion(symbolVersionId: string): Promise<{
     signature: (row["signature"] as string) ?? "",
     body_hash: (row["body_hash"] as string) ?? "",
     symbol_id: (row["symbol_id"] as string) ?? "",
+    kind: (row["kind"] as string) ?? "",
+    snapshot_id: (row["snapshot_id"] as string) ?? "",
+    file_id: (row["file_id"] as string) ?? "",
+    range_start_line: Number(row["range_start_line"] ?? 0),
+    range_end_line: Number(row["range_end_line"] ?? 0),
+  }
+}
+
+/** The members declared inside a class or interface version: name -> body hash. */
+async function loadMemberHashes(v: LoadedVersion): Promise<Map<string, string>> {
+  const result = await db.query(
+    `SELECT s.canonical_name, sv.body_hash
+       FROM symbol_versions sv
+       JOIN symbols s ON s.symbol_id = sv.symbol_id
+      WHERE sv.snapshot_id = $1 AND sv.file_id = $2 AND s.parent_name = $3
+        AND sv.range_start_line >= $4 AND sv.range_end_line <= $5 AND s.symbol_id <> $6
+      LIMIT 1000`,
+    [v.snapshot_id, v.file_id, v.canonical_name, v.range_start_line, v.range_end_line, v.symbol_id],
+  )
+  const out = new Map<string, string>()
+  for (const row of result.rows as { canonical_name: string; body_hash: string }[]) out.set(row.canonical_name, row.body_hash)
+  return out
+}
+
+/**
+ * A class's change is its members' changes. The dimensions above compare the
+ * class node's own profile, which for a class is close to empty; a removed
+ * method is a breaking change to every caller, a changed body a major one,
+ * an added method a minor one.
+ */
+async function memberChange(before: LoadedVersion, after: LoadedVersion): Promise<SemanticChange | null> {
+  const isContainer = (k: string) => k === "class" || k === "interface"
+  if (!isContainer(before.kind) || !isContainer(after.kind)) return null
+  const [b, a] = await Promise.all([loadMemberHashes(before), loadMemberHashes(after)])
+  const removed = [...b.keys()].filter((n) => !a.has(n)).sort()
+  const added = [...a.keys()].filter((n) => !b.has(n)).sort()
+  const changed = [...b.keys()].filter((n) => a.has(n) && a.get(n) !== b.get(n)).sort()
+  const total = removed.length + added.length + changed.length
+  const parts: string[] = []
+  if (removed.length) parts.push(`removed ${formatArray(removed)}`)
+  if (changed.length) parts.push(`changed ${formatArray(changed)}`)
+  if (added.length) parts.push(`added ${formatArray(added)}`)
+  return {
+    dimension: "members",
+    changed: total > 0,
+    before: `${b.size} member(s)`,
+    after: `${a.size} member(s)`,
+    severity: removed.length > 0 ? "breaking" : changed.length > 0 ? "major" : added.length > 0 ? "minor" : "none",
+    detail: total === 0 ? "Members unchanged" : parts.join("; "),
   }
 }
 
@@ -382,6 +440,10 @@ export async function computeSemanticDiff(options: SemanticDiffOptions): Promise
   })
 
   // 6. Overall severity and breaking-change flag
+  // -- Members (class and interface targets) --
+  const members = await memberChange(beforeSv, afterSv)
+  if (members) changes.push(members)
+
   const overallSeverity = maxSeverity(changes)
   const hasBreaking = changes.some((c) => c.severity === "breaking")
 

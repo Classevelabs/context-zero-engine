@@ -266,6 +266,8 @@ export interface BlastRadiusImpact {
 
 export interface BlastRadiusReport {
   target_symbols: string[]
+  /** Members of class or interface targets that were added to the target set. */
+  member_targets?: number
   structural_impacts: BlastRadiusImpact[]
   behavioral_impacts: BlastRadiusImpact[]
   contract_impacts: BlastRadiusImpact[]

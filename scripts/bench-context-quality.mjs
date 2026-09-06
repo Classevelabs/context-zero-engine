@@ -266,8 +266,116 @@ const isInternal = (spec) => {
 // from the ground truth. Counted, so the size of that blind spot is stated
 // rather than hidden.
 const resolution = { internal: 0, dropped: 0 }
+// Python and Go ground truth, so recall is measured on the languages the
+// engine indexes rather than stated for TypeScript and assumed elsewhere.
+//
+// Python: `import a.b [as c]` binds a namespace on the module file;
+// `from a.b import x [as y]` binds x on a/b.py (or a/b/__init__.py), or, when
+// a/b/x.py exists, a namespace on that module. Relative dots climb from the
+// importing file's directory.
+//
+// Go: every import binds a namespace (the explicit alias or the last path
+// segment) on a package DIRECTORY inside the module named by go.mod; a
+// member used through it is looked up across that directory's files.
+const goModule = (() => {
+  try {
+    const m = fs.readFileSync(path.join(REPO, "go.mod"), "utf-8").match(/^module\s+(\S+)/m)
+    return m ? m[1] : null
+  } catch {
+    return null
+  }
+})()
+const dirFiles = new Map() // normalized dir -> [files in corpus]
+for (const p of corpus.keys()) {
+  const dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : ""
+  const list = dirFiles.get(dir) || []
+  list.push(p)
+  dirFiles.set(dir, list)
+}
+const pyModuleFile = (mod, fromRel, level) => {
+  const parts = mod ? mod.split(".") : []
+  let base
+  if (level > 0) {
+    let dir = path.posix.dirname(fromRel)
+    for (let i = 1; i < level; i++) dir = path.posix.dirname(dir)
+    base = dir === "." ? "" : dir
+  } else base = ""
+  const rel = [base, ...parts].filter(Boolean).join("/")
+  if (corpus.has(rel + ".py")) return rel + ".py"
+  if (corpus.has(rel + "/__init__.py")) return rel + "/__init__.py"
+  // A top-level package name may live under src/.
+  if (level === 0 && corpus.has("src/" + rel + ".py")) return "src/" + rel + ".py"
+  if (level === 0 && corpus.has("src/" + rel + "/__init__.py")) return "src/" + rel + "/__init__.py"
+  return null
+}
+const PY_IMPORT_RE = /^[ \t]*(?:from[ \t]+(\.*)([\w.]*)[ \t]+import[ \t]+([^\n#]+)|import[ \t]+([^\n#]+))/gm
+const pyBindings = (text, fromRel) => {
+  const out = new Map()
+  PY_IMPORT_RE.lastIndex = 0
+  let m
+  while ((m = PY_IMPORT_RE.exec(text)) !== null) {
+    if (m[4] !== undefined) {
+      for (const item of m[4].split(",")) {
+        const [mod, alias] = item.trim().split(/\s+as\s+/)
+        if (!mod) continue
+        const file = pyModuleFile(mod, fromRel, 0)
+        resolution.internal += file ? 1 : 0
+        if (!file) continue
+        out.set(alias || mod.split(".")[0], { imported: "*", file, namespace: true })
+      }
+      continue
+    }
+    const level = m[1].length
+    const mod = m[2]
+    const isInternalPy = level > 0 || pyModuleFile(mod, fromRel, 0) !== null || pyModuleFile(mod.split(".")[0], fromRel, 0) !== null
+    if (isInternalPy) resolution.internal++
+    const modFile = pyModuleFile(mod, fromRel, level)
+    for (const item of m[3].replace(/[()]/g, "").split(",")) {
+      const [name, alias] = item.trim().split(/\s+as\s+/)
+      if (!name || !/^[A-Za-z_]\w*$/.test(name)) continue
+      const local = alias || name
+      const sub = pyModuleFile(mod ? mod + "." + name : name, fromRel, level)
+      if (sub) out.set(local, { imported: "*", file: sub, namespace: true })
+      else if (modFile) out.set(local, { imported: name, file: modFile })
+      else if (isInternalPy) resolution.dropped++
+    }
+  }
+  return out
+}
+const GO_IMPORT_RE = /^[ \t]*import[ \t]+(?:\(([\s\S]*?)\)|(\w+[ \t]+)?"([^"]+)")/gm
+const goBindings = (text) => {
+  const out = new Map()
+  if (!goModule) return out
+  GO_IMPORT_RE.lastIndex = 0
+  let m
+  const specs = []
+  while ((m = GO_IMPORT_RE.exec(text)) !== null) {
+    if (m[1] !== undefined) {
+      for (const line of m[1].split("\n")) {
+        const one = line.trim().match(/^(?:(\w+)\s+)?"([^"]+)"/)
+        if (one) specs.push([one[1], one[2]])
+      }
+    } else specs.push([m[2]?.trim(), m[3]])
+  }
+  for (const [alias, spec] of specs) {
+    if (spec !== goModule && !spec.startsWith(goModule + "/")) continue
+    resolution.internal++
+    const dir = spec === goModule ? "" : spec.slice(goModule.length + 1)
+    const files = dirFiles.get(dir)
+    if (!files || files.length === 0) {
+      resolution.dropped++
+      continue
+    }
+    const local = alias && alias !== "_" && alias !== "." ? alias : spec.split("/").pop()
+    out.set(local, { imported: "*", file: files[0], dir, namespace: true })
+  }
+  return out
+}
+
 /** Local bindings a file imports, mapped to { imported, file }. */
 const importBindings = (text, fromRel) => {
+  if (fromRel.endsWith(".py")) return pyBindings(text, fromRel)
+  if (fromRel.endsWith(".go")) return goBindings(text)
   const out = new Map()
   IMPORT_RE.lastIndex = 0
   let m
@@ -332,6 +440,10 @@ const targets = await db.query(
 
 // ------------------------------------------------------------------ run ---
 const rows = []
+/** Targets that produced no usable capsule; scored as delivering nothing. */
+const failures = []
+/** Files the naive baseline reads, best-first. */
+const NAIVE_FILE_CAP = Number(process.env.CZ_BENCH_NAIVE_FILES || 25)
 for (const t of targets.rows) {
   const defRel = norm(t.file_path)
   const defFile = corpus.get(defRel)
@@ -354,7 +466,12 @@ for (const t of targets.rows) {
   const deps = new Map() // required name -> { file, indexed }
   for (const [local, info] of importBindings(defFile.text, defRel)) {
     if (!bodyIdents.has(local)) continue
-    const known = symbolsInFile.get(info.file) || new Set()
+    // A Go package is a directory: what it declares is the union of its files.
+    let known = symbolsInFile.get(info.file) || new Set()
+    if (info.dir !== undefined) {
+      known = new Set()
+      for (const f of dirFiles.get(info.dir) || []) for (const n of symbolsInFile.get(f) || []) known.add(n)
+    }
 
     const memberRe = new RegExp("\\b" + local + "\\s*\\.\\s*([A-Za-z_$][\\w$]*)", "g")
     let m
@@ -382,12 +499,20 @@ for (const t of targets.rows) {
   const tc = Date.now()
   try {
     capsule = await capsuleCompiler.compile(t.symbol_version_id, snapshotId, "strict", BUDGET)
-  } catch {
+  } catch (err) {
+    // A target the engine cannot answer for is a failed task: its
+    // dependencies count against recall and the failure is reported. It
+    // used to vanish from the denominator, which made the score describe the
+    // tasks that happened to work.
+    failures.push({ target: t.name, file: defRel, deps: deps.size, reason: err instanceof Error ? err.message : String(err) })
     continue
   }
   const compileMs = Date.now() - tc
   const spent = tok(Buffer.byteLength(JSON.stringify(capsule), "utf-8"))
-  if (spent < 50) continue
+  if (spent < 50) {
+    failures.push({ target: t.name, file: defRel, deps: deps.size, reason: `capsule of ${spent} tokens` })
+    continue
+  }
 
   const nodes = capsule.context_nodes || []
   const delivered = new Map() // name -> the symbol's complete source came with it
@@ -496,13 +621,17 @@ for (const t of targets.rows) {
     oracleLines += corpus.get(f)?.lines ?? 0
   }
 
-  // Naive cost: what the grep-and-read agent actually pays, capped at 25 files.
-  // Quoted in files and lines as well as tokens — those are the units someone
-  // can picture without converting anything.
-  const naiveSlice = ranked.slice(0, 25)
+  // Naive cost: what the grep-and-read agent pays for the NAIVE_FILE_CAP
+  // files that mention the symbol most, best-first. The cap is a parameter
+  // of the comparison, stated in the output; the uncapped total (every file
+  // that mentions the symbol) ships beside it so the reduction can be read
+  // against either. Quoted in files and lines as well as tokens — those are
+  // the units someone can picture without converting anything.
+  const naiveSlice = ranked.slice(0, NAIVE_FILE_CAP)
   const naiveTokens = naiveSlice.reduce((a, f) => a + f.tokens, 0)
   const naiveFiles = naiveSlice.length
   const naiveLines = naiveSlice.reduce((a, f) => a + f.lines, 0)
+  const naiveAllTokens = ranked.reduce((a, f) => a + f.tokens, 0)
 
   // What the capsule actually contains, in lines of real code.
   const countLines = (text) => (typeof text === "string" && text.length > 0 ? text.split(/\r?\n/).length : 0)
@@ -531,6 +660,7 @@ for (const t of targets.rows) {
     name: t.name,
     spent,
     naiveTokens,
+    naiveAllTokens,
     naiveFiles,
     naiveLines,
     oracleTokens,
@@ -614,6 +744,10 @@ console.log(
       universe_tokens: [...corpus.values()].reduce((a, f) => a + f.tokens, 0),
       corpus_load_ms: corpusMs,
       tasks: rows.length,
+      tasks_attempted: rows.length + failures.length,
+      failed_tasks: failures.length,
+      failed_task_samples: failures.slice(0, 10),
+      naive_baseline_file_cap: NAIVE_FILE_CAP,
       capsule_token_budget: BUDGET,
       min_symbol_name_length: MIN_NAME,
 
@@ -643,6 +777,8 @@ console.log(
         naive_grep_read_tokens: sum((r) => r.naiveTokens),
         contextzero_tokens: sum((r) => r.spent),
         reduction_vs_naive: +(sum((r) => r.naiveTokens) / sum((r) => r.spent)).toFixed(1),
+        naive_all_referencing_tokens: sum((r) => r.naiveAllTokens),
+        reduction_vs_all_referencing: +(sum((r) => r.naiveAllTokens) / sum((r) => r.spent)).toFixed(1),
         oracle_file_tokens: sum((r) => r.oracleTokens),
         reduction_vs_oracle: +(sum((r) => r.oracleTokens) / sum((r) => r.spent)).toFixed(1),
         reduction_vs_oracle_median: +median((r) => r.oracleTokens / Math.max(1, r.spent)).toFixed(1),
@@ -655,6 +791,10 @@ console.log(
         internal_imports_seen: resolution.internal,
         internal_imports_unresolved_pct: +((resolution.dropped / Math.max(1, resolution.internal)) * 100).toFixed(1),
         contextzero_recall_overall_pct: ratio((r) => r.czDeps, (r) => r.depsTotal),
+        // Recall with failed tasks' dependencies in the denominator.
+        contextzero_recall_incl_failures_pct: +(
+          (sum((r) => r.czDeps) / Math.max(1, sum((r) => r.depsTotal) + failures.reduce((a, f) => a + f.deps, 0))) * 100
+        ).toFixed(1),
         contextzero_recall_of_indexed_pct: ratio((r) => r.czIndexedDeps, (r) => r.depsIndexed),
         file_reading_recall_overall_pct: ratio((r) => r.baseDeps, (r) => r.depsTotal),
         ...(DIAGNOSE
