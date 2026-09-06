@@ -67,6 +67,7 @@ jest.mock("../db-driver/result", () => {
 
 // ── Imports (after mocks) ───────────────────────────────────────────
 import { BlastRadiusEngine } from "../analysis-engine/blast-radius"
+import { liftedEffect } from "../analysis-engine/effect-engine"
 import { capPerSymbol, MAX_INVARIANTS_PER_SYMBOL } from "../analysis-engine/deep-contracts"
 import type { SymbolHistory } from "../analysis-engine/blame-co-change"
 import { DeepContractSynthesizer } from "../analysis-engine/deep-contracts"
@@ -600,6 +601,32 @@ describe("EffectEngine", () => {
       ]
       const result = dedup(effects)
       expect(result).toHaveLength(2)
+    })
+
+    test("a lifted effect names its origin and hops, keeps source and confidence, and carries no detail text", () => {
+      const direct: EffectEntry = {
+        kind: "calls_external",
+        descriptor: "network.http",
+        detail: "HTTP client call",
+        provenance: "direct",
+        source: "heuristic_pattern",
+        confidence: 0.5,
+      }
+      const once = liftedEffect(direct, "callee-1", 1)
+      expect(once).toEqual({
+        kind: "calls_external",
+        descriptor: "network.http",
+        provenance: "transitive",
+        origin_symbol_version_id: "callee-1",
+        hops: 1,
+        source: "heuristic_pattern",
+        confidence: 0.5,
+      })
+      expect("detail" in once).toBe(false)
+      // Lifting again keeps the first origin, not the intermediate callee.
+      const twice = liftedEffect(once, "callee-2", 2)
+      expect(twice.origin_symbol_version_id).toBe("callee-1")
+      expect(twice.hops).toBe(2)
     })
 
     test("deduplicateEffects prefers direct over transitive", () => {

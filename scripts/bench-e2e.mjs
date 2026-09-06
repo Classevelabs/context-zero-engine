@@ -172,7 +172,7 @@ async function storageAnatomy() {
       FROM semantic_vectors`)
 
   const versionCols = await one(`
-    SELECT COALESCE(sum(pg_column_size(body_source)),0) AS body_source,
+    SELECT (SELECT COALESCE(sum(pg_column_size(body_source)),0) FROM symbol_bodies) AS body_source,
            COALESCE(sum(pg_column_size(signature)),0)   AS signature,
            COALESCE(sum(pg_column_size(ast_hash) + pg_column_size(body_hash)
                       + COALESCE(pg_column_size(normalized_ast_hash),0)),0) AS hashes,
@@ -196,10 +196,11 @@ async function buildQueryCases(snapshotId, repoId) {
   const symbols = await rows(`
     SELECT sv.symbol_version_id, s.symbol_id, s.canonical_name, f.path
       FROM symbol_versions sv
+      LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
       JOIN symbols s ON s.symbol_id = sv.symbol_id
       JOIN files f ON f.file_id = sv.file_id
-     WHERE sv.snapshot_id = $1 AND sv.body_source IS NOT NULL
-     ORDER BY length(sv.body_source) DESC
+     WHERE sv.snapshot_id = $1 AND sb.body_source IS NOT NULL
+     ORDER BY length(sb.body_source) DESC
      LIMIT 60`, [snapshotId])
 
   if (symbols.length === 0) return []
@@ -372,7 +373,7 @@ for (const t of st.tables) {
 }
 
 console.log(`\n  semantic_vectors columns: sparse ${kb(st.vectorCols.sparse)}, minhash ${kb(st.vectorCols.minhash)} (${st.vectorCols.with_sig} rows), bands ${kb(st.vectorCols.bands)}`)
-console.log(`  symbol_versions columns:  body_source ${kb(st.versionCols.body_source)}, hashes ${kb(st.versionCols.hashes)}, signature ${kb(st.versionCols.signature)}, summary ${kb(st.versionCols.summary)}`)
+console.log(`  bodies (symbol_bodies) ${kb(st.versionCols.body_source)}; symbol_versions columns: hashes ${kb(st.versionCols.hashes)}, signature ${kb(st.versionCols.signature)}, summary ${kb(st.versionCols.summary)}`)
 
 console.log(`\n  largest indexes`)
 for (const i of st.idxTop) {

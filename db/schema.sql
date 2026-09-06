@@ -1,7 +1,7 @@
 -- ContextZero Database Schema
 -- Generated from db/migrations/*.sql. Do not hand-edit.
--- Generated at 2026-09-06T01:49:20.660Z
--- Dropped tables excluded: semantic_profiles, lsh_bands
+-- Generated at 2026-09-06T02:26:13.896Z
+-- Dropped tables excluded: semantic_profiles, lsh_bands, capsule_compilations
 
 -- >>> 001_initial_schema.sql
 
@@ -636,27 +636,10 @@ ALTER TABLE symbol_versions ADD COLUMN IF NOT EXISTS normalized_ast_hash VARCHAR
 -- 8. CAPSULE METADATA — inclusion rationale tracking
 -- ============================================================================
 
-CREATE TABLE capsule_compilations (
-    capsule_id UUID PRIMARY KEY,
-    symbol_version_id UUID NOT NULL REFERENCES symbol_versions(symbol_version_id) ON DELETE CASCADE,
-    snapshot_id UUID NOT NULL REFERENCES snapshots(snapshot_id) ON DELETE CASCADE,
-    -- Configuration
-    mode VARCHAR(20) NOT NULL,
-    token_budget INT NOT NULL,
-    -- Results
-    token_estimate INT NOT NULL,
-    nodes_included INT NOT NULL,
-    nodes_omitted INT NOT NULL,
-    -- Rationale (for debugging and improvement)
-    inclusion_rationale JSONB NOT NULL DEFAULT '[]',
-    exclusion_rationale JSONB NOT NULL DEFAULT '[]',
-    -- Fetch handles for omitted nodes
-    omitted_handles JSONB NOT NULL DEFAULT '[]',
-    compiled_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-);
+-- [omitted] CREATE TABLE capsule_compilations — dropped by later migration
 
-CREATE INDEX idx_capsule_sv ON capsule_compilations(symbol_version_id);
-CREATE INDEX idx_capsule_snapshot ON capsule_compilations(snapshot_id);
+-- [omitted] index on capsule_compilations — table dropped
+-- [omitted] index on capsule_compilations — table dropped
 
 -- ============================================================================
 -- 9. REPOSITORIES ENHANCEMENT
@@ -1072,8 +1055,7 @@ CREATE INDEX IF NOT EXISTS idx_inferred_relations_evidence_bundle
     ON inferred_relations (evidence_bundle_id);
 
 -- capsule_compilations lookup by symbol + snapshot (common cache check)
-CREATE INDEX IF NOT EXISTS idx_capsule_compilations_sv_snapshot
-    ON capsule_compilations (symbol_version_id, snapshot_id);
+-- [omitted] index on capsule_compilations — table dropped
 
 -- ─── Evidence Bundle Deduplication ─────────────────────────────────────────
 -- Prevent identical evidence bundles from accumulating.
@@ -1769,3 +1751,90 @@ DELETE FROM temporal_co_changes;
 
 COMMENT ON TABLE temporal_file_co_changes IS
     'Files that change in the same commits, from git log. Symbol-level pairs live in temporal_co_changes and come from git blame.';
+
+-- >>> 030_symbol_bodies.sql
+
+-- Migration 030: store each distinct body once, addressed by its content.
+--
+-- A snapshot was a full copy of every symbol's source text. On the local
+-- twenty-snapshot database that was 584,411 symbol versions carrying
+-- 58,259 distinct bodies: the same text stored ten times over, because a
+-- version row is per snapshot and the body column lived on it. The body
+-- text also duplicated itself within one snapshot, since a class's text
+-- contains its members' text.
+--
+-- Bodies now live in symbol_bodies, keyed by the SHA-256 of the text, and a
+-- version row carries body_ref, the key. Two versions with the same text
+-- share one row; a version with no body (a module symbol, a symbol whose
+-- file could not be read) carries NULL. The key is the hash of the stored
+-- text itself, computed the same way here and in the application
+-- (sha256 over UTF-8 bytes, lowercase hex), so a row written by either
+-- side lands on the same key.
+--
+-- Rows in symbol_bodies that no version references are reclaimed by the
+-- retention pass, not by a foreign-key cascade, because a body outlives any
+-- one snapshot by design.
+
+CREATE TABLE IF NOT EXISTS symbol_bodies (
+    body_hash VARCHAR(64) PRIMARY KEY,
+    body_source TEXT NOT NULL,
+    byte_length INT NOT NULL,
+    first_seen TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE symbol_versions ADD COLUMN IF NOT EXISTS body_ref VARCHAR(64) REFERENCES symbol_bodies(body_hash);
+
+INSERT INTO symbol_bodies (body_hash, body_source, byte_length)
+SELECT DISTINCT ON (h) h, body_source, octet_length(body_source)
+FROM (
+    SELECT encode(sha256(convert_to(body_source, 'UTF8')), 'hex') AS h, body_source
+    FROM symbol_versions
+    WHERE body_source IS NOT NULL
+) distinct_bodies
+ON CONFLICT (body_hash) DO NOTHING;
+
+UPDATE symbol_versions
+   SET body_ref = encode(sha256(convert_to(body_source, 'UTF8')), 'hex')
+ WHERE body_source IS NOT NULL;
+
+ALTER TABLE symbol_versions DROP COLUMN body_source;
+
+CREATE INDEX IF NOT EXISTS idx_symbol_versions_body_ref ON symbol_versions (body_ref);
+
+COMMENT ON TABLE symbol_bodies IS
+    'Distinct symbol source texts, keyed by SHA-256 of the text. Referenced from symbol_versions.body_ref; orphans are reclaimed by retention.';
+
+-- >>> 031_drop_capsule_compilations.sql
+
+-- Migration 031: drop the capsule compilation log.
+--
+-- capsule_compilations recorded one row per compiled capsule: budget, token
+-- estimate, node counts and a JSON rationale for every included and omitted
+-- node. Nothing read it back: no tool, no service, no script. It was written
+-- on every capsule request and deleted only when a snapshot was re-ingested,
+-- so on a busy server it was the one table that grew with reads rather than
+-- with code. The compiler's decisions are already visible in the capsule it
+-- returns (omission_rationale, fetch_handles, token_estimate).
+
+DROP TABLE IF EXISTS capsule_compilations;
+
+-- >>> 032_cleanup_log_derived_rows.sql
+
+-- Migration 032: let the cleanup log record the derived-row phase.
+--
+-- cleanup_log enumerates the operations it accepts. The retention pass gained
+-- a phase that reclaims bodies, invariants and lineage rows no living
+-- snapshot supports (see retention-service.ts, cleanupStaleDerivedRows); its
+-- audit row was rejected by the check while its deletes had already run,
+-- which is the one order of failure an audit log must not have.
+
+ALTER TABLE cleanup_log DROP CONSTRAINT IF EXISTS chk_cleanup_operation;
+ALTER TABLE cleanup_log ADD CONSTRAINT chk_cleanup_operation CHECK (
+    operation IN (
+        'snapshot_expiry',
+        'stale_transaction_cleanup',
+        'orphan_data_cleanup',
+        'snapshot_cap_enforcement',
+        'derived_rows_cleanup'
+    )
+);

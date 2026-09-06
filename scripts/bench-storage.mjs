@@ -41,6 +41,10 @@ const REPO_NAME = process.argv[3] ?? "czbench-storage"
 const toFileUrl = (p) => new URL(`file://${path.resolve(repoRoot, p).replace(/\\/g, "/")}`).href
 const { ingestor } = await import(toFileUrl("dist/ingestor/index.js"))
 const { db } = await import(toFileUrl("dist/db-driver/index.js"))
+// The bench owns its scratch database; an ingest against a schema behind the
+// code fails on the first new column, so bring it current first.
+const { runPendingMigrations } = await import(toFileUrl("dist/db-driver/migrate.js"))
+await runPendingMigrations()
 
 const rows = async (sql, params = []) => (await db.query(sql, params)).rows
 const one = async (sql, params = []) => (await rows(sql, params))[0]

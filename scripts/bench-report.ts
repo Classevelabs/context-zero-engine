@@ -6,6 +6,7 @@ import * as os from "os"
 import * as path from "path"
 import { performance } from "perf_hooks"
 import { db } from "../src/db-driver"
+import { runPendingMigrations } from "../src/db-driver/migrate"
 import { ingestor } from "../src/ingestor"
 import { capsuleCompiler } from "../src/analysis-engine/capsule-compiler"
 import { blastRadiusEngine } from "../src/analysis-engine/blast-radius"
@@ -363,6 +364,8 @@ async function ingestBenchmark(): Promise<{
 }> {
   const commitSha = `bench-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`
   const start = performance.now()
+  // The bench owns its scratch database; bring its schema current before writing.
+  await runPendingMigrations()
   const result = await ingestor.ingestRepo(repoRoot, `${path.basename(repoRoot)}-benchmark`, commitSha, "benchmark")
   const ingestElapsed = elapsedMs(start)
 
@@ -401,13 +404,14 @@ async function selectTargets(snapshotId: string): Promise<
     `SELECT sv.symbol_version_id,
                 s.canonical_name,
                 f.path AS file_path,
-                LENGTH(COALESCE(sv.body_source, '')) AS body_len
+                LENGTH(COALESCE(sb.body_source, '')) AS body_len
          FROM symbol_versions sv
+         LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
          JOIN symbols s ON s.symbol_id = sv.symbol_id
          JOIN files f ON f.file_id = sv.file_id
          WHERE f.snapshot_id = $1
            AND s.kind IN ('function', 'method', 'class')
-           AND LENGTH(COALESCE(sv.body_source, '')) >= 400
+           AND LENGTH(COALESCE(sb.body_source, '')) >= 400
            AND LENGTH(s.canonical_name) >= 6
            AND f.path NOT LIKE '%__tests__%'
          ORDER BY body_len DESC, s.canonical_name ASC

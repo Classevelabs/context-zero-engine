@@ -101,10 +101,11 @@ const snapshotId = snapRes.rows[0].snapshot_id
 const targets = await db.query(
   `SELECT sv.symbol_version_id, s.canonical_name AS name, f.path AS file_path
      FROM symbol_versions sv
+     LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
      JOIN symbols s USING(symbol_id)
      JOIN files f ON f.file_id = sv.file_id
     WHERE f.snapshot_id = $1 AND s.kind IN ('function','method','class')
-      AND LENGTH(COALESCE(sv.body_source,'')) > 500 AND LENGTH(s.canonical_name) >= 12
+      AND LENGTH(COALESCE(sb.body_source,'')) > 500 AND LENGTH(s.canonical_name) >= 12
     ORDER BY RANDOM() LIMIT $2`,
   [snapshotId, N],
 )

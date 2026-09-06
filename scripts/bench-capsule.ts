@@ -17,11 +17,12 @@ async function pickTarget(snapshotId: string): Promise<string> {
     `
         SELECT sv.symbol_version_id
         FROM symbol_versions sv
+        LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
         JOIN symbols s ON s.symbol_id = sv.symbol_id
         JOIN files f ON f.file_id = sv.file_id
         WHERE f.snapshot_id = $1
           AND s.kind IN ('function', 'method')
-        ORDER BY LENGTH(COALESCE(sv.body_source, '')) DESC
+        ORDER BY LENGTH(COALESCE(sb.body_source, '')) DESC
         LIMIT 1
     `,
     [snapshotId],

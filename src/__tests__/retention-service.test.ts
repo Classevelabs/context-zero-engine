@@ -48,6 +48,7 @@ import {
   runRetentionPolicy,
   getRetentionStats,
   listStaleTransactions,
+  cleanupStaleDerivedRows,
 } from "../services/retention-service"
 
 beforeEach(() => {
@@ -166,6 +167,33 @@ describe("cleanupOrphanedData", () => {
   })
 })
 
+describe("cleanupStaleDerivedRows", () => {
+  it("reclaims unreferenced bodies, unverified invariants and detached lineage, and logs the sum", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 4 }) // symbol_bodies
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 5 }) // invariants
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }) // symbol_lineage
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }) // audit log
+
+    const count = await cleanupStaleDerivedRows()
+
+    expect(count).toBe(10)
+    const sql = mockQuery.mock.calls.map((call) => String(call[0]))
+    expect(sql[0]).toMatch(/DELETE FROM symbol_bodies[\s\S]*NOT EXISTS[\s\S]*body_ref = sb.body_hash/)
+    // A body written by an ingest still in flight is never cut out from under it.
+    expect(sql[0]).toContain("INTERVAL '1 hour'")
+    expect(sql[1]).toMatch(/DELETE FROM invariants[\s\S]*last_verified_snapshot_id IS NULL/)
+    // Only a dead lineage is reclaimed; one that is alive keeps its history after its birth snapshot expires.
+    expect(sql[2]).toMatch(/DELETE FROM symbol_lineage[\s\S]*is_alive = FALSE AND birth_snapshot_id IS NULL AND death_snapshot_id IS NULL/)
+    expect(mockQuery).toHaveBeenCalledTimes(4)
+  })
+
+  it("returns 0 and writes no audit row when nothing is stale", async () => {
+    mockQuery.mockResolvedValue({ rows: [], rowCount: 0 })
+    expect(await cleanupStaleDerivedRows()).toBe(0)
+    expect(mockQuery).toHaveBeenCalledTimes(3)
+  })
+})
+
 // ────────── runRetentionPolicy ──────────
 
 describe("runRetentionPolicy", () => {
@@ -198,9 +226,15 @@ describe("runRetentionPolicy", () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
+    // Phase 5: cleanupStaleDerivedRows (3 queries)
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
     const result = await runRetentionPolicy()
 
     expect(result.errors).toHaveLength(0)
+    expect(result.derivedRowsCleaned).toBe(0)
     expect(result.durationMs).toBeGreaterThanOrEqual(0)
     // Lock taken on a pinned connection, and released exactly once.
     expect(mockTryAdvisoryLock).toHaveBeenCalledTimes(1)
@@ -241,6 +275,11 @@ describe("runRetentionPolicy", () => {
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
     mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
+    // Phase 5: derived rows succeeds (3 queries)
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+
     const result = await runRetentionPolicy()
 
     expect(result.errors).toHaveLength(1)
@@ -271,12 +310,13 @@ describe("runRetentionPolicy", () => {
   })
 
   it("runs every phase when no control is given, as an admin-triggered pass does", async () => {
-    for (let i = 0; i < 7; i++) mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
+    // Six phases, ten queries: 1 + 1 + 2 + 1 + 2 + 3.
+    for (let i = 0; i < 10; i++) mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 })
 
     const result = await runRetentionPolicy()
 
     expect(result.stoppedBefore).toBeUndefined()
-    expect(mockQuery).toHaveBeenCalledTimes(7)
+    expect(mockQuery).toHaveBeenCalledTimes(10)
   })
 })
 

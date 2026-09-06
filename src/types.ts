@@ -292,7 +292,6 @@ export interface ContextCapsule {
   dispatch_context?: DispatchContextNode[]
   family_context?: FamilyContextNode[]
   effect_signature?: CapsuleEffectSummary[]
-  inclusion_rationale?: InclusionRationale[]
 }
 
 export interface ContextNode {
@@ -556,7 +555,8 @@ export interface ClassHierarchyEntry {
 export interface CapsuleEffectSummary {
   kind: string
   descriptor: string
-  detail: string
+  /** Present on direct observations; a transitive entry is described by its origin. */
+  detail?: string
   provenance?: "direct" | "transitive"
 }
 
@@ -640,16 +640,6 @@ export interface FamilyContextNode {
   member_count: number
   is_target_exemplar: boolean
   contradicting_members: string[]
-}
-
-export interface InclusionRationale {
-  node_name: string
-  node_type: string
-  included: boolean
-  resolution: ContextResolution
-  reason: string
-  tokens_used: number
-  tokens_saved: number
 }
 
 // CONSTANTS

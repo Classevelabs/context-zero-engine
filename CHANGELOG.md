@@ -13,6 +13,51 @@ new keys are computed in the application. Semantic search and homolog
 similarity return nothing for a repository until its next ingest, which
 re-embeds it against the stored corpus. Nothing else is lost.
 
+### Changed
+
+- **A snapshot no longer copies every symbol's source text.** Bodies live
+  in `symbol_bodies`, one row per distinct text keyed by its SHA-256, and a
+  version row carries `body_ref` (migration 030, which moves existing text
+  over and drops `symbol_versions.body_source`). Two versions with the same
+  text share one row, across snapshots and within one: a class's text used
+  to be stored again inside each of its members' rows. On the local
+  twenty-snapshot database 584,411 version rows carried 58,259 distinct
+  bodies. Every reader joins the body by reference; nothing a tool returns
+  changes.
+  Measured on the local database (26,359 versions, 25,689 distinct bodies,
+  mostly one snapshot per repository): migrations 030 to 032 ran in 4.7 s;
+  after the table rewrite that returns the dropped column's space (`VACUUM
+  FULL symbol_versions`, 1.2 s) the version table went from 39 MB to 27 MB
+  and the body table holds 17 MB, so a database with little duplication
+  pays about 5 MB for the second table and its index. On the bench database,
+  four snapshots of this engine share 16,919 bodies across 20,149 versions.
+  The saving grows with snapshots per repository, which is what incremental
+  ingest and the watcher produce; a fresh ingest of gin stores 1,691 distinct
+  bodies for 1,715 versions and a capsule for its largest function carries
+  the full 12,702-character body through the join.
+- **The capsule compilation log is gone.** `capsule_compilations` recorded
+  a row per compiled capsule with a JSON rationale for every included and
+  omitted node; nothing read it back, and it was the one table that grew
+  with reads rather than with code. Migration 031 drops it. The capsule
+  itself carries the decisions (`omission_rationale`, `fetch_handles`,
+  `token_estimate`).
+- **A transitive effect entry no longer repeats its origin as text.** The
+  `[transitive from <id>] ...` string was 147 bytes on 17,318 of 20,100
+  effect entries locally and said what `origin_symbol_version_id` and
+  `hops` already say. `detail` is now present only on direct observations.
+- **Retention reclaims derived rows.** A new last phase removes bodies no
+  version references (an hour after they were written, so an ingest in
+  flight is never cut out from under), invariants whose verifying snapshot
+  is gone, and dead lineages whose birth and death snapshots are both gone;
+  a living lineage keeps its history after the snapshot it was born in
+  expires. None of these were ever pruned: snapshot deletion cascades to
+  rows that reference a snapshot and these deliberately do not. The cleanup
+  log's list of operations now admits the phase (migration 032); its first
+  run had reclaimed rows and then failed to record that it had.
+- **Bench scripts bring their scratch database's schema current before
+  ingesting.** `bench-storage` failed on the first column a migration had
+  added since the scratch database was last touched.
+
 ### Fixed
 
 - **Historical co-change claimed symbol pairs that no line supported.**

@@ -112,9 +112,10 @@ export async function getSymbolDetails(
   if (!sv) {
     const svResult = await db.query(
       `
-            SELECT sv.*, s.canonical_name, s.kind, s.stable_key, s.repo_id,
+            SELECT sv.*, sb.body_source, s.canonical_name, s.kind, s.stable_key, s.repo_id,
                    f.path as file_path
             FROM symbol_versions sv
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE sv.symbol_version_id = $1

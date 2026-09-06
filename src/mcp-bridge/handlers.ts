@@ -1525,10 +1525,11 @@ async function handleReadSourceImpl(args: Record<string, unknown>, log: McpLogge
     const svResult = await db.query(
       `
             SELECT sv.symbol_version_id, sv.range_start_line, sv.range_end_line,
-                   sv.signature, sv.summary, sv.body_source,
+                   sv.signature, sv.summary, sb.body_source,
                    s.canonical_name, s.kind, s.stable_key,
                    f.path as file_path
             FROM symbol_versions sv
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE sv.symbol_version_id IN (${placeholders})
@@ -1858,9 +1859,10 @@ async function handleSemanticSearchImpl(args: Record<string, unknown>, log: McpL
   const metaResult = await db.query(
     `
         SELECT sv.symbol_version_id, s.canonical_name, s.kind, s.stable_key,
-               sv.signature, sv.summary, sv.body_source,
+               sv.signature, sv.summary, sb.body_source,
                f.path as file_path, sv.range_start_line, sv.range_end_line
         FROM symbol_versions sv
+        LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
         JOIN symbols s ON s.symbol_id = sv.symbol_id
         JOIN files f ON f.file_id = sv.file_id
         WHERE sv.symbol_version_id IN (${placeholders})

@@ -76,7 +76,7 @@ const DIAGNOSE = process.env.CZ_BENCH_DIAGNOSE === "1"
 // as long as what is toggled does not itself qualify as a target.
 const TARGET_ORDER =
   process.env.CZ_BENCH_ORDER === "det"
-    ? "LENGTH(COALESCE(sv.body_source,'')) DESC, s.canonical_name, f.path"
+    ? "LENGTH(COALESCE(sb.body_source,'')) DESC, s.canonical_name, f.path"
     : "RANDOM()"
 const diagnosis = { edgeExistsNotChosen: 0, noEdgeRecorded: 0, samples: [], notChosen: [] }
 const tok = (bytes) => Math.round(bytes / 4)
@@ -300,7 +300,7 @@ const importBindings = (text, fromRel) => {
 // from the selection gap.
 const defRes = await db.query(
   "SELECT s.canonical_name AS name, f.path AS file_path" +
-    " FROM symbol_versions sv JOIN symbols s USING(symbol_id) JOIN files f ON f.file_id = sv.file_id" +
+    " FROM symbol_versions sv LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref JOIN symbols s USING(symbol_id) JOIN files f ON f.file_id = sv.file_id" +
     " WHERE f.snapshot_id = $1",
   [snapshotId],
 )
@@ -323,9 +323,9 @@ const KINDS = process.env.CZ_BENCH_KIND
 const targets = await db.query(
   "SELECT sv.symbol_version_id, s.canonical_name AS name, f.path AS file_path," +
     " sv.range_start_line, sv.range_end_line" +
-    " FROM symbol_versions sv JOIN symbols s USING(symbol_id) JOIN files f ON f.file_id = sv.file_id" +
+    " FROM symbol_versions sv LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref JOIN symbols s USING(symbol_id) JOIN files f ON f.file_id = sv.file_id" +
     " WHERE f.snapshot_id = $1 AND s.kind IN (" + KINDS + ")" +
-    " AND LENGTH(COALESCE(sv.body_source,'')) > 500 AND LENGTH(s.canonical_name) >= $3" +
+    " AND LENGTH(COALESCE(sb.body_source,'')) > 500 AND LENGTH(s.canonical_name) >= $3" +
     " ORDER BY " + TARGET_ORDER + " LIMIT $2",
   [snapshotId, N, MIN_NAME],
 )

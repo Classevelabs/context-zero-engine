@@ -5,6 +5,7 @@
  * - Snapshot expiry based on age and per-repo cap
  * - Stale transaction cleanup (stuck in intermediate states)
  * - Orphaned data cleanup (rows referencing deleted parents)
+ * - Derived rows whose snapshot is gone (bodies, invariants, lineage)
  * - Audit logging of all cleanup operations
  *
  * All operations use advisory locks to prevent concurrent cleanup runs.
@@ -32,6 +33,8 @@ export interface RetentionRunResult {
   stuckIndexingReaped: number
   staleTransactionsCleaned: number
   orphansCleaned: number
+  /** Bodies, invariants and lineage rows that no living snapshot supports. */
+  derivedRowsCleaned: number
   durationMs: number
   errors: string[]
 }
@@ -292,6 +295,48 @@ export async function cleanupOrphanedData(): Promise<number> {
 }
 
 /**
+ * Reclaim derived rows that no living snapshot supports.
+ *
+ * Snapshot deletion cascades through the rows that reference a snapshot
+ * directly, and three tables deliberately do not: symbol_bodies is shared
+ * across snapshots by content, so nothing cascades to it; invariants and
+ * symbol_lineage keep their rows and null the snapshot column, so that an
+ * invariant verified against a since-deleted snapshot is not lost while a
+ * newer snapshot may re-verify it. Left alone those rows only grow — on the
+ * local database invariants and lineage were never pruned at all. A body is
+ * reclaimed an hour after it was written, so an ingest that has stored its
+ * bodies but not yet its version rows is never cut out from under.
+ */
+export async function cleanupStaleDerivedRows(): Promise<number> {
+  const timer = log.startTimer("cleanupStaleDerivedRows")
+
+  const bodies = await db.query(`
+        DELETE FROM symbol_bodies sb
+        WHERE sb.first_seen < NOW() - INTERVAL '1 hour'
+          AND NOT EXISTS (SELECT 1 FROM symbol_versions sv WHERE sv.body_ref = sb.body_hash)
+    `)
+  const invariants = await db.query(`
+        DELETE FROM invariants
+        WHERE last_verified_snapshot_id IS NULL
+    `)
+  // A lineage is detached only once it is dead and neither the snapshot it
+  // was born in nor the one it died in exists. A living lineage whose birth
+  // snapshot expired still describes a symbol that is here today.
+  const lineage = await db.query(`
+        DELETE FROM symbol_lineage
+        WHERE is_alive = FALSE AND birth_snapshot_id IS NULL AND death_snapshot_id IS NULL
+    `)
+
+  const cleaned = { bodies: bodies.rowCount ?? 0, invariants: invariants.rowCount ?? 0, lineage: lineage.rowCount ?? 0 }
+  const total = cleaned.bodies + cleaned.invariants + cleaned.lineage
+  if (total > 0) {
+    await logCleanup("derived_rows_cleanup", "multiple", total, cleaned)
+    timer({ cleaned: total, ...cleaned })
+  }
+  return total
+}
+
+/**
  * Run the full retention policy. Acquires an advisory lock to prevent
  * concurrent runs. Each phase runs independently — a failure in one
  * does not prevent the others from executing.
@@ -319,6 +364,7 @@ export async function runRetentionPolicy(control?: PassControl): Promise<Retenti
       stuckIndexingReaped: 0,
       staleTransactionsCleaned: 0,
       orphansCleaned: 0,
+      derivedRowsCleaned: 0,
       durationMs: Date.now() - start,
       errors: ["Lock not acquired — concurrent retention run in progress"],
     }
@@ -329,6 +375,7 @@ export async function runRetentionPolicy(control?: PassControl): Promise<Retenti
   let stuckIndexingReaped = 0
   let staleTransactionsCleaned = 0
   let orphansCleaned = 0
+  let derivedRowsCleaned = 0
 
   // One phase at a time, each in its own try so a failure in one never costs
   // the others. Between phases the pass looks for a stop request: shutdown
@@ -369,6 +416,13 @@ export async function runRetentionPolicy(control?: PassControl): Promise<Retenti
       run: cleanupOrphanedData,
       record: (n) => (orphansCleaned = n),
     },
+    // Last, because the snapshot phases above are what detach these rows.
+    {
+      name: "derived_rows",
+      failure: "Retention: derived-row cleanup failed",
+      run: cleanupStaleDerivedRows,
+      record: (n) => (derivedRowsCleaned = n),
+    },
   ]
   let stoppedBefore: string | undefined
 
@@ -398,6 +452,7 @@ export async function runRetentionPolicy(control?: PassControl): Promise<Retenti
     stuckIndexingReaped,
     staleTransactionsCleaned,
     orphansCleaned,
+    derivedRowsCleaned,
     durationMs,
     errorCount: errors.length,
     ...(stoppedBefore ? { stoppedBefore } : {}),
@@ -409,6 +464,7 @@ export async function runRetentionPolicy(control?: PassControl): Promise<Retenti
     stuckIndexingReaped,
     staleTransactionsCleaned,
     orphansCleaned,
+    derivedRowsCleaned,
     durationMs,
     errors,
     ...(stoppedBefore ? { stoppedBefore } : {}),

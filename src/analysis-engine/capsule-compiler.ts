@@ -24,7 +24,6 @@
 
 import * as fsp from "fs/promises"
 import * as path from "path"
-import { v4 as uuidv4 } from "uuid"
 import { db } from "../db-driver"
 import { Logger } from "../logger"
 import { capsuleCache } from "../cache"
@@ -36,7 +35,6 @@ import type {
   FetchHandle,
   DispatchContextNode,
   FamilyContextNode,
-  InclusionRationale,
 } from "../types"
 import type { EffectEntry } from "./effect-engine"
 
@@ -207,7 +205,6 @@ export class CapsuleCompiler {
     const contextNodes: ContextNode[] = []
     const omissionRationale: string[] = []
     const uncertaintyNotes: string[] = []
-    const inclusionRationale: InclusionRationale[] = []
     const fetchHandles: FetchHandle[] = []
 
     // Bookkeeping strings ship too, so they are charged too.
@@ -407,30 +404,11 @@ export class CapsuleCompiler {
           includedWithCode.add(node.symbol_id)
         }
         if (candidate.degraded) chargeOmission(candidate.degraded)
-        inclusionRationale.push({
-          node_name: node.name,
-          node_type: category,
-          included: true,
-          resolution: candidate.resolution,
-          reason: candidate.reason,
-          tokens_used: cost,
-          tokens_saved:
-            candidate.resolution === "full_source" ? 0 : Math.max(0, fullSourceTokens + summaryTokens - cost),
-        })
         return true
       }
 
       // Fully omitted — record rationale and create fetch handle
       chargeOmission(`Omitted ${category} ${node.name}: token budget exceeded`)
-      inclusionRationale.push({
-        node_name: node.name,
-        node_type: category,
-        included: false,
-        resolution: "name_only",
-        reason: `Token budget exceeded — omitted entirely`,
-        tokens_used: 0,
-        tokens_saved: fullSourceTokens + summaryTokens,
-      })
 
       // Create fetch handle so the AI can request this node later
       const handle: FetchHandle | null = rawRow
@@ -514,15 +492,6 @@ export class CapsuleCompiler {
           if (usedTokens + dispatchTokens <= effectiveBudget) {
             contextNodes.push(dispatchNode)
             usedTokens += dispatchTokens
-            inclusionRationale.push({
-              node_name: dispatch.resolved_target,
-              node_type: "dispatch_target",
-              included: true,
-              resolution: "contract_summary",
-              reason: `Resolved dispatch chain: ${dispatch.chain}`,
-              tokens_used: dispatchTokens,
-              tokens_saved: 0,
-            })
           }
         }
       }
@@ -548,15 +517,6 @@ export class CapsuleCompiler {
         if (usedTokens + familyTokens <= effectiveBudget) {
           contextNodes.push(familyNode)
           usedTokens += familyTokens
-          inclusionRationale.push({
-            node_name: family.family_name,
-            node_type: "family_member",
-            included: true,
-            resolution: "contract_summary",
-            reason: `Target is member of concept family "${family.family_name}" (${family.family_type})`,
-            tokens_used: familyTokens,
-            tokens_saved: 0,
-          })
         }
       }
     }
@@ -572,26 +532,17 @@ export class CapsuleCompiler {
     if (effectEntries.length > 0) {
       const deduped = this.dedupeEffects(effectEntries)
       const directOnly = deduped.filter((e) => !e.provenance || e.provenance === "direct")
-      const tryShip = (entries: EffectEntry[], label: string): boolean => {
+      const tryShip = (entries: EffectEntry[]): boolean => {
         if (entries.length === 0) return false
         const cost = this.serializedTokens(entries) + 2
         if (usedTokens + cost > effectiveBudget) return false
         shippedEffects = entries
         usedTokens += cost
-        inclusionRationale.push({
-          node_name: "Effect Signature",
-          node_type: "effect",
-          included: true,
-          resolution: "effect_summary",
-          reason: label,
-          tokens_used: cost,
-          tokens_saved: 0,
-        })
         return true
       }
       if (
-        !tryShip(deduped, "Typed effect signature (deduplicated)") &&
-        !tryShip(directOnly, "Typed effect signature — direct effects only (budget)")
+        !tryShip(deduped) &&
+        !tryShip(directOnly)
       ) {
         const effectSummary = this.formatEffectSignature(deduped)
         const effectNode: ContextNode = {
@@ -609,28 +560,17 @@ export class CapsuleCompiler {
         if (usedTokens + effectTokens <= effectiveBudget) {
           contextNodes.push(effectNode)
           usedTokens += effectTokens
-          inclusionRationale.push({
-            node_name: "Effect Signature",
-            node_type: "effect",
-            included: true,
-            resolution: "effect_summary",
-            reason: "Typed effect signature for target and dependencies (summary line)",
-            tokens_used: effectTokens,
-            tokens_saved: 0,
-          })
         } else {
           chargeOmission("Effect signature omitted: token budget exceeded")
         }
       }
     }
 
-    const nodesIncluded = contextNodes.length
-    const nodesOmitted = fetchHandles.length
 
     // What ships is what was priced. Dispatch and family context already ship
     // as context nodes, so the raw arrays would be the same information paid
-    // for twice; inclusion rationale is bookkeeping and is persisted to the
-    // database below instead of being billed to every consumer.
+    // for twice. The compiler's decisions are visible in omission_rationale
+    // and fetch_handles; nothing else about a compilation is kept.
     const capsule: ContextCapsule = {
       target_symbol: targetBlock(),
       context_nodes: contextNodes,
@@ -648,22 +588,6 @@ export class CapsuleCompiler {
     capsule.token_estimate = this.serializedTokens(capsule)
     this.enforceBudget(capsule, effectiveBudget)
     capsule.token_estimate = this.serializedTokens(capsule)
-
-    // Persist compilation metadata for debugging and improvement. The row's id
-    // is not shipped: nothing reads it back through any tool, and attaching it
-    // here — after the estimate was taken — made every capsule 14 tokens larger
-    // than its own token_estimate said.
-    await this.persistCompilation(
-      symbolVersionId,
-      snapshotId,
-      mode,
-      effectiveBudget,
-      usedTokens,
-      nodesIncluded,
-      nodesOmitted,
-      inclusionRationale,
-      fetchHandles,
-    )
 
     timer({ nodes: contextNodes.length, tokens: usedTokens, omissions: omissionRationale.length })
     capsuleCache.set(cacheKey, capsule)
@@ -874,8 +798,9 @@ export class CapsuleCompiler {
       `
             SELECT sv.symbol_id, s.canonical_name, s.kind, sv.signature,
                    f.path as file_path, sv.range_start_line, sv.range_end_line,
-                   sv.body_source, sv.uncertainty_flags
+                   sb.body_source, sv.uncertainty_flags
             FROM symbol_versions sv
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE sv.symbol_version_id = $1
@@ -944,10 +869,11 @@ export class CapsuleCompiler {
             SELECT * FROM (
               SELECT DISTINCT ON (sv.symbol_version_id)
                      sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
-                     sv.body_source, sr.relation_type, sr.confidence,
+                     sb.body_source, sr.relation_type, sr.confidence,
                      f.path as file_path, sv.range_start_line, sv.range_end_line
               FROM structural_relations sr
               JOIN symbol_versions sv ON sv.symbol_version_id = sr.dst_symbol_version_id
+              LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
               JOIN symbols s ON s.symbol_id = sv.symbol_id
               JOIN files f ON f.file_id = sv.file_id
               WHERE ${srcPredicate}
@@ -1005,10 +931,11 @@ export class CapsuleCompiler {
             SELECT * FROM (
               SELECT DISTINCT ON (sv.symbol_version_id)
                      sv.symbol_version_id, sv.symbol_id, s.canonical_name, sv.signature, sv.summary,
-                     sv.body_source, sr.relation_type, sr.confidence,
+                     sb.body_source, sr.relation_type, sr.confidence,
                      f.path as file_path, sv.range_start_line, sv.range_end_line
               FROM structural_relations sr
               JOIN symbol_versions sv ON sv.symbol_version_id = sr.src_symbol_version_id
+              LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
               JOIN symbols s ON s.symbol_id = sv.symbol_id
               JOIN files f ON f.file_id = sv.file_id
               WHERE sr.dst_symbol_version_id = $1
@@ -1045,9 +972,10 @@ export class CapsuleCompiler {
     const result = await db.query(
       `
             SELECT ta.test_artifact_id, ta.assertion_summary, ta.framework,
-                   sv.symbol_version_id, sv.body_source, s.canonical_name, s.kind
+                   sv.symbol_version_id, sb.body_source, s.canonical_name, s.kind
             FROM test_artifacts ta
             JOIN symbol_versions sv ON sv.symbol_version_id = ta.symbol_version_id
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             WHERE $1 = ANY(ta.related_symbols)
             ORDER BY CASE s.kind WHEN 'test_case' THEN 0 ELSE 1 END
@@ -1113,10 +1041,11 @@ export class CapsuleCompiler {
     const result = await db.query(
       `
             SELECT ir.dst_symbol_version_id, ir.relation_type, ir.confidence,
-                   s.canonical_name, sv.signature, sv.body_source, sv.symbol_id,
+                   s.canonical_name, sv.signature, sb.body_source, sv.symbol_id,
                    f.path as file_path, sv.range_start_line, sv.range_end_line
             FROM inferred_relations ir
             JOIN symbol_versions sv ON sv.symbol_version_id = ir.dst_symbol_version_id
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE ir.src_symbol_version_id = $1
@@ -1498,70 +1427,6 @@ export class CapsuleCompiler {
     return parts.join(" | ")
   }
 
-  /**
-   * Persist compilation metadata to capsule_compilations table.
-   * Returns the capsule_id on success, or null if persistence fails
-   * (non-blocking — compilation works even without persistence).
-   */
-  private async persistCompilation(
-    symbolVersionId: string,
-    snapshotId: string,
-    mode: CapsuleMode,
-    tokenBudget: number,
-    tokenEstimate: number,
-    nodesIncluded: number,
-    nodesOmitted: number,
-    rationale: InclusionRationale[],
-    handles: FetchHandle[],
-  ): Promise<string | null> {
-    const capsuleId = uuidv4()
-    try {
-      const inclusionEntries = rationale.filter((r) => r.included)
-      const exclusionEntries = rationale.filter((r) => !r.included)
-
-      await db.query(
-        `
-                INSERT INTO capsule_compilations (
-                    capsule_id, symbol_version_id, snapshot_id,
-                    mode, token_budget, token_estimate,
-                    nodes_included, nodes_omitted,
-                    inclusion_rationale, exclusion_rationale,
-                    omitted_handles
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            `,
-        [
-          capsuleId,
-          symbolVersionId,
-          snapshotId,
-          mode,
-          tokenBudget,
-          tokenEstimate,
-          nodesIncluded,
-          nodesOmitted,
-          JSON.stringify(inclusionEntries),
-          JSON.stringify(exclusionEntries),
-          JSON.stringify(handles),
-        ],
-      )
-
-      log.debug("Capsule compilation persisted", {
-        capsuleId,
-        symbolVersionId,
-        mode,
-        nodesIncluded,
-        nodesOmitted,
-      })
-      return capsuleId
-    } catch (err) {
-      // Non-blocking: log the error but don't fail the compilation
-      log.warn("Failed to persist capsule compilation — continuing without persistence", {
-        error: err instanceof Error ? err.message : String(err),
-        capsuleId,
-        symbolVersionId,
-      })
-      return null
-    }
-  }
 }
 
 export const capsuleCompiler = new CapsuleCompiler()

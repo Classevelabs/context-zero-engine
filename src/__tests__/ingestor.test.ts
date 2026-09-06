@@ -20,6 +20,7 @@
  *   - resolveSafePath — delegation to path-security module
  */
 
+import { bodyRef } from "../db-driver/symbol-bodies"
 import * as path from "path"
 
 // ── Mocks — must be declared BEFORE imports ──────────────────────────────
@@ -951,6 +952,83 @@ describe("Ingestor — Module symbols and owners", () => {
     expect(byKey.get("svc.ts::__module__")?.[4]).toBe("module")
     const relations = (mockComputeRelationsFromRaw.mock.calls[0]?.[2] ?? []) as { source_key: string }[]
     expect(relations.map((r) => r.source_key)).toEqual(["svc.ts::__module__"])
+  })
+})
+
+describe("Ingestor — Content-addressed bodies", () => {
+  test("stores each distinct body once, before the version rows that reference it by hash", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([makeDirent("svc.ts", { isFile: true })])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValueOnce({ size: 100 })
+    // The discovery read asks for bytes; the body read asks for text.
+    const fileText = "class Service {\n  run() {}\n}\n"
+    mockReadFile.mockImplementation(async (_path: string, encoding?: string) =>
+      encoding ? fileText : Buffer.from(fileText),
+    )
+
+    const symbol = (stable_key: string, canonical_name: string, kind: string) => ({
+      stable_key,
+      canonical_name,
+      kind,
+      range_start_line: 1,
+      range_start_col: 0,
+      range_end_line: 2,
+      range_end_col: 0,
+      signature: "",
+      ast_hash: "a",
+      body_hash: "b",
+      visibility: "public",
+    })
+    mockExtractFromTypeScript.mockReturnValue({
+      symbols: [symbol("svc.ts#Service", "Service", "class"), symbol("svc.ts#Service.run", "run", "method")],
+      relations: [],
+      behavior_hints: [],
+      contract_hints: [],
+      parse_confidence: 1.0,
+      uncertainty_flags: [],
+    })
+    mockQuery.mockImplementation(async (text: string, params?: unknown[]) => {
+      if (text.includes("SELECT file_id, path FROM files")) return { rows: [{ file_id: "f-1", path: "svc.ts" }], rowCount: 1 }
+      if (text.includes("INSERT INTO symbols")) {
+        const rows = []
+        for (let i = 0; i < (params?.length ?? 0); i += 7) rows.push({ symbol_id: `id-${params![i + 2]}`, stable_key: params![i + 2] })
+        return { rows, rowCount: rows.length }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+    // Every transaction's client is kept so its statements can be read back in order.
+    const clients: { query: jest.Mock }[] = []
+    mockTransaction.mockImplementation(async (cb: any) => {
+      const client = { query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }) }
+      clients.push(client)
+      return cb(client)
+    })
+
+    await ingestor.ingestRepo("/repo", "test-repo", "abc123")
+
+    const statements = clients.flatMap((c) => c.query.mock.calls as [string, unknown[]][])
+    const bodyIndex = statements.findIndex(([text]) => text.startsWith("INSERT INTO symbol_bodies"))
+    const versionIndex = statements.findIndex(([text]) => text.includes("INSERT INTO symbol_versions"))
+    expect(bodyIndex).toBeGreaterThanOrEqual(0)
+    expect(versionIndex).toBeGreaterThan(bodyIndex)
+
+    // Both symbols span the same two lines, so there is one body, keyed by its hash.
+    const bodyText = "class Service {\n  run() {}"
+    const [bodySql, bodyParams] = statements[bodyIndex]!
+    expect(bodySql).toContain("ON CONFLICT (body_hash) DO NOTHING")
+    expect(bodyParams).toEqual([bodyRef(bodyText), bodyText, Buffer.byteLength(bodyText)])
+
+    // Version rows carry the reference, and the module symbol carries none.
+    const [versionSql, versionParams] = statements[versionIndex]!
+    expect(versionSql).toContain("body_ref")
+    expect(versionSql).not.toContain("body_source")
+    const rows: unknown[][] = []
+    for (let i = 0; i < versionParams.length; i += 17) rows.push(versionParams.slice(i, i + 17))
+    expect(rows.length).toBe(3)
+    expect(rows.filter((r) => r[13] === bodyRef(bodyText)).length).toBe(2)
+    expect(rows.filter((r) => r[13] === null).length).toBe(1)
   })
 })
 

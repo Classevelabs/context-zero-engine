@@ -68,8 +68,14 @@ export interface EffectEntry {
   kind: EffectKind
   /** Domain key — resource path, event name, error type, etc. */
   descriptor: string
-  /** Human-readable detail string for display/debugging */
-  detail: string
+  /**
+   * Human-readable detail for a direct observation. A transitive entry
+   * carries none: its origin_symbol_version_id and hops say where it came
+   * from, and the string that used to say the same ("[transitive from
+   * <uuid>] ...") was 147 bytes on average, on 17,318 of 20,100 entries
+   * locally, all derivable.
+   */
+  detail?: string
   /** Whether this effect was observed directly or propagated from a callee */
   provenance: "direct" | "transitive"
   /** How the effect was found. Absent on entries written before sources were recorded. */
@@ -621,9 +627,10 @@ export class EffectEngine {
     // Load all symbol versions for the snapshot
     const svResult = await db.query(
       `
-            SELECT sv.symbol_version_id, sv.body_source, sv.signature, sv.summary,
+            SELECT sv.symbol_version_id, sb.body_source, sv.signature, sv.summary,
                    sv.language, s.canonical_name, s.kind
             FROM symbol_versions sv
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             WHERE sv.snapshot_id = $1
         `,
@@ -810,8 +817,9 @@ export class EffectEngine {
     // Mine from framework patterns (body source)
     // Query kind alongside body_source to gate container-kind symbols
     const svResult = await db.query(
-      `SELECT sv.body_source, sv.signature, sv.summary, sv.language, s.kind
+      `SELECT sb.body_source, sv.signature, sv.summary, sv.language, s.kind
              FROM symbol_versions sv
+             LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
              JOIN symbols s ON s.symbol_id = sv.symbol_id
              WHERE sv.symbol_version_id = $1`,
       [symbolVersionId],
@@ -1063,18 +1071,7 @@ export class EffectEngine {
           const transitiveKey = `${calleeEffect.kind}:${calleeEffect.descriptor}`
 
           if (!callerKeys.has(transitiveKey)) {
-            callerSig.effects.push({
-              kind: calleeEffect.kind,
-              descriptor: calleeEffect.descriptor,
-              detail: `[transitive from ${calleeId}] ${calleeEffect.detail}`,
-              provenance: "transitive",
-              origin_symbol_version_id:
-                calleeEffect.provenance === "transitive" ? calleeEffect.origin_symbol_version_id : calleeId,
-              hops,
-              // A lifted effect is exactly as trustworthy as where it was found.
-              ...(calleeEffect.source ? { source: calleeEffect.source } : {}),
-              ...(calleeEffect.confidence !== undefined ? { confidence: calleeEffect.confidence } : {}),
-            })
+            callerSig.effects.push(liftedEffect(calleeEffect, calleeId, hops))
             callerKeys.add(transitiveKey)
             callerChanged = true
           }
@@ -1198,17 +1195,7 @@ export class EffectEngine {
               if (hops > MAX_EFFECT_HOPS) continue
               const key = `${calleeEffect.kind}:${calleeEffect.descriptor}`
               if (memberKeys.has(key)) continue
-              memberSig.effects.push({
-                kind: calleeEffect.kind,
-                descriptor: calleeEffect.descriptor,
-                detail: `[transitive from ${calleeId}] ${calleeEffect.detail}`,
-                provenance: "transitive",
-                origin_symbol_version_id:
-                  calleeEffect.provenance === "transitive" ? calleeEffect.origin_symbol_version_id : calleeId,
-                hops,
-                ...(calleeEffect.source ? { source: calleeEffect.source } : {}),
-                ...(calleeEffect.confidence !== undefined ? { confidence: calleeEffect.confidence } : {}),
-              })
+              memberSig.effects.push(liftedEffect(calleeEffect, calleeId, hops))
               memberKeys.add(key)
               memberChanged = true
             }
@@ -1263,16 +1250,7 @@ export class EffectEngine {
           for (const effect of clusterEffects) {
             const key = `${effect.kind}:${effect.descriptor}`
             if (!nodeKeys.has(key)) {
-              sig.effects.push({
-                kind: effect.kind,
-                descriptor: effect.descriptor,
-                detail: `[cycle-propagated] ${effect.detail}`,
-                provenance: "transitive",
-                origin_symbol_version_id: effect.provenance === "transitive" ? effect.origin_symbol_version_id : nodeId,
-                hops: 1,
-                ...(effect.source ? { source: effect.source } : {}),
-                ...(effect.confidence !== undefined ? { confidence: effect.confidence } : {}),
-              })
+              sig.effects.push(liftedEffect(effect, nodeId, 1))
               nodeKeys.add(key)
               changed = true
             }
@@ -1971,6 +1949,25 @@ export class EffectEngine {
       .toLowerCase()
       .replace(/\s+/g, "_")
       .replace(/[^a-z0-9_.-]/g, "")
+  }
+}
+
+/**
+ * The entry a caller gets when a callee's effect is lifted into it. It names
+ * the origin (the first direct observation, through any chain) and the hop
+ * count, keeps the source and confidence it was found with, and carries no
+ * detail text: the origin id says the same thing, and the string that used
+ * to repeat it was 147 bytes on 17,318 of 20,100 entries locally.
+ */
+export function liftedEffect(from: EffectEntry, fromId: string, hops: number): EffectEntry {
+  return {
+    kind: from.kind,
+    descriptor: from.descriptor,
+    provenance: "transitive",
+    origin_symbol_version_id: from.provenance === "transitive" ? from.origin_symbol_version_id : fromId,
+    hops,
+    ...(from.source ? { source: from.source } : {}),
+    ...(from.confidence !== undefined ? { confidence: from.confidence } : {}),
   }
 }
 

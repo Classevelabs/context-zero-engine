@@ -15,6 +15,50 @@ against, and how a regression would show up to somebody using the engine.
 
 ---
 
+## 2026-09-06 — A body is stored once, addressed by its content
+
+**Decision.** `symbol_bodies(body_hash, body_source, byte_length, first_seen)`
+holds each distinct source text once, keyed by SHA-256 over its UTF-8 bytes;
+`symbol_versions.body_ref` points at it (migration 030). The application and
+the migration compute the key the same way, so both land the same text on the
+same row. Readers join by reference. Orphaned bodies are reclaimed by the
+retention pass an hour after they were written, never by cascade; the same
+phase removes invariants whose verifying snapshot is gone and lineages that
+are dead with both their snapshots gone, and the cleanup log admits the
+phase's audit row (migration 032).
+
+**Why it is not arbitrary.** A version row is per snapshot and per symbol, and
+the text is per neither: on the local database 584,411 version rows carried
+58,259 distinct bodies, and within one snapshot a class's text contained its
+members' text again. The key is the hash of the stored text rather than the
+adapter's `body_hash`, because the adapter hashes the node it parsed while the
+ingestor stores a line-range slice, and the two can differ on a shared first
+or last line; addressing by the stored text is exact by construction. The
+one-hour grace before reclaiming a body exists because the single-row insert
+path writes the body and the version in separate statements. Nothing a tool
+returns changes, which is the point: this is a representation decision.
+
+**Verified against.** `symbol-bodies.test.ts` pins the key to the SHA-256
+test vectors and byte lengths to UTF-8; the ingestor test shows the body
+statement running before the version rows in the same transaction, one row
+for two symbols sharing a text, and `NULL` for the module symbol; the
+schema-contract test checks every joined column against the regenerated
+schema.
+Observed: the upgrade on the local database (26,359 versions) ran in 4.7 s
+and, after a table rewrite, left the version table at 27 MB from 39 MB with
+17 MB of bodies; a fresh gin ingest reads its largest function's full body
+back through a capsule; the bench database's body view embeds 30 tokens per
+symbol on average after the change, so the semantic engine still sees the
+text; deleting a snapshot and running the phase reclaimed every body it had
+introduced (1,716 to 0) and recorded the audit row.
+
+**Regression looks like.** Database size grows linearly with snapshots
+again; a snapshot's body text is missing from a capsule after a copy-forward
+ingest (a reader that forgot the join); orphaned bodies accumulate after
+snapshots expire.
+
+---
+
 ## 2026-09-06 — Symbol co-change comes from blame; file co-change from the log
 
 **Decision.** `temporal_co_changes` holds symbol pairs whose lines were last

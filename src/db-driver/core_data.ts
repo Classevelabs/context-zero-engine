@@ -6,6 +6,7 @@
  */
 
 import { db } from "./index"
+import { bodyRef, bodyUpsert } from "./symbol-bodies"
 import { v4 as uuidv4 } from "uuid"
 import { Logger } from "../logger"
 import { firstRow, optionalStringField, validateRows, validateSymbolVersionRow, type SymbolVersionRow } from "./result"
@@ -283,15 +284,25 @@ export class CoreDataService {
     return symbolId
   }
 
+  /** Store a body once and return its reference, or null for no body. */
+  private async storeBody(text: string | null): Promise<string | null> {
+    if (text === null) return null
+    const ref = bodyRef(text)
+    const stmt = bodyUpsert(new Map([[ref, text]]))
+    if (stmt) await db.query(stmt.text, stmt.params)
+    return ref
+  }
+
   public async insertSymbolVersion(input: SymbolVersionInput): Promise<string> {
     const id = uuidv4()
+    const bodyRef = await this.storeBody(input.body_source ?? null)
     const result = await db.query(
       `
             INSERT INTO symbol_versions (
                 symbol_version_id, symbol_id, snapshot_id, file_id,
                 range_start_line, range_start_col, range_end_line, range_end_col,
                 signature, ast_hash, body_hash, normalized_ast_hash,
-                summary, body_source, visibility, language, uncertainty_flags
+                summary, body_ref, visibility, language, uncertainty_flags
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (symbol_id, snapshot_id) DO UPDATE SET
                 file_id = EXCLUDED.file_id,
@@ -304,7 +315,7 @@ export class CoreDataService {
                 body_hash = EXCLUDED.body_hash,
                 normalized_ast_hash = EXCLUDED.normalized_ast_hash,
                 summary = EXCLUDED.summary,
-                body_source = EXCLUDED.body_source,
+                body_ref = EXCLUDED.body_ref,
                 visibility = EXCLUDED.visibility,
                 language = EXCLUDED.language,
                 uncertainty_flags = EXCLUDED.uncertainty_flags
@@ -324,7 +335,7 @@ export class CoreDataService {
         input.body_hash,
         input.normalized_ast_hash || null,
         input.summary,
-        input.body_source ?? null,
+        bodyRef,
         input.visibility,
         input.language,
         input.uncertainty_flags || [],
@@ -749,8 +760,9 @@ export class CoreDataService {
   public async getSymbolVersionsForSnapshot(snapshot_id: string): Promise<SymbolVersionRow[]> {
     const result = await db.query(
       `
-            SELECT sv.*, s.canonical_name, s.kind, s.stable_key, s.parent_name, s.repo_id, f.path as file_path
+            SELECT sv.*, sb.body_source, s.canonical_name, s.kind, s.stable_key, s.parent_name, s.repo_id, f.path as file_path
             FROM symbol_versions sv
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE sv.snapshot_id = $1
@@ -762,49 +774,6 @@ export class CoreDataService {
     return validateRows(result.rows, validateSymbolVersionRow, "getSymbolVersionsForSnapshot")
   }
 
-  /**
-   * Cursor-based paginated version of getSymbolVersionsForSnapshot.
-   * Use this for snapshots that may contain 50K+ rows to avoid loading
-   * the entire table into memory at once.
-   *
-   * @param snapshot_id  The snapshot to query
-   * @param options.limit  Max rows per page (default 1000)
-   * @param options.afterId  Cursor: return rows with symbol_version_id > afterId
-   * @param options.excludeBodySource  If true, omits body_source to reduce transfer size
-   */
-  public async getSymbolVersionsForSnapshotPaginated(
-    snapshot_id: string,
-    options?: { limit?: number; afterId?: string; excludeBodySource?: boolean },
-  ): Promise<{ rows: SymbolVersionRow[]; hasMore: boolean }> {
-    const limit = options?.limit ?? 1000
-    const columns = options?.excludeBodySource
-      ? "sv.symbol_version_id, sv.symbol_id, sv.snapshot_id, sv.file_id, sv.range_start_line, sv.range_start_col, sv.range_end_line, sv.range_end_col, sv.signature, sv.ast_hash, sv.body_hash, sv.summary, sv.visibility, sv.language, sv.uncertainty_flags, s.canonical_name, s.kind, s.stable_key, s.repo_id, f.path as file_path"
-      : "sv.*, s.canonical_name, s.kind, s.stable_key, s.repo_id, f.path as file_path"
-
-    let sql = `
-            SELECT ${columns}
-            FROM symbol_versions sv
-            JOIN symbols s ON s.symbol_id = sv.symbol_id
-            JOIN files f ON f.file_id = sv.file_id
-            WHERE sv.snapshot_id = $1
-        `
-    const params: unknown[] = [snapshot_id]
-
-    if (options?.afterId) {
-      sql += ` AND sv.symbol_version_id > $2`
-      params.push(options.afterId)
-    }
-
-    sql += ` ORDER BY sv.symbol_version_id LIMIT $${params.length + 1}`
-    params.push(limit + 1) // fetch one extra to detect hasMore
-
-    const result = await db.query(sql, params)
-    const hasMore = result.rows.length > limit
-    const rawRows = hasMore ? result.rows.slice(0, limit) : result.rows
-    const rows = validateRows(rawRows, validateSymbolVersionRow, "getSymbolVersionsForSnapshotPaginated")
-
-    return { rows, hasMore }
-  }
 }
 
 export const coreDataService = new CoreDataService()

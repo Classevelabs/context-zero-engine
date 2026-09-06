@@ -5,6 +5,7 @@ import * as os from "os"
 import * as path from "path"
 import { performance } from "perf_hooks"
 import { db } from "../src/db-driver"
+import { runPendingMigrations } from "../src/db-driver/migrate"
 import { ingestor } from "../src/ingestor"
 import { capsuleCompiler } from "../src/analysis-engine/capsule-compiler"
 import { blastRadiusEngine } from "../src/analysis-engine/blast-radius"
@@ -394,14 +395,15 @@ async function selectTargets(
 > {
   const result = await db.query(
     `SELECT sv.symbol_version_id, s.canonical_name, f.path AS file_path,
-                LENGTH(COALESCE(sv.body_source, '')) AS body_len
+                LENGTH(COALESCE(sb.body_source, '')) AS body_len
          FROM symbol_versions sv
+         LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
          JOIN symbols s ON s.symbol_id = sv.symbol_id
          JOIN files f ON f.file_id = sv.file_id
          WHERE sv.snapshot_id = $1
            AND sv.language = ANY($2)
            AND s.kind IN ('function', 'method', 'class', 'interface', 'type_alias')
-           AND LENGTH(COALESCE(sv.body_source, '')) >= 120
+           AND LENGTH(COALESCE(sb.body_source, '')) >= 120
            AND f.path NOT LIKE '%test%'
            AND f.path NOT LIKE '%spec%'
          ORDER BY body_len DESC, s.canonical_name ASC
@@ -505,6 +507,8 @@ async function ingestTarget(target: BenchTarget): Promise<TargetResult> {
   const syntheticCommit = `bench-${target.id}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`
   const corpus = await collectCorpusStats(repoPath)
   const start = performance.now()
+  // The bench owns its scratch database; bring its schema current before writing.
+  await runPendingMigrations()
   const result = await ingestor.ingestRepo(repoPath, `${target.id}-multi-bench`, syntheticCommit, "benchmark")
   const elapsed = elapsedMs(start)
   const snap = await db.query(

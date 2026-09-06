@@ -338,13 +338,13 @@ describe("Capsule Integration — Token Budget Enforcement", () => {
     ["NaN", Number.NaN, 12_000],
     ["positive infinity", Number.POSITIVE_INFINITY, 12_000],
     ["over maximum", 1_000_000, 100_000],
-  ])("normalizes %s token budgets before use and persistence", async (_label, requested, expected) => {
+  ])("normalizes %s token budgets before use", async (_label, requested, expected) => {
     setupMockForMode("standard", { depCount: 0, callerCount: 0, testCount: 0 })
 
     const capsule = await compiler.compile(`sv-${_label}`, "snap-001", "standard", requested as number)
 
-    const persistenceCall = mockQuery.mock.calls.find((call) => String(call[0]).includes("INSERT INTO capsule_compilations"))
-    expect(persistenceCall?.[1]?.[4]).toBe(expected)
+    // Nothing is logged per compilation any more; the capsule is the record.
+    expect(mockQuery.mock.calls.some((call) => String(call[0]).includes("capsule_compilations"))).toBe(false)
     // token_estimate is the measured serialized size of the whole capsule.
     // The budget binds the content; the JSON frame (skeleton plus the empty
     // target block) is irreducible, so a pathological budget can be exceeded

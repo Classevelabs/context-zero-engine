@@ -134,9 +134,10 @@ export async function compileSmartContext(
   const targetsResult = await db.query(
     `
         SELECT sv.symbol_version_id, s.canonical_name, s.kind, sv.signature,
-               sv.summary, sv.body_source, f.path as file_path,
+               sv.summary, sb.body_source, f.path as file_path,
                sv.range_start_line, sv.range_end_line
         FROM symbol_versions sv
+        LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
         JOIN symbols s ON s.symbol_id = sv.symbol_id
         JOIN files f ON f.file_id = sv.file_id
         WHERE sv.symbol_version_id IN (${targetPH})
@@ -198,9 +199,10 @@ export async function compileSmartContext(
     const impPH = chunk.map((_, i) => `$${i + 2}`).join(",")
     const impResult = await db.query(
       `
-            SELECT s.symbol_id, s.canonical_name, s.kind, sv.body_source,
+            SELECT s.symbol_id, s.canonical_name, s.kind, sb.body_source,
                    f.path as file_path, sv.range_start_line, sv.range_end_line
             FROM symbol_versions sv
+            LEFT JOIN symbol_bodies sb ON sb.body_hash = sv.body_ref
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE sv.snapshot_id = $1 AND s.symbol_id IN (${impPH})

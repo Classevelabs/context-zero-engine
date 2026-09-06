@@ -20,6 +20,7 @@ import { promisify } from "util"
 const execFileAsync = promisify(execFile)
 import { Logger } from "../logger"
 import { coreDataService } from "../db-driver/core_data"
+import { bodyRef, bodyUpsert } from "../db-driver/symbol-bodies"
 import { structuralGraphEngine } from "../analysis-engine"
 import { behavioralEngine } from "../analysis-engine/behavioral"
 import { contractEngine } from "../analysis-engine/contracts"
@@ -468,13 +469,13 @@ export class Ingestor {
                         symbol_version_id, symbol_id, snapshot_id, file_id,
                         range_start_line, range_start_col, range_end_line, range_end_col,
                         signature, ast_hash, body_hash, normalized_ast_hash,
-                        summary, body_source, visibility, language, uncertainty_flags
+                        summary, body_ref, visibility, language, uncertainty_flags
                     )
                     SELECT
                         gen_random_uuid(), sv.symbol_id, $2, f_new.file_id,
                         sv.range_start_line, sv.range_start_col, sv.range_end_line, sv.range_end_col,
                         sv.signature, sv.ast_hash, sv.body_hash, sv.normalized_ast_hash,
-                        sv.summary, sv.body_source, sv.visibility, sv.language, sv.uncertainty_flags
+                        sv.summary, sv.body_ref, sv.visibility, sv.language, sv.uncertainty_flags
                     FROM symbol_versions sv
                     JOIN files f_old ON f_old.file_id = sv.file_id AND f_old.snapshot_id = $1
                     JOIN files f_new ON f_new.path = f_old.path AND f_new.snapshot_id = $2
@@ -1256,6 +1257,8 @@ export class Ingestor {
     // O(N²) dedupe. Dedupe must happen here because PostgreSQL refuses
     // ON CONFLICT DO UPDATE on the same target row twice in one statement.
     const rowBySymbolId = new Map<string, unknown[]>()
+    // Distinct bodies this file set introduces, by content hash.
+    const bodiesToStore = new Map<string, string>()
     const filteredUncertaintyFlags = (extraction.uncertainty_flags || []).filter(
       (f) => f === "encoding_fallback" || f === "extraction_error",
     )
@@ -1278,6 +1281,12 @@ export class Ingestor {
         // Strip null bytes — they corrupt PostgreSQL TEXT columns
         if (raw.includes("\0")) raw = raw.replace(/\0/g, "")
         bodySource = raw
+      }
+      // Bodies are stored once by content; the version row carries the key.
+      let bodyRefValue: string | null = null
+      if (bodySource !== null) {
+        bodyRefValue = bodyRef(bodySource)
+        if (!bodiesToStore.has(bodyRefValue)) bodiesToStore.set(bodyRefValue, bodySource)
       }
 
       const svId = crypto.randomUUID()
@@ -1302,7 +1311,7 @@ export class Ingestor {
         sym.body_hash,
         sym.normalized_ast_hash || null,
         sym.summary || "",
-        bodySource,
+        bodyRefValue,
         sym.visibility,
         language,
         filteredUncertaintyFlags,
@@ -1318,6 +1327,13 @@ export class Ingestor {
       const MAX_PARAMS = 30_000
       const maxRowsPerChunk = Math.max(1, Math.floor(MAX_PARAMS / SV_COLS))
       await db.transaction(async (client) => {
+        // Bodies first: the version rows reference them.
+        const bodyEntries = [...bodiesToStore]
+        const bodiesPerChunk = Math.max(1, Math.floor(MAX_PARAMS / 3))
+        for (let offset = 0; offset < bodyEntries.length; offset += bodiesPerChunk) {
+          const stmt = bodyUpsert(new Map(bodyEntries.slice(offset, offset + bodiesPerChunk)))
+          if (stmt) await client.query(stmt.text, stmt.params)
+        }
         for (let offset = 0; offset < dedupedRows.length; offset += maxRowsPerChunk) {
           const chunk = dedupedRows.slice(offset, offset + maxRowsPerChunk)
           const valuesClauses: string[] = []
@@ -1333,7 +1349,7 @@ export class Ingestor {
                             symbol_version_id, symbol_id, snapshot_id, file_id,
                             range_start_line, range_start_col, range_end_line, range_end_col,
                             signature, ast_hash, body_hash, normalized_ast_hash,
-                            summary, body_source, visibility, language, uncertainty_flags
+                            summary, body_ref, visibility, language, uncertainty_flags
                         ) VALUES ${valuesClauses.join(", ")}
                         ON CONFLICT (symbol_id, snapshot_id) DO UPDATE SET
                             file_id = EXCLUDED.file_id,
@@ -1346,7 +1362,7 @@ export class Ingestor {
                             body_hash = EXCLUDED.body_hash,
                             normalized_ast_hash = EXCLUDED.normalized_ast_hash,
                             summary = EXCLUDED.summary,
-                            body_source = EXCLUDED.body_source,
+                            body_ref = EXCLUDED.body_ref,
                             visibility = EXCLUDED.visibility,
                             language = EXCLUDED.language,
                             uncertainty_flags = EXCLUDED.uncertainty_flags`,
@@ -1646,7 +1662,6 @@ export class Ingestor {
       await db.queryWithClient(client, "DELETE FROM concept_families WHERE snapshot_id = $1", [snapshotId])
       await db.queryWithClient(client, "DELETE FROM temporal_risk_scores WHERE snapshot_id = $1", [snapshotId])
       await db.queryWithClient(client, "DELETE FROM runtime_traces WHERE snapshot_id = $1", [snapshotId])
-      await db.queryWithClient(client, "DELETE FROM capsule_compilations WHERE snapshot_id = $1", [snapshotId])
 
       await db.queryWithClient(client, "DELETE FROM files WHERE snapshot_id = $1", [snapshotId])
       // Don't delete the snapshot row itself — it will be updated via upsert
