@@ -31,7 +31,16 @@ Also verify:
 - HTTP mutation routes reject regular keys and accept only admin keys;
 - MCP mutation access and repository command execution are enabled only when
   explicitly intended;
-- a clean database migration and real repository ingest succeed;
+- a clean database migration and real repository ingest succeed, and the
+  upgrade path is exercised: the pending migrations applied to a database
+  that already holds data, timed, before the candidate is tagged;
+- a cold-start MCP smoke (initialize + tools/list against the built bridge)
+  finishes with zero error-level log lines;
+- the corpus sweep (`scripts/bench-e2e.mjs` and
+  `scripts/bench-context-quality.mjs` over `E:/cz-bench-corpus`, or an
+  equivalent set of real repositories) has been run on the candidate build,
+  its results are committed under a dated directory, and every number quoted
+  in `BENCHMARKS.md` comes from that run — no headline may predate a fix;
 - rollback/restore has been rehearsed; and
 - public benchmark language is limited to reproducible evidence. Historical
   author-run results without committed raw artifacts are not release gates.

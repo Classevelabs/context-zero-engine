@@ -15,6 +15,63 @@ against, and how a regression would show up to somebody using the engine.
 
 ---
 
+## 2026-09-06 — Relations resolve once per snapshot, and every engine inserts in bulk
+
+**Decision.** `computeRelationsFromRaw` runs once per ingest over every
+file's raw relations, against an identity index of the whole snapshot with
+no cap and no database fallback; the same edge extracted twice is written
+once, and the rows go through `bulkInsert` with a checkable `ON CONFLICT ...
+DO UPDATE` clause. `batchInsert` folds runs of identical single-row inserts
+into multi-row statements, replaying a chunk row by row under a savepoint if
+PostgreSQL reports a cardinality violation.
+
+**Why it is not arbitrary.** Per-file resolution rebuilt the index for every
+file and asked the database for every unresolved name: 3.8 s of gin's 17.6 s,
+11.9 s of flask's 28.6 s, 19.0 s of this engine's 56.8 s. It also could not
+reach a symbol in a file persisted later, so recall depended on file order.
+Folding in the shared helper fixes twenty-seven call sites at once, with the
+savepoint fallback preserving last-write-wins for any caller that relied on it.
+
+**Verified against.** Structural-graph tests pin one multi-row statement, no
+lookup query, and single-edge writes; driver tests pin the fold, the
+placeholder renumbering, the row-by-row replay on code 21000 and the abort on
+anything else. Observed on a fresh database: gin 17.6 s to 11.6 s with 3,789
+relations (3,422 before), flask 28.6 s to 15.4 s, this engine 56.8 s to 36.2 s.
+
+**Regression looks like.** Ingest time grows with files times symbols again;
+relation counts differ with file order; the relation phase shows as many
+calls as files in the ingest log.
+
+---
+
+## 2026-09-06 — Delta ingest is the default and engines carry unchanged work forward
+
+**Decision.** `ingestRepo` takes the latest complete snapshot on the branch as
+parent unless told otherwise. With a fully refined parent (complete, no
+deferred refinement), deep contracts re-verify and skip versions with the
+same body and signature, effect signatures rebuild from the parent's direct
+entries, and the temporal pass carries blame commit sets (`symbol_history`,
+migration 033) for files with unchanged content. Propagation, dispatch and
+lineage still run over the whole snapshot, because they are about the graph.
+
+**Why it is not arbitrary.** Only the MCP handler looked up a parent, so every
+other entry was a full ingest, and even a delta ingest re-ran every engine
+over every symbol. Blame is a property of content: an unchanged file has the
+same last-change commit on every line, so its sets are exact to carry. The
+parent must be fully refined because a carried row that does not exist is a
+silent gap, and "mine everything" is the only safe answer to doubt.
+
+**Verified against.** Observed on gin, one file touched: 12.4 s to 4.2 s;
+1 file extracted of 99; blame 1.7 s to 115 ms with 98 files carried;
+invariants and effects reported as carried in the ingest log. The full suite
+covers the parent lookup, the carried path and the refined-parent guard.
+
+**Regression looks like.** A second ingest with one file touched extracts
+every file again, or blames every file again; a symbol changed in place keeps
+stale invariants (the guard on body and signature failed).
+
+---
+
 ## 2026-09-06 — A body is stored once, addressed by its content
 
 **Decision.** `symbol_bodies(body_hash, body_source, byte_length, first_seen)`

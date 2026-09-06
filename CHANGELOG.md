@@ -13,6 +13,80 @@ new keys are computed in the application. Semantic search and homolog
 similarity return nothing for a repository until its next ingest, which
 re-embeds it against the stored corpus. Nothing else is lost.
 
+### Performance
+
+Measured on a fresh database, wall clock for a full ingest, before and
+after this batch: gin 17.6 s to 11.6 s, flask 28.6 s to 15.4 s, this engine
+56.8 s to 36.2 s. A second ingest of gin with one file touched: 12.4 s to
+4.2 s, extracting 1 file instead of 99.
+
+- **Relations are resolved once per snapshot, after every file's symbols
+  exist.** They were resolved per file, rebuilding the identity index each
+  time and asking the database for every name the index did not hold: 3.8 s
+  of gin's ingest, 11.9 s of flask's, 19.0 s of this engine's. One pass over
+  the complete index also lets a relation reach a symbol in a file persisted
+  after its own, and there is no database fallback and no cap on the index:
+  gin now keeps 3,789 relations (3,422 before).
+- **Every engine's batch insert folds identical single-row inserts into
+  multi-row statements.** The shared helper handed the database one
+  round-trip per row for every engine (21,849 for this engine's relations
+  alone). Runs of statements with identical text now go as one statement
+  per chunk with renumbered placeholders; updates and CTEs run as written;
+  a chunk that would touch the same conflict row twice is rolled back to a
+  savepoint and replayed row by row, so every caller keeps its semantics.
+- **Delta ingest is the default, for every caller.** Only the MCP handler
+  looked up the parent snapshot; the REST server, the benches and scripts
+  re-parsed every file and re-ran every engine on each ingest. The ingest
+  entry now takes the latest complete snapshot of the repository and branch
+  as parent unless told otherwise.
+- **Engines carry unchanged work forward instead of redoing it.** With a
+  fully refined parent, a version with the same body and signature keeps
+  its symbol's invariants (re-verified in one statement, not mined again)
+  and its effect signature's direct entries (transitive entries are rebuilt
+  by propagation over the whole graph); a file with the same content keeps
+  its symbols' blame commit sets (`symbol_history`, migration 033), so the
+  temporal pass blames only changed files: 1.7 s to 115 ms on the one-file
+  pass. Deep-contract paging moved from OFFSET, quadratic in the snapshot,
+  to a key cursor.
+- **Rename candidates come from an index, not a scan.** Lineage ranked every
+  same-kind old symbol by edit distance for every new symbol; candidates are
+  now the old symbols sharing the most name bigrams plus those sharing the
+  body or normalized-AST hash.
+- **The native symbol search parses a file once per version.** Every search
+  re-parsed the workspace; a parse is reused while the file's size and
+  mtime hold, bounded at 4,000 files.
+- **Validation of a change is a delta ingest of the base snapshot**, which
+  the two changes above make proportional to the patch rather than the
+  repository.
+
+### Added
+
+- **A large class ships as a skeleton.** When a class or interface body
+  would take more than a third of the capsule budget, the capsule carries
+  its header and one signature line per member, with a fetch handle for
+  each member's body, and spends the rest of the budget on what the class
+  actually depends on. Measured on class targets before this: 57.7%
+  dependency recall at 6,470 tokens, most of it spent on member bodies the
+  caller could fetch by handle. __SKELETON_MEASUREMENT__
+- **A class's blast radius includes its members' callers.** The class node
+  alone has almost no callers; its methods do. Class and interface targets
+  now widen to their members before any dimension runs, and the report says
+  how many were added (`member_targets`).
+- **The semantic diff of a class reports its members.** A removed member is
+  breaking, a changed body major, an added member minor; before this a
+  class diff compared the class node's own, nearly empty, profile.
+- **The quality benchmark measures Python and Go, not only TypeScript.**
+  Dependency ground truth now comes from Python imports (absolute and
+  relative, module or member) and Go package imports resolved through
+  go.mod, so recall is measured on the languages the engine indexes rather
+  than stated for one and assumed for the rest.
+- **The benchmark counts what it could not answer.** A target the capsule
+  compiler fails on, or answers with fewer than 50 tokens, used to vanish
+  from the denominator; it is now a failed task, reported with its reason,
+  and `contextzero_recall_incl_failures_pct` carries its dependencies. The
+  naive baseline's 25-file cap is a stated parameter, and the uncapped cost
+  of reading every file that mentions the symbol ships beside it.
+
 ### Changed
 
 - **A snapshot no longer copies every symbol's source text.** Bodies live
