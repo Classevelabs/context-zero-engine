@@ -95,6 +95,103 @@ interface MemberCallsite {
   receiverExpression: string
   methodName: string
   line: number
+  /**
+   * The declared type of the chain's root when the root is a typed parameter
+   * or receiver rather than `this`/`self` — `c` in `c.JSON(...)` inside
+   * `func (c *Context) ...` or `handle(ctx Context)`. Chains were only ever
+   * collected from `this` and `self`, so a language whose receivers are named
+   * parameters — Go, and every call through a parameter in Java, C#, Kotlin,
+   * Swift and typed TypeScript — produced no dispatch at all.
+   */
+  rootType?: string
+}
+
+/**
+ * The declared types of a signature's parameters, by parameter name.
+ *
+ * One parser for every language's spelling: `name: Type` (TypeScript, Python,
+ * Kotlin, Swift), `Type name` (Java, C#), `name Type` and `name *Type` (Go,
+ * including the receiver group). A type is reduced to its own name — no
+ * pointer, slice, generic, nullable or package prefix — because that is what
+ * the symbol table knows it as. Parameters without a type are skipped.
+ */
+export function parameterTypesFromSignature(signature: string, language: string): Map<string, string> {
+  const result = new Map<string, string>()
+  if (!signature) return result
+  // Every top-level parenthesised group before the body: Go has two (receiver
+  // and parameters); the others one.
+  const groups: string[] = []
+  let depth = 0
+  let start = -1
+  const stopAt = (() => {
+    const brace = signature.indexOf("{")
+    const arrow = signature.indexOf("=>")
+    const ends = [brace, arrow].filter((i) => i >= 0)
+    return ends.length ? Math.min(...ends) : signature.length
+  })()
+  for (let i = 0; i < stopAt; i++) {
+    const ch = signature[i]
+    if (ch === "(") {
+      if (depth === 0) start = i + 1
+      depth++
+    } else if (ch === ")") {
+      depth--
+      if (depth === 0 && start >= 0) {
+        groups.push(signature.slice(start, i))
+        start = -1
+      }
+    }
+  }
+  const splitTopLevel = (text: string): string[] => {
+    const parts: string[] = []
+    let level = 0
+    let current = ""
+    for (const ch of text) {
+      if (ch === "<" || ch === "[" || ch === "(" || ch === "{") level++
+      else if (ch === ">" || ch === "]" || ch === ")" || ch === "}") level--
+      if (ch === "," && level === 0) {
+        parts.push(current)
+        current = ""
+      } else current += ch
+    }
+    if (current.trim()) parts.push(current)
+    return parts
+  }
+  const typeName = (raw: string): string | null => {
+    let t = raw.trim().replace(/\s*=.*$/, "").replace(/<.*$/, "").replace(/\[.*?\]/g, "")
+    t = t.replace(/^[*&?!]+|[*&?!]+$/g, "").replace(/^(?:const|final|readonly|mut|ref|out|in|inout)\s+/, "")
+    const last = t.split(/[.:]+/).filter(Boolean).pop() ?? ""
+    return /^[A-Za-z_]\w*$/.test(last) ? last : null
+  }
+  for (const group of groups) {
+    for (const param of splitTopLevel(group)) {
+      let p = param.trim().replace(/^@\w+(\([^)]*\))?\s+/, "").replace(/^(?:private|protected|public|readonly|final|val|var)\s+/, "")
+      p = p.replace(/\s*=\s*[^,]+$/, "")
+      if (!p || p === "self" || p === "cls" || p === "this") continue
+      let name: string | null = null
+      let type: string | null = null
+      const colon = p.match(/^(\w+)\s*\??\s*:\s*(.+)$/)
+      if (colon && language !== "go") {
+        name = colon[1]!
+        type = typeName(colon[2]!)
+      } else if (language === "go") {
+        const go = p.match(/^(\w+)\s+(.+)$/)
+        if (go) {
+          name = go[1]!
+          type = typeName(go[2]!)
+        }
+      } else {
+        // `Type name` — the last identifier is the name, the rest the type.
+        const typed = p.match(/^(.+?)\s+(\w+)$/)
+        if (typed) {
+          name = typed[2]!
+          type = typeName(typed[1]!)
+        }
+      }
+      if (name && type) result.set(name, type)
+    }
+  }
+  return result
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +258,10 @@ const DATACLASS_FIELD_RE = /(\w+)\s*:\s*(\w[\w.,\s|]*)\s*=\s*(?:Field|field|Colu
 // Member access chain in source: self.a.b.c(...)  or  this.a.b.c(...)
 const MEMBER_CHAIN_CALL_RE = /(?:this|self)\s*(\.\s*\w+(?:\s*\.\s*\w+)*)\s*\(/g
 
+// name.x.y.z( — a chain rooted at an identifier; kept only when that identifier
+// is a typed parameter of the enclosing symbol (see parameterTypesFromSignature).
+const PARAM_CHAIN_CALL_RE = /(?<![\w.])([A-Za-z_]\w*)\s*(\.\s*\w+(?:\s*\.\s*\w+)*)\s*\(/g
+
 // ---------------------------------------------------------------------------
 // DispatchResolver
 // ---------------------------------------------------------------------------
@@ -201,13 +302,17 @@ export class DispatchResolver {
    */
   private static buildCanonicalMap(svRows: SymbolVersionRow[]): Map<string, SymbolVersionRow[]> {
     const map = new Map<string, SymbolVersionRow[]>()
+    const add = (name: string, sv: SymbolVersionRow): void => {
+      const existing = map.get(name)
+      if (existing) existing.push(sv)
+      else map.set(name, [sv])
+    }
     for (const sv of svRows) {
-      const existing = map.get(sv.canonical_name)
-      if (existing) {
-        existing.push(sv)
-      } else {
-        map.set(sv.canonical_name, [sv])
-      }
+      add(sv.canonical_name, sv)
+      // A member is also reachable as `Owner.member`, which is how the chain
+      // walk asks for it. Python names its methods that way already; every
+      // other adapter names them bare and records the owner as data.
+      if (sv.parent_name && !sv.canonical_name.includes(".")) add(`${sv.parent_name}.${sv.canonical_name}`, sv)
     }
     return map
   }
@@ -864,6 +969,10 @@ export class DispatchResolver {
       const source = sv.body_source
       if (!source) continue
 
+      // Typed parameters and receivers are chain roots too: `c.JSON(...)`
+      // inside `func (c *Context) ...` is a call on Context.
+      const paramTypes = parameterTypesFromSignature(sv.signature, sv.language)
+
       const lines = source.split("\n")
       for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
         const line = lines[lineIdx] ?? ""
@@ -886,6 +995,26 @@ export class DispatchResolver {
             receiverExpression,
             methodName,
             line: sv.range_start_line + lineIdx,
+          })
+        }
+
+        if (paramTypes.size === 0) continue
+        const rootedRe = new RegExp(PARAM_CHAIN_CALL_RE.source, "g")
+        while ((match = rootedRe.exec(line)) !== null) {
+          const root = match[1]
+          const chainGroup = match[2]
+          if (!root || !chainGroup) continue
+          const rootType = paramTypes.get(root)
+          if (!rootType) continue
+          const chainPart = chainGroup.replace(/\s+/g, "")
+          const segments = chainPart.split(".").filter((s) => s.length > 0)
+          if (segments.length === 0) continue
+          callsites.push({
+            callerSvId: sv.symbol_version_id,
+            receiverExpression: root + chainPart,
+            methodName: segments[segments.length - 1] ?? "",
+            line: sv.range_start_line + lineIdx,
+            rootType,
           })
         }
       }
@@ -953,10 +1082,15 @@ export class DispatchResolver {
       return result
     }
 
-    // Find owning class — extract from stable_key (format: "file#Class.method")
-    // canonical_name may be just "method" without class prefix (TS adapter behavior)
+    // The owning class is data (symbols.parent_name, migration 028): every
+    // adapter knows the owner when it emits a member, and the tree-sitter
+    // adapter's keys carried it in a form the parsing below never read, so
+    // Go, Java, C#, Kotlin and PHP methods had no owner and no dispatch. The
+    // parsing stays as the fallback for rows written before the column.
     let ownerCanonical: string | null = null
-    if (callerSv.kind === "method") {
+    if (callerSv.parent_name) {
+      ownerCanonical = callerSv.parent_name
+    } else if (callerSv.kind === "method") {
       // First try canonical_name (Python adapter uses Class.method format)
       const dotIdx = callerSv.canonical_name.lastIndexOf(".")
       if (dotIdx !== -1) {
@@ -1331,7 +1465,9 @@ export class DispatchResolver {
     _snapshotId: string,
   ): Promise<DispatchResolution> {
     const chain = callsite.receiverExpression
-    const segments = chain.replace(/^(this|self)\./, "").split(".")
+    // A chain rooted at a typed parameter starts from that type; one rooted
+    // at this/self starts from the caller's owner.
+    const segments = callsite.rootType ? chain.split(".").slice(1) : chain.replace(/^(this|self)\./, "").split(".")
 
     if (segments.length === 0) {
       return {
@@ -1362,7 +1498,11 @@ export class DispatchResolver {
     }
 
     let ownerCanonical: string | null = null
-    if (callerSv.kind === "method") {
+    if (callerSv.parent_name) {
+      // The owner as data (migration 028); the parsing below is the fallback
+      // for rows written before the column existed.
+      ownerCanonical = callerSv.parent_name
+    } else if (callerSv.kind === "method") {
       const dotIdx = callerSv.canonical_name.lastIndexOf(".")
       if (dotIdx !== -1) {
         ownerCanonical = callerSv.canonical_name.substring(0, dotIdx)
@@ -1381,6 +1521,7 @@ export class DispatchResolver {
     } else if (callerSv.kind === "class") {
       ownerCanonical = callerSv.canonical_name
     }
+    if (callsite.rootType) ownerCanonical = callsite.rootType
 
     let currentTypes: string[] = ownerCanonical ? [ownerCanonical] : []
     let currentSvIds: string[] = []

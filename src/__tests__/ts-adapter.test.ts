@@ -49,6 +49,50 @@ function ofType(h: any[], t: string) {
   return h.filter((x: any) => x.hint_type === t)
 }
 
+// Members without bodies of their own were resolution targets but never
+// symbols, so a reference to `this.config` resolved to a key nothing carried
+// and the edge was dropped. Interface and enum members were also visited
+// under the wrong parent.
+describe("Members are symbols keyed under their owner", () => {
+  const source = [
+    "interface Store { get(key: string): string; size: number }",
+    "enum Color { Red, Green }",
+    "class Service {",
+    "  private config = new Map<string, string>()",
+    "  get name(): string { return 'svc' }",
+    "  set name(v: string) { this.config.set('name', v) }",
+    "  paint(c: Color): string { return this.config.get(String(c)) ?? '' }",
+    "}",
+  ].join("\n")
+
+  test("class properties, accessors, interface members and enum members are symbols with owner keys", async () => {
+    const syms = await symbols(source)
+    const byKey = new Map(syms.map((s: any) => [s.stable_key.split("#")[1], s.kind]))
+    expect(byKey.get("Service.config")).toBe("property")
+    expect(byKey.get("Service.name")).toBe("accessor")
+    expect(byKey.get("Store.get")).toBe("method")
+    expect(byKey.get("Store.size")).toBe("property")
+    expect(byKey.get("Color.Red")).toBe("enum_member")
+    expect(byKey.get("Color.Green")).toBe("enum_member")
+  })
+
+  test("a getter and its setter are one symbol, not two", async () => {
+    const syms = await symbols(source)
+    expect(syms.filter((s: any) => s.stable_key.endsWith("#Service.name"))).toHaveLength(1)
+  })
+
+  test("a reference to a property now lands on a symbol", async () => {
+    const result = await extract(source)
+    // Compare by member key: the ingestor normalizes both sides to one path
+    // form, which this in-memory extraction does not.
+    const member = (key: string) => key.split("#")[1]
+    const propertyMembers = new Set(result.symbols.filter((s: any) => s.kind === "property").map((s: any) => member(s.stable_key)))
+    const toProperty = result.relations.filter((r: any) => r.target_key && propertyMembers.has(member(r.target_key)))
+    expect(toProperty.length).toBeGreaterThan(0)
+    expect(toProperty.some((r: any) => member(r.source_key) === "Service.paint" && member(r.target_key) === "Service.config")).toBe(true)
+  })
+})
+
 // ── Behavioral Hints: Positive Cases ──
 
 describe("Behavioral Hints — Positive", () => {

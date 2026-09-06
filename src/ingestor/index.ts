@@ -1072,8 +1072,20 @@ export class Ingestor {
       const relPart = toPortableRelativePath(path.isAbsolute(filePart) ? path.relative(repoPath, filePart) : filePart)
       return sepIdx >= 0 ? relPart + key.substring(sepIdx) : relPart
     }
+    // A relation whose source is the file itself — an import, a module-level
+    // call, a top-level reference — has to come from a symbol, or it is
+    // dropped as unresolvable: 518 of gin's relations and 623 of flask's went
+    // that way. Every file therefore has a module symbol, keyed
+    // `<path>::__module__`, and a file-level source resolves to it whether the
+    // adapter wrote the bare path (Python) or the module key (tree-sitter).
+    const moduleKeyFor = (portablePath: string): string => `${portablePath}::__module__`
+    const filesNeedingModule = new Set<string>()
     for (const rel of extraction.relations) {
       rel.source_key = normalizeKey(rel.source_key)
+      if (!rel.source_key.includes("::") && !rel.source_key.includes("#")) {
+        rel.source_key = moduleKeyFor(rel.source_key)
+      }
+      if (rel.source_key.endsWith("::__module__")) filesNeedingModule.add(rel.source_key.slice(0, -"::__module__".length))
       // Declaration keys arrive absolute from the adapter and must land in the
       // same portable form as the symbols they point at, or an exact target
       // resolves to nothing and silently falls back to name matching.
@@ -1115,8 +1127,27 @@ export class Ingestor {
         stable_key: string
         canonical_name: string
         kind: string
+        parent_name: string | null
       }
     >()
+    // The owner of a member is in the key every adapter writes —
+    // `file::Parent.name` or `file#Parent.name` — and is stored as a column
+    // (migration 028) so readers ask data rather than parse keys. Test cases
+    // carry titles with dots that are not owners, hence the kind gate.
+    const MEMBER_KINDS = new Set(["method", "constructor", "property", "accessor", "enum_member"])
+    const parentNameFromKey = (stableKey: string, kind: string): string | null => {
+      if (!MEMBER_KINDS.has(kind)) return null
+      let sep = stableKey.indexOf("::")
+      let sepLen = 2
+      if (sep < 0) {
+        sep = stableKey.indexOf("#")
+        sepLen = 1
+      }
+      if (sep < 0) return null
+      const member = stableKey.slice(sep + sepLen)
+      const dot = member.lastIndexOf(".")
+      return dot > 0 ? canonicalNameForDb(member.slice(0, dot)) : null
+    }
     for (const sym of extraction.symbols) {
       // Stable key format: "filePath::SymbolName" or "filePath#SymbolName"
       let separatorIdx = sym.stable_key.indexOf("::")
@@ -1130,10 +1161,41 @@ export class Ingestor {
         sym.stable_key = separatorIdx >= 0 ? stableKeyPath + sym.stable_key.substring(separatorIdx) : stableKeyPath
       }
       shadowEntries.push({ sym, stableKeyPath })
+      filesNeedingModule.add(stableKeyPath)
       distinctSymInputs.set(sym.stable_key, {
         stable_key: sym.stable_key,
         canonical_name: canonicalNameForDb(sym.canonical_name),
         kind: sym.kind,
+        parent_name: parentNameFromKey(sym.stable_key, sym.kind),
+      })
+    }
+
+    // One module symbol per file in this extraction (see moduleKeyFor). It
+    // spans the file, carries no body of its own — the file is not a symbol's
+    // source — and is the source of every file-level relation.
+    for (const filePath of filesNeedingModule) {
+      const stableKey = moduleKeyFor(filePath)
+      if (distinctSymInputs.has(stableKey)) continue
+      const lines = await getFileLines(filePath)
+      const moduleSymbol: ExtractedSymbol = {
+        stable_key: stableKey,
+        canonical_name: canonicalNameForDb(filePath),
+        kind: "module",
+        range_start_line: 1,
+        range_start_col: 1,
+        range_end_line: Math.max(1, lines?.length ?? 1),
+        range_end_col: 1,
+        signature: `module ${filePath}`,
+        ast_hash: crypto.createHash("sha256").update(`module:${filePath}`).digest("hex"),
+        body_hash: crypto.createHash("sha256").update(`module:${filePath}`).digest("hex"),
+        visibility: "public",
+      }
+      shadowEntries.push({ sym: moduleSymbol, stableKeyPath: filePath })
+      distinctSymInputs.set(stableKey, {
+        stable_key: stableKey,
+        canonical_name: moduleSymbol.canonical_name,
+        kind: "module",
+        parent_name: null,
       })
     }
 
@@ -1143,7 +1205,7 @@ export class Ingestor {
     // is critical for the lookup map below.
     const symbolIdByStableKey = new Map<string, string>()
     if (distinctSymInputs.size > 0) {
-      const SYM_COLS = 6 // symbol_id, repo_id, stable_key, canonical_name, kind, logical_namespace
+      const SYM_COLS = 7 // symbol_id, repo_id, stable_key, canonical_name, kind, logical_namespace, parent_name
       const MAX_PARAMS = 30_000
       const maxRowsPerChunk = Math.max(1, Math.floor(MAX_PARAMS / SYM_COLS))
       const allRows = Array.from(distinctSymInputs.values()).map((s) => [
@@ -1153,6 +1215,7 @@ export class Ingestor {
         s.canonical_name,
         s.kind,
         null,
+        s.parent_name,
       ])
       for (let offset = 0; offset < allRows.length; offset += maxRowsPerChunk) {
         const chunk = allRows.slice(offset, offset + maxRowsPerChunk)
@@ -1160,16 +1223,19 @@ export class Ingestor {
         const params: unknown[] = []
         let idx = 1
         for (const r of chunk) {
-          valuesClauses.push(`($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5})`)
+          valuesClauses.push(
+            `($${idx}, $${idx + 1}, $${idx + 2}, $${idx + 3}, $${idx + 4}, $${idx + 5}, $${idx + 6})`,
+          )
           params.push(...r)
           idx += SYM_COLS
         }
         const mergeResult = await db.query(
-          `INSERT INTO symbols (symbol_id, repo_id, stable_key, canonical_name, kind, logical_namespace)
+          `INSERT INTO symbols (symbol_id, repo_id, stable_key, canonical_name, kind, logical_namespace, parent_name)
                      VALUES ${valuesClauses.join(", ")}
                      ON CONFLICT (repo_id, stable_key) DO UPDATE SET
                          canonical_name = EXCLUDED.canonical_name,
-                         kind = EXCLUDED.kind
+                         kind = EXCLUDED.kind,
+                         parent_name = EXCLUDED.parent_name
                      RETURNING symbol_id, stable_key`,
           params,
         )
@@ -1204,7 +1270,8 @@ export class Ingestor {
       // Extract body source from file using line ranges (uses per-file cache)
       const lines = await getFileLines(stableKeyPath)
       let bodySource: string | null = null
-      if (lines && sym.range_start_line >= 1 && sym.range_end_line >= sym.range_start_line) {
+      // A module symbol spans its file; the file is not its body.
+      if (sym.kind !== "module" && lines && sym.range_start_line >= 1 && sym.range_end_line >= sym.range_start_line) {
         const start = Math.max(0, sym.range_start_line - 1)
         const end = Math.min(lines.length, sym.range_end_line)
         let raw = lines.slice(start, end).join("\n")

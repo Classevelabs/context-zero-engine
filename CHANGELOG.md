@@ -15,6 +15,46 @@ re-embeds it against the stored corpus. Nothing else is lost.
 
 ### Fixed
 
+- **Tree-sitter languages and Python kept a fraction of the relations they
+  extracted.** Three defects, one mechanism. A relation whose source is the
+  file itself — an import, a module-level call — had no symbol to come from:
+  every file now has a module symbol, keyed `<path>::__module__`, and a
+  file-level source resolves to it whether the adapter wrote the bare path or
+  the module key. Call text was matched against bare names or nothing:
+  resolution now walks the caller's scopes outward — the same file, the same
+  directory (the package in Go, Java, C# and Kotlin), then the repository —
+  and `Owner.member` text finds that owner's member wherever it lives; only a
+  unique match at a scope counts, and the database is asked by the identifier
+  a chain ends in rather than the whole chain. Measured on the same
+  repositories in a fresh database: gin keeps 36.3% of its extracted
+  relations (19.4% before), flask 37.0% (6.5% before), with flask's import
+  edges 2 to 140.
+- **Dispatch resolution was dead for Go, Java, C#, Kotlin and PHP.** The
+  owning class was parsed from a dot in the canonical name or a `#` in the
+  key, and the tree-sitter adapter writes neither, so gin produced 0 dispatch
+  edges with 428 methods. Every adapter now records a member's owner as a
+  column (`symbols.parent_name`, migration 028); a Go method's owner is its
+  receiver type; and a chain rooted at a typed parameter or receiver — `c` in
+  `c.JSON(...)` inside `func (c *Context)`, a `Context ctx` in Java, `ctx:
+  Context` anywhere — is resolved from that type, where before only `this`
+  and `self` chains were collected at all.
+- **TypeScript properties, accessors, interface members and enum members were
+  resolution targets but never symbols.** A reference to `this.config` or
+  `Color.Red` resolved to a key nothing carried and the edge was dropped. They
+  are symbols now, keyed under their owner; a getter and its setter are one
+  member; interface and enum members are visited under their owner rather
+  than the owner's parent. The engine's own tree gains 1,967 property symbols.
+- **The Python extractor carried two dead method bodies.** In a class body
+  the last definition of a name wins silently, so the first
+  `_extract_contract_hint` and `_collect_raised_exceptions` never ran and an
+  edit to either read as a fix while changing nothing. The dead copies are
+  removed — output on a real module is byte-identical — and a test fails on
+  any class-level name defined twice.
+- **Bodies of every language were tokenized with the JavaScript rules.**
+  Python, Ruby and shell comments and Python docstrings stayed in as code, and
+  each language's keywords were its most frequent tokens, so a search for what
+  code does matched `def`, `self`, `func` and `nil`. Comments are stripped the
+  way the language writes them and each language brings its own keyword list.
 - **`scg_explain_relation` had never once answered.** Its query joined
   `evidence_bundles` on `inferred_relation_id`, a column that table does not
   have; the relation row carries `evidence_bundle_id`. Every call failed with

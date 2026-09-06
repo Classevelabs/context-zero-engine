@@ -486,7 +486,8 @@ Fields:
 - `repo_id`
 - `stable_key`
 - `canonical_name`
-- `kind`
+- `kind` — includes `module` (one per file, the source of file-level relations), `property`, `accessor` and `enum_member`
+- `parent_name` — the class, struct, interface, enum or receiver type that declares a member; NULL for top-level symbols
 - `logical_namespace`
 
 ### SymbolVersion

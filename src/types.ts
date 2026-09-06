@@ -23,6 +23,9 @@ export type SymbolKind =
   | "type_alias"
   | "enum"
   | "module"
+  | "property"
+  | "accessor"
+  | "enum_member"
 
 export type Visibility = "public" | "private" | "protected" | "internal" | "package"
 

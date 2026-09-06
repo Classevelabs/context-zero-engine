@@ -873,6 +873,19 @@ function cleanCommentText(raw: string): string | undefined {
  * Build a stable key from file path, optional parent name, and symbol name.
  * Format: "filePath::Parent.name" or "filePath::name"
  */
+/**
+ * The type a Go method is declared on: the last identifier of its receiver
+ * parameter, so `(c *Context)`, `(s Server)` and `(h *pkg.Handler)` all name
+ * the type and never the variable.
+ */
+function receiverTypeName(node: SyntaxNode): string | null {
+  const receiver = node.childForFieldName("receiver")
+  if (!receiver) return null
+  const identifiers = receiver.descendantsOfType("type_identifier")
+  const last = identifiers[identifiers.length - 1]
+  return last?.text || null
+}
+
 function makeStableKey(filePath: string, parentName: string | null, name: string): string {
   if (parentName) {
     return `${filePath}::${parentName}.${name}`
@@ -3454,7 +3467,12 @@ function walkNode(
         recurseChildren(node, ctx, parentName, parentClassNode)
         return
       }
-      emitSymbol(node, name, ctx, parentName, parentClassNode)
+      // A Go method belongs to its receiver type, not to a lexical parent:
+      // `func (c *Context) JSON(...)` is `Context.JSON`. Without the owner the
+      // key was `file::JSON`, and dispatch resolution — which needs to know
+      // what `c` is — found no owner for any Go method at all.
+      const owner = nodeType === "method_declaration" && lang === "go" ? receiverTypeName(node) : parentName
+      emitSymbol(node, name, ctx, owner, parentClassNode)
       return
     }
 

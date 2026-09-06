@@ -142,6 +142,8 @@ export interface SymbolVersionRow {
   canonical_name: string
   kind: string
   stable_key: string
+  /** Owner of a member (class, struct, interface, enum, receiver type); null for top-level symbols. */
+  parent_name?: string | null
   repo_id: string
   file_path: string
 }
@@ -173,6 +175,7 @@ export function validateSymbolVersionRow(row: QueryRow): SymbolVersionRow | null
     canonical_name: typeof row["canonical_name"] === "string" ? row["canonical_name"] : "",
     kind: typeof row["kind"] === "string" ? row["kind"] : "",
     stable_key: typeof row["stable_key"] === "string" ? row["stable_key"] : "",
+    parent_name: typeof row["parent_name"] === "string" ? row["parent_name"] : null,
     repo_id: typeof row["repo_id"] === "string" ? row["repo_id"] : "",
     file_path: typeof row["file_path"] === "string" ? row["file_path"] : "",
   }

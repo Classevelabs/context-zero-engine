@@ -149,6 +149,16 @@ function classifyKind(node: ts.Node, sourceFile: ts.SourceFile): string {
   // `constructor(private config: ApplicationConfig)`). Left unextracted, those
   // injected dependencies produced no edge and DI-heavy code read as isolated.
   if (ts.isConstructorDeclaration(node)) return "method"
+  // Members that are declarations without bodies of their own. They were
+  // resolution targets — a reference to `this.config` or `Color.Red` resolved
+  // to the key `File#Class.config` — but never symbols, so every such edge
+  // was dropped for want of a node to land on. An interface's method
+  // signature is a method for the same purpose: implementations and callers
+  // point at it.
+  if (ts.isPropertyDeclaration(node) || ts.isPropertySignature(node)) return "property"
+  if (ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) return "accessor"
+  if (ts.isEnumMember(node)) return "enum_member"
+  if (ts.isMethodSignature(node)) return "method"
   if (ts.isFunctionDeclaration(node)) {
     const text = node.getText(sourceFile)
     if (/router\.(get|post|put|delete|patch)|app\.(get|post|put|delete|patch)/.test(text)) {
@@ -665,6 +675,11 @@ function extractFromSourceFile(
     }
   }
 
+  // A getter and its setter share one key — they are one member — and only
+  // the first declaration becomes the symbol; both bodies still contribute
+  // their references under that key.
+  const emittedKeys = new Set<string>()
+
   function visit(node: ts.Node, parentKey?: string): void {
     if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)) {
       if (extractTestBlock(node, node.expression)) return
@@ -679,6 +694,12 @@ function extractFromSourceFile(
       ts.isEnumDeclaration(node) ||
       ts.isMethodDeclaration(node) ||
       (INDEX_CONSTRUCTORS && ts.isConstructorDeclaration(node)) ||
+      ts.isPropertyDeclaration(node) ||
+      ts.isPropertySignature(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node) ||
+      ts.isMethodSignature(node) ||
+      ts.isEnumMember(node) ||
       (isTopLevelVariableStatement && node.declarationList.declarations.length > 0)
 
     if (isExtractable) {
@@ -877,7 +898,7 @@ function extractFromSourceFile(
           uncertaintyFlags.push("normalization_failure")
         }
 
-        symbols.push({
+        if (!emittedKeys.has(stableKey)) symbols.push({
           stable_key: stableKey,
           canonical_name: name,
           kind: classifyKind(node, sourceFile),
@@ -891,11 +912,18 @@ function extractFromSourceFile(
           normalized_ast_hash: normalizedAstHash,
           visibility: getVisibility(node),
         })
+        emittedKeys.add(stableKey)
 
         // Extract behavior hints from function/method bodies.
         // External-effect categories come from the TYPE-RESOLVED analyzer;
         // syntactic patterns (on code-only text) fill the local categories.
-        if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node)) {
+        if (
+          ts.isFunctionDeclaration(node) ||
+          ts.isMethodDeclaration(node) ||
+          ts.isConstructorDeclaration(node) ||
+          ts.isGetAccessorDeclaration(node) ||
+          ts.isSetAccessorDeclaration(node)
+        ) {
           extractBehaviorHints(codeOnlyScanText(node, sourceFile), stableKey, startLine + 1, behaviorHints)
           for (const resolved of resolveEffectHints(node, sourceFile, checker)) {
             behaviorHints.push({
@@ -905,10 +933,15 @@ function extractFromSourceFile(
               line: resolved.line,
             })
           }
-          // A constructor has parameters but no return contract; the contract
+          // A constructor has parameters but no return contract, and an
+          // accessor has neither in the shape the contract miner reads; the
           // miner is written for function/method return-and-error shapes, so
-          // skip it for constructors while still taking their behavior/effects.
-          if (!ts.isConstructorDeclaration(node)) {
+          // skip it for those while still taking their behavior/effects.
+          if (
+            !ts.isConstructorDeclaration(node) &&
+            !ts.isGetAccessorDeclaration(node) &&
+            !ts.isSetAccessorDeclaration(node)
+          ) {
             extractContractHint(node, sourceFile, checker, stableKey, contractHints, uncertaintyFlags)
           }
         }
@@ -935,6 +968,14 @@ function extractFromSourceFile(
             }
           }
           return // Don't recurse again
+        }
+
+        // Interface and enum members are keyed under their owner, exactly as
+        // class members are; falling through to the generic recursion visited
+        // them under the owner's parent instead.
+        if (ts.isInterfaceDeclaration(node) || ts.isEnumDeclaration(node)) {
+          node.members.forEach((member) => visit(member, name))
+          return
         }
       }
     }

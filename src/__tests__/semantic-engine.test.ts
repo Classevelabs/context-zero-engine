@@ -775,6 +775,45 @@ describe("end-to-end tokenizer → similarity pipeline", () => {
   })
 })
 
+// ────────── Language-aware body tokenization ──────────
+
+// Bodies of every language were tokenized with the JavaScript rules: `#`
+// comments and docstrings stayed in as code, and each language's keywords were
+// its most frequent tokens, so "what does this do" matched `def` and `self`.
+describe("tokenizeBody by language", () => {
+  it("strips Python docstrings and hash comments, and Python keywords", () => {
+    const tokens = tokenizeBody(
+      'def load(self, path):\n    """Read the manifest from disk."""\n    # parse it\n    return parseManifest(path)\n',
+      "python",
+    )
+    expect(tokens).toEqual(expect.arrayContaining(["load", "path", "parse", "manifest"]))
+    for (const noise of ["def", "self", "read", "disk", "manifest_from", "parse_it"]) expect(tokens).not.toContain(noise)
+    expect(tokens.filter((t) => t === "manifest")).toHaveLength(1)
+  })
+
+  it("drops Go keywords and the ubiquitous error vocabulary", () => {
+    const tokens = tokenizeBody("func (c *Context) Render(w io.Writer) error {\n  if err := c.write(w); err != nil { return err }\n  return nil\n}", "go")
+    expect(tokens).toEqual(expect.arrayContaining(["render", "write", "writer"]))
+    for (const noise of ["func", "nil", "err", "error"]) expect(tokens).not.toContain(noise)
+  })
+
+  it("keeps C-style stripping for languages that use it, and treats # as code there", () => {
+    const tokens = tokenizeBody("// note\nconst value = compute(input) // #hashtag\n", "typescript")
+    expect(tokens).toEqual(expect.arrayContaining(["value", "compute", "input"]))
+    expect(tokens).not.toContain("note")
+    expect(tokens).not.toContain("hashtag")
+  })
+
+  it("is the JavaScript behaviour when no language is given", () => {
+    expect(tokenizeBody("const x = doThing()")).toEqual(tokenizeBody("const x = doThing()", "typescript"))
+  })
+
+  it("strips Ruby block comments and PHP hash comments", () => {
+    expect(tokenizeBody("=begin\nold notes\n=end\ndef run; helper; end", "ruby")).not.toContain("notes")
+    expect(tokenizeBody("<?php\n# legacy\nfunction go() { return helper(); }", "php")).not.toContain("legacy")
+  })
+})
+
 // ────────── Packed MinHash Storage ──────────
 
 describe("packMinHash / unpackMinHash", () => {

@@ -154,14 +154,70 @@ export function tokenizeName(name: string): string[] {
  * callers that need set semantics (e.g. MinHash) wrap the result in new Set().
  */
 /** Max code size for tokenization — beyond this, truncate to prevent CPU spike */
-export function tokenizeBody(code: string): string[] {
+/**
+ * Keywords and library nouns that carry no meaning about what a body does,
+ * by language. The base set is JavaScript and TypeScript; a language adds its
+ * own. These are the language's vocabulary, not a table of expected inputs:
+ * `def`, `self` and `None` are in every Python body, `func`, `nil` and `err`
+ * in every Go body, and a search for "what does this do" gains nothing from
+ * matching them. Before this, Python and Go bodies were tokenized with the
+ * JavaScript list alone, so their most common tokens were their keywords.
+ */
+const LANGUAGE_NOISE: Record<string, readonly string[]> = {
+  python: ["def", "self", "cls", "none", "elif", "lambda", "pass", "yield", "with", "as", "not", "and", "or", "is", "in", "del", "global", "nonlocal", "raise", "except", "try", "finally", "assert", "print", "str", "int", "dict", "list", "tuple", "set", "bool", "float", "bytes", "object", "len", "range", "isinstance", "super", "kwargs", "args"],
+  go: ["func", "nil", "package", "defer", "go", "chan", "range", "struct", "map", "err", "error", "int", "int64", "int32", "uint", "bool", "byte", "fmt", "len", "append", "make", "ctx", "context", "errors", "errorf", "sprintf"],
+  rust: ["fn", "pub", "let", "mut", "impl", "struct", "enum", "trait", "use", "mod", "crate", "self", "match", "ref", "dyn", "where", "some", "none", "ok", "err", "vec", "box", "str", "u8", "u16", "u32", "u64", "i32", "i64", "usize", "bool", "result", "option", "unwrap", "clone", "into", "iter", "as", "loop", "unsafe"],
+  java: ["public", "private", "protected", "static", "final", "int", "long", "double", "float", "char", "byte", "short", "object", "override", "throws", "throw", "catch", "try", "finally", "instanceof", "package", "abstract", "synchronized", "list", "map", "set", "integer"],
+  kotlin: ["fun", "val", "var", "override", "private", "public", "internal", "protected", "object", "companion", "data", "when", "is", "as", "in", "int", "long", "unit", "list", "map", "set", "lateinit", "suspend"],
+  csharp: ["public", "private", "protected", "internal", "static", "readonly", "override", "virtual", "namespace", "using", "int", "long", "double", "object", "var", "get", "set", "async", "await", "task", "list", "dictionary", "foreach", "is", "as", "throw", "catch", "try", "finally"],
+  ruby: ["def", "end", "nil", "self", "do", "module", "require", "attr", "accessor", "reader", "writer", "unless", "elsif", "puts", "raise", "rescue", "ensure", "yield", "block", "each", "hash", "array"],
+  php: ["function", "echo", "namespace", "use", "public", "private", "protected", "static", "array", "isset", "unset", "empty", "foreach", "as", "self", "parent", "throw", "catch", "try", "finally", "instanceof", "int", "bool", "mixed", "void"],
+  c: ["int", "char", "long", "short", "double", "float", "unsigned", "signed", "struct", "typedef", "sizeof", "static", "extern", "include", "define", "ifdef", "endif", "goto", "malloc", "free", "printf", "size", "len", "buf", "ptr"],
+  cpp: ["int", "char", "long", "short", "double", "float", "unsigned", "signed", "struct", "typedef", "sizeof", "static", "extern", "include", "define", "ifdef", "endif", "nullptr", "std", "template", "typename", "namespace", "using", "auto", "virtual", "override", "public", "private", "protected", "size", "len", "ptr"],
+  swift: ["func", "let", "var", "guard", "nil", "self", "struct", "enum", "protocol", "extension", "override", "private", "public", "internal", "fileprivate", "throws", "throw", "try", "catch", "some", "any", "int", "string", "bool", "double"],
+  bash: ["echo", "local", "then", "elif", "fi", "done", "esac", "exit", "shift", "eval", "printf", "test"],
+}
+const noiseCache = new Map<string, Set<string>>()
+function noiseFor(language: string | undefined): Set<string> {
+  const key = language ?? "typescript"
+  const cached = noiseCache.get(key)
+  if (cached) return cached
+  const merged = new Set(NOISE_WORDS)
+  for (const word of LANGUAGE_NOISE[key] ?? []) merged.add(word)
+  noiseCache.set(key, merged)
+  return merged
+}
+
+/** Languages whose comments are `#` lines; everything else is C-style. */
+const HASH_COMMENT_LANGUAGES = new Set(["python", "ruby", "bash", "sh", "shell"])
+
+/**
+ * Remove comments the way the language writes them. C-style stripping alone
+ * left every `#` comment and every docstring in Python, Ruby and shell bodies
+ * as code, so the prose in a docstring was tokenized as if it were identifiers.
+ */
+function stripComments(input: string, language: string | undefined): string {
+  let out = input
+  if (language === "python") {
+    out = out.replace(/"""[\s\S]*?"""/g, "").replace(/'''[\s\S]*?'''/g, "")
+  }
+  if (language && HASH_COMMENT_LANGUAGES.has(language)) {
+    out = out.replace(/#.*$/gm, "")
+    if (language === "ruby") out = out.replace(/^=begin[\s\S]*?^=end/gm, "")
+    return out
+  }
+  out = out.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
+  if (language === "php") out = out.replace(/#.*$/gm, "")
+  return out
+}
+
+export function tokenizeBody(code: string, language?: string): string[] {
   // Truncate extremely large bodies to prevent regex backtracking / CPU spike.
   // 100K chars covers ~2500 lines — sufficient for TF-IDF token extraction.
   const input = code.length > MAX_TOKENIZE_LENGTH ? code.slice(0, MAX_TOKENIZE_LENGTH) : code
 
-  // Strip comments: single-line and multi-line
-  let stripped = input.replace(/\/\/.*$/gm, "")
-  stripped = stripped.replace(/\/\*[\s\S]*?\*\//g, "")
+  let stripped = stripComments(input, language)
+  const noise = noiseFor(language)
 
   // Strip string literals (single-quoted, double-quoted, backtick)
   stripped = stripped.replace(/'(?:[^'\\]|\\.)*'/g, "")
@@ -190,7 +246,7 @@ export function tokenizeBody(code: string): string[] {
     const parts = splitCompoundName(ident)
     for (const part of parts) {
       const normalized = normalizeToken(part)
-      if (normalized !== "" && !NOISE_WORDS.has(normalized)) {
+      if (normalized !== "" && !noise.has(normalized)) {
         tokens.push(normalized)
         if (tokens.length >= MAX_TOKENS_PER_VIEW) return tokens
       }

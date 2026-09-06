@@ -288,10 +288,11 @@ class SemanticEngine {
     signature: string,
     behaviorHints: BehaviorHint[],
     contractHint: ContractHint | null,
+    language?: string,
   ): Record<ViewType, string[]> {
     return {
       name: tokenizeName(name),
-      body: tokenizeBody(code),
+      body: tokenizeBody(code, language),
       signature: tokenizeSignature(signature),
       behavior: tokenizeBehavior(behaviorHints.map((h) => ({ hint_type: h.hint_type, detail: h.detail }))),
       contract: contractHint
@@ -325,6 +326,8 @@ class SemanticEngine {
      * after every edit.
      */
     preloadedIdf?: SnapshotIdf,
+    /** The symbol's language, so the body is tokenized with that language's comments and keywords. */
+    language?: string,
   ): Promise<void> {
     const done = log.startTimer("embedSymbol", { symbolVersionId })
 
@@ -332,7 +335,7 @@ class SemanticEngine {
       // Step 1: Generate token streams for all 5 views
       const viewTokens: Record<ViewType, string[]> = {
         name: tokenizeName(name),
-        body: tokenizeBody(code),
+        body: tokenizeBody(code, language),
         signature: tokenizeSignature(signature),
         behavior: tokenizeBehavior(behaviorHints.map((h) => ({ hint_type: h.hint_type, detail: h.detail }))),
         contract: contractHint
@@ -709,6 +712,7 @@ class SemanticEngine {
           behaviorHints,
           contractHint,
           corpus,
+          symbol.language,
         )
         embedded++
       }
@@ -760,6 +764,7 @@ class SemanticEngine {
               symbol.signature,
               behaviorHints,
               contractHint,
+              symbol.language,
             ),
           }
         })

@@ -890,6 +890,70 @@ describe("Ingestor — Snapshot status transitions", () => {
   })
 })
 
+// A relation whose source is the file itself — an import, a module-level
+// call — had no symbol to come from and was dropped; and a member's owner
+// lived only inside its key. Every file now gets a module symbol, and the
+// owner is written as a column.
+describe("Ingestor — Module symbols and owners", () => {
+  test("mints a module symbol per file, routes file-level sources to it, and writes each member's owner", async () => {
+    setupLockAcquired()
+    mockStat.mockResolvedValueOnce({ isDirectory: () => true })
+    mockReaddir.mockResolvedValueOnce([makeDirent("svc.ts", { isFile: true })])
+    mockLstat.mockResolvedValue({ isSymbolicLink: () => false })
+    mockStat.mockResolvedValueOnce({ size: 100 })
+    mockReadFile.mockResolvedValue(Buffer.from("class Service {\n  run() {}\n}\n"))
+
+    const symbol = (stable_key: string, canonical_name: string, kind: string) => ({
+      stable_key,
+      canonical_name,
+      kind,
+      range_start_line: 1,
+      range_start_col: 0,
+      range_end_line: 2,
+      range_end_col: 0,
+      signature: "",
+      ast_hash: "a",
+      body_hash: "b",
+      visibility: "public",
+    })
+    mockExtractFromTypeScript.mockReturnValue({
+      symbols: [symbol("svc.ts#Service", "Service", "class"), symbol("svc.ts#Service.run", "run", "method")],
+      relations: [{ source_key: "svc.ts", target_name: "helper", relation_type: "imports" }],
+      behavior_hints: [],
+      contract_hints: [],
+      parse_confidence: 1.0,
+      uncertainty_flags: [],
+    })
+    mockQuery.mockImplementation(async (text: string, params?: unknown[]) => {
+      if (text.includes("SELECT file_id, path FROM files")) return { rows: [{ file_id: "f-1", path: "svc.ts" }], rowCount: 1 }
+      if (text.includes("INSERT INTO symbols")) {
+        // Echo the keys back as merged symbols, as the database would.
+        const rows = []
+        for (let i = 0; i < (params?.length ?? 0); i += 7) rows.push({ symbol_id: `id-${params![i + 2]}`, stable_key: params![i + 2] })
+        return { rows, rowCount: rows.length }
+      }
+      return { rows: [], rowCount: 0 }
+    })
+
+    await ingestor.ingestRepo("/repo", "test-repo", "abc123")
+
+    const merge = mockQuery.mock.calls.find((call: any[]) => String(call[0]).includes("INSERT INTO symbols"))
+    expect(String(merge?.[0])).toContain("parent_name")
+    const params = merge?.[1] as unknown[]
+    const rows: unknown[][] = []
+    for (let i = 0; i < params.length; i += 7) rows.push(params.slice(i, i + 7))
+    const byKey = new Map(rows.map((r) => [r[2] as string, r]))
+
+    // The method's owner is data, the class's is null.
+    expect(byKey.get("svc.ts#Service.run")?.[6]).toBe("Service")
+    expect(byKey.get("svc.ts#Service")?.[6]).toBeNull()
+    // The file's module symbol exists and is what the import comes from.
+    expect(byKey.get("svc.ts::__module__")?.[4]).toBe("module")
+    const relations = (mockComputeRelationsFromRaw.mock.calls[0]?.[2] ?? []) as { source_key: string }[]
+    expect(relations.map((r) => r.source_key)).toEqual(["svc.ts::__module__"])
+  })
+})
+
 describe("Ingestor — Repository and snapshot creation", () => {
   test("creates repository with correct parameters", async () => {
     setupLockAcquired()

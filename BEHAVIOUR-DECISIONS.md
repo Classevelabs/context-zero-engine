@@ -178,6 +178,54 @@ lines in the startup log of a session that only listed tools.
 
 ---
 
+## 2026-09-06 — Every file has a module symbol, and names resolve by scope
+
+**Decision.** The ingestor mints one `module` symbol per extracted file,
+keyed `<path>::__module__`, spanning the file with no body, and rewrites a
+bare-path relation source to it. The structural graph resolves a target from
+the caller's scopes outward — same file, same directory, whole repository —
+accepting only a unique match at each; `Owner.member` text resolves to that
+owner's member anywhere; the database fallback is asked by the last segment.
+
+**Why it is not arbitrary.** File-level relations were dropped for want of a
+source, and call text was compared against bare names: gin kept 19% of what
+it extracted, flask 6.5%. Directory-as-package is how Go, Java, C# and Kotlin
+actually scope names, and same-file-first is right in every language because
+of shadowing. Ambiguity records nothing, because a confident wrong edge is
+worse than none.
+
+**Verified against.** `analysis-engine-extended.test.ts` scope cases;
+`ingestor.test.ts` module and owner rows; fresh-database ingest of gin (36.3%
+kept), flask (37.0%), and the engine itself (42.7%, 159 module symbols).
+
+**Regression looks like.** Import edges near zero on any non-TypeScript
+repository, or a caller whose same-file helper resolves to a namesake
+elsewhere.
+
+---
+
+## 2026-09-06 — A member's owner is data, and a typed parameter is a chain root
+
+**Decision.** `symbols.parent_name` (migration 028) holds the owner every
+adapter already knows; a Go method's owner is its receiver type. The dispatch
+resolver reads the column and looks members up as `Owner.member`; it collects
+call chains rooted at any typed parameter or receiver as well as `this` and
+`self`, with one signature parser for every language's spelling.
+
+**Why it is not arbitrary.** Owners lived only in key strings the resolver
+parsed for one separator, so Go, Java, C#, Kotlin and PHP had none; and even
+with the owner known, chains through parameters were never collected, so a
+Go method call on its receiver `c` was invisible. gin: 0 dispatch edges.
+
+**Verified against.** `parameterTypesFromSignature` tests across six
+languages; the Go receiver chain test producing an edge; the fresh-database
+probe recorded in the changelog.
+
+**Regression looks like.** `scg_get_dispatch` empty on Go or Java code, or
+`symbols with parent` at zero for a tree-sitter language.
+
+---
+
 ## 2026-09-06 — Every column the engine's SQL names is checked against the schema
 
 **Decision.** `sql-schema-contract.test.ts` parses `db/schema.sql` into tables

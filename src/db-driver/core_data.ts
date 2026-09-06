@@ -749,7 +749,7 @@ export class CoreDataService {
   public async getSymbolVersionsForSnapshot(snapshot_id: string): Promise<SymbolVersionRow[]> {
     const result = await db.query(
       `
-            SELECT sv.*, s.canonical_name, s.kind, s.stable_key, s.repo_id, f.path as file_path
+            SELECT sv.*, s.canonical_name, s.kind, s.stable_key, s.parent_name, s.repo_id, f.path as file_path
             FROM symbol_versions sv
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id

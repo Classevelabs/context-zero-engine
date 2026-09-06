@@ -990,8 +990,103 @@ describe("DeepContractSynthesizer", () => {
 // 4. DISPATCH RESOLVER
 // =====================================================================
 
+describe("parameterTypesFromSignature", () => {
+  const { parameterTypesFromSignature } = require("../analysis-engine/dispatch-resolver")
+  const types = (sig: string, lang: string) => Object.fromEntries(parameterTypesFromSignature(sig, lang))
+
+  test("Go: receiver and parameters, pointers and package prefixes stripped", () => {
+    expect(types("func (c *Context) JSON(code int, obj any)", "go")).toEqual({ c: "Context", code: "int", obj: "any" })
+    expect(types("func handle(w http.ResponseWriter, r *http.Request)", "go")).toEqual({ w: "ResponseWriter", r: "Request" })
+  })
+
+  test("Java and C#: type before name, annotations and generics ignored", () => {
+    expect(types("void run(@Nonnull final Context ctx, List<String> names)", "java")).toEqual({ ctx: "Context", names: "List" })
+    expect(types("public Task Handle(ILogger<Foo> logger, CancellationToken token)", "csharp")).toEqual({ logger: "ILogger", token: "CancellationToken" })
+  })
+
+  test("TypeScript, Python, Kotlin, Swift: name before type, optional and defaulted parameters", () => {
+    expect(types("(ctx?: Context, retries: number = 3): Promise<void>", "typescript")).toEqual({ ctx: "Context", retries: "number" })
+    expect(types("def handle(self, request: Request, timeout=5) -> Response", "python")).toEqual({ request: "Request" })
+    expect(types("fun render(view: View, depth: Int): Unit", "kotlin")).toEqual({ view: "View", depth: "Int" })
+  })
+
+  test("untyped parameters and this/self are not roots", () => {
+    expect(types("function f(a, b) {", "javascript")).toEqual({})
+    expect(types("def f(self, x)", "python")).toEqual({})
+  })
+})
+
 describe("DispatchResolver", () => {
   const resolver = new DispatchResolver()
+
+  // Chains were only collected from `this` and `self`, so a receiver named in
+  // the signature — every Go method, every call through a typed parameter —
+  // produced no dispatch. gin: 428 methods with owners, 0 dispatch edges.
+  describe("chains rooted at a typed parameter or receiver", () => {
+    const row = (overrides: Record<string, unknown>) => ({
+      symbol_version_id: "sv",
+      symbol_id: "sym",
+      snapshot_id: "snap-1",
+      file_id: "f1",
+      range_start_line: 1,
+      range_start_col: 0,
+      range_end_line: 3,
+      range_end_col: 0,
+      signature: "",
+      ast_hash: "",
+      body_hash: "",
+      summary: "",
+      body_source: "",
+      visibility: "public",
+      language: "go",
+      uncertainty_flags: [],
+      canonical_name: "",
+      kind: "function",
+      stable_key: "",
+      parent_name: null,
+      repo_id: "repo-1",
+      file_path: "ctx.go",
+      ...overrides,
+    })
+
+    test("resolves `c.JSON(...)` inside `func (c *Context)` to Context.JSON", async () => {
+      const { coreDataService } = require("../db-driver/core_data")
+      coreDataService.getSymbolVersionsForSnapshot.mockResolvedValue([
+        row({ symbol_version_id: "sv-ctx", symbol_id: "sym-ctx", canonical_name: "Context", kind: "class", stable_key: "ctx.go::Context" }),
+        row({
+          symbol_version_id: "sv-json",
+          symbol_id: "sym-json",
+          canonical_name: "JSON",
+          kind: "method",
+          stable_key: "ctx.go::Context.JSON",
+          parent_name: "Context",
+          signature: "func (c *Context) JSON(code int, obj any)",
+          body_source: "func (c *Context) JSON(code int, obj any) { c.Render(code, obj) }",
+        }),
+        row({
+          symbol_version_id: "sv-handler",
+          symbol_id: "sym-handler",
+          file_id: "f2",
+          file_path: "routes.go",
+          canonical_name: "handler",
+          signature: "func handler(c *Context)",
+          body_source: "func handler(c *Context) {\n  c.JSON(200, nil)\n}",
+        }),
+      ])
+      mockQuery.mockResolvedValue({ rows: [], rowCount: 0 })
+      mockBatchInsert.mockClear()
+
+      const edges = await resolver.resolveDispatches("snap-1", "repo-1")
+
+      expect(edges).toBeGreaterThanOrEqual(1)
+      const inserts = (mockBatchInsert.mock.calls.at(-1)?.[0] as { text: string; params: unknown[] }[]).filter((s) =>
+        s.text.includes("INSERT INTO dispatch_edges"),
+      )
+      const edge = inserts.find((s) => s.params[2] === "sv-handler")
+      expect(edge?.params[3]).toBe("c.JSON")
+      expect(edge?.params[5]).toEqual(["sv-json"])
+    })
+  })
 
   describe("C3 linearization", () => {
     test("handles single class with no parents", () => {
@@ -1682,6 +1777,78 @@ describe("StructuralGraphEngine", () => {
 
       const result = await sge.computeRelationsFromRaw("snap-1", "repo-1", relations)
       expect(result).toBe(0)
+    })
+
+    // Names are scoped and the scopes are in the keys. Before the ladder,
+    // call text was matched against bare names or nothing: gin kept 19% of
+    // the relations it extracted, flask 6.5%.
+    describe("resolves by scope, from the caller outward", () => {
+      const persistedTargets = (): string[] =>
+        (mockBatchInsert.mock.calls.at(-1)?.[0] as { params: unknown[] }[]).map((s) => s.params[2] as string)
+
+      beforeEach(() => {
+        mockBatchInsert.mockClear()
+        const { coreDataService } = require("../db-driver/core_data")
+        coreDataService.getSymbolIdentitiesForSnapshot.mockResolvedValue([
+          { stable_key: "pkg/a.go::handle", canonical_name: "handle", symbol_version_id: "sv-a-handle" },
+          { stable_key: "pkg/b.go::handle", canonical_name: "handle", symbol_version_id: "sv-b-handle" },
+          { stable_key: "other/c.go::handle", canonical_name: "handle", symbol_version_id: "sv-c-handle" },
+          { stable_key: "pkg/a.go::caller", canonical_name: "caller", symbol_version_id: "sv-caller" },
+          { stable_key: "other/c.go::farCaller", canonical_name: "farCaller", symbol_version_id: "sv-far" },
+          { stable_key: "pkg/ctx.go::Context.JSON", canonical_name: "JSON", symbol_version_id: "sv-ctx-json" },
+          { stable_key: "pkg/a.go::__module__", canonical_name: "pkg/a.go", symbol_version_id: "sv-mod-a" },
+          { stable_key: "lib/only.go::unique", canonical_name: "unique", symbol_version_id: "sv-unique" },
+        ])
+      })
+
+      test("a name defined in the caller's own file wins over the same name elsewhere", async () => {
+        const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
+          { source_key: "pkg/a.go::caller", target_name: "handle", relation_type: "calls" as const },
+        ])
+        expect(n).toBe(1)
+        expect(persistedTargets()).toEqual(["sv-a-handle"])
+      })
+
+      test("then the caller's directory — the package — before the repository", async () => {
+        // From other/c.go, `handle` has a same-file definition; from a file in
+        // pkg/ with none of its own, the package's one is ambiguous (a.go and
+        // b.go both define it), so nothing is recorded rather than a guess.
+        const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
+          { source_key: "other/c.go::farCaller", target_name: "handle", relation_type: "calls" as const },
+          { source_key: "pkg/ctx.go::Context.JSON", target_name: "handle", relation_type: "calls" as const },
+        ])
+        expect(n).toBe(1)
+        expect(persistedTargets()).toEqual(["sv-c-handle"])
+      })
+
+      test("`Owner.member` call text resolves to that owner's member wherever it lives", async () => {
+        const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
+          { source_key: "other/c.go::farCaller", target_name: "Context.JSON", relation_type: "calls" as const },
+          { source_key: "other/c.go::farCaller", target_name: "c.JSON", relation_type: "calls" as const },
+        ])
+        // The first names the owner; the second names a variable, and JSON is
+        // unique in the repository, so both land on the same member.
+        expect(n).toBe(2)
+        expect(persistedTargets()).toEqual(["sv-ctx-json", "sv-ctx-json"])
+      })
+
+      test("a file-level relation comes from the file's module symbol", async () => {
+        const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
+          { source_key: "pkg/a.go::__module__", target_name: "lib.unique", relation_type: "imports" as const },
+        ])
+        expect(n).toBe(1)
+        expect(persistedTargets()).toEqual(["sv-unique"])
+      })
+
+      test("the database is asked by the identifier a chain ends in, not the chain", async () => {
+        mockQuery.mockResolvedValueOnce({ rows: [{ symbol_version_id: "sv-db", canonical_name: "Split" }], rowCount: 1 })
+        const n = await sge.computeRelationsFromRaw("snap-1", "repo-1", [
+          { source_key: "pkg/a.go::caller", target_name: "strings.Split", relation_type: "calls" as const },
+        ])
+        const lookup = mockQuery.mock.calls.find((c) => String(c[0]).includes("canonical_name IN"))
+        expect(lookup?.[1]).toEqual(["repo-1", "snap-1", "Split"])
+        expect(n).toBe(1)
+      })
     })
   })
 
