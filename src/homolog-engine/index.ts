@@ -13,7 +13,7 @@
  *   6. Test overlap                   — 0.10
  *   7. History co-change              — 0.05
  *
- * Candidate generation uses 5 buckets:
+ * Candidate generation uses these buckets:
  *   - body_hash exact match
  *   - ast_hash exact match
  *   - Name similarity (pg_trgm)
@@ -33,9 +33,6 @@ import { db } from "../db-driver"
 import { BatchLoader } from "../db-driver/batch-loader"
 import { mapWithConcurrency } from "../concurrency"
 import {
-  firstRow,
-  parseCountField,
-  numberField,
   validateBehavioralProfile,
   validateContractProfile,
 } from "../db-driver/result"
@@ -57,6 +54,14 @@ import { HOMOLOG_WEIGHTS, MIN_EVIDENCE_FAMILIES, DEFAULT_HOMOLOG_CONFIDENCE_THRE
 const HOMOLOG_SCORING_CONCURRENCY = 8
 
 const log = new Logger("homolog-engine")
+
+/** Per-target lookups shared by every candidate's scoring. */
+interface TargetContext {
+  /** Other symbol version -> number of test artifacts covering it and the target. */
+  sharedTests: Map<string, number>
+  /** Other symbol version -> strongest co_changed_with confidence with the target. */
+  coChangeConfidence: Map<string, number>
+}
 
 interface CandidateRow {
   symbol_version_id: string
@@ -119,6 +124,11 @@ export class HomologInferenceEngine {
       profileCache.set(`cp:${svId}`, cp)
     }
 
+    // Test coverage and co-change history are properties of the target that
+    // each candidate is looked up against, so they are loaded once here
+    // rather than queried twice per candidate.
+    const context = await this.loadTargetContext(target.symbol_version_id)
+
     // Score each candidate across 7 dimensions.
     // Profile cache is pre-warmed above (L97-106), but scoring still hits the DB
     // per candidate (semantic similarity is not pre-warmed) — so concurrency MUST
@@ -128,7 +138,7 @@ export class HomologInferenceEngine {
       candidates.filter((c) => c.symbol_version_id !== targetSymbolVersionId),
       HOMOLOG_SCORING_CONCURRENCY,
       async (candidate): Promise<HomologCandidate | null> => {
-          const evidence = await this.scoreCandidate(target, candidate, snapshotId)
+          const evidence = await this.scoreCandidate(target, candidate, context)
 
           if (evidence.evidence_family_count < MIN_EVIDENCE_FAMILIES) return null
           if (evidence.weighted_total < confidenceThreshold) return null
@@ -271,8 +281,11 @@ export class HomologInferenceEngine {
     const SV_COLS = `sv.symbol_version_id, sv.symbol_id, s.canonical_name,
                    s.stable_key, sv.body_hash, sv.ast_hash, sv.normalized_ast_hash, sv.signature, s.kind`
 
-    // Buckets 1-4, 6-7 are independent DB queries — run in parallel
-    const [bodyMatches, astMatches, normalizedMatches, nameMatches, behaviorMatches, kindMatches] = await Promise.all([
+    // Buckets 1-4 and 6 are independent DB queries — run in parallel.
+    // There is no "same kind" bucket: twenty arbitrary functions are not
+    // candidates, they are whichever rows the planner returned first, and
+    // every one of them cost seven scoring dimensions.
+    const [bodyMatches, astMatches, normalizedMatches, nameMatches, behaviorMatches] = await Promise.all([
       // Bucket 1: body_hash exact match
       db.query(
         `
@@ -346,19 +359,6 @@ export class HomologInferenceEngine {
                 `,
         [snapshotId, target.symbol_version_id, target.kind],
       ),
-
-      // Bucket 7: Same kind symbols (fallback for low-signal repos)
-      db.query(
-        `
-                    SELECT ${SV_COLS}
-                    FROM symbol_versions sv
-                    JOIN symbols s ON s.symbol_id = sv.symbol_id
-                    WHERE sv.snapshot_id = $1 AND s.kind = $2
-                    AND sv.symbol_version_id != $3
-                    LIMIT 20
-                `,
-        [snapshotId, target.kind, target.symbol_version_id],
-      ),
     ])
 
     addRows(bodyMatches.rows as CandidateRow[])
@@ -366,7 +366,6 @@ export class HomologInferenceEngine {
     addRows(normalizedMatches.rows as CandidateRow[])
     addRows(nameMatches.rows as CandidateRow[])
     addRows(behaviorMatches.rows as CandidateRow[])
-    addRows(kindMatches.rows as CandidateRow[])
 
     // Bucket 5: Semantic candidates via MinHash LSH
     // Batch-load all semantic candidates in one query instead of N+1
@@ -406,7 +405,7 @@ export class HomologInferenceEngine {
   private async scoreCandidate(
     target: CandidateRow,
     candidate: CandidateRow,
-    _snapshotId: string,
+    context: TargetContext,
   ): Promise<EvidenceScores> {
     let familyCount = 0
 
@@ -473,12 +472,13 @@ export class HomologInferenceEngine {
     const contractOverlap = await this.computeContractOverlap(target.symbol_version_id, candidate.symbol_version_id)
     if (contractOverlap > 0.1) familyCount++
 
-    // Dimension 6: Test overlap
-    const testOverlap = await this.computeTestOverlap(target.symbol_version_id, candidate.symbol_version_id)
+    // Dimension 6: Test overlap — tests that exercise both symbols
+    const sharedTests = context.sharedTests.get(candidate.symbol_version_id) ?? 0
+    const testOverlap = sharedTests > 0 ? Math.min(1.0, sharedTests * 0.3) : 0.0
     if (testOverlap > 0.1) familyCount++
 
     // Dimension 7: History co-change
-    const historySim = await this.computeHistoryCoChange(target.symbol_id, candidate.symbol_id)
+    const historySim = context.coChangeConfidence.get(candidate.symbol_version_id) ?? 0.0
     if (historySim > 0.1) familyCount++
 
     // Guard all scores against NaN before computing weighted total
@@ -801,50 +801,44 @@ export class HomologInferenceEngine {
     return total > 0 ? matches / total : 0.0
   }
 
-  private async computeTestOverlap(svIdA: string, svIdB: string): Promise<number> {
-    // Count test artifacts whose related_symbols contain BOTH svIdA and svIdB
-    const result = await db.query(
-      `
-            SELECT COUNT(*) as cnt
-            FROM test_artifacts ta
-            WHERE $1 = ANY(ta.related_symbols)
-            AND $2 = ANY(ta.related_symbols)
-        `,
-      [svIdA, svIdB],
-    )
-
-    const count = parseCountField(firstRow(result))
-    return count > 0 ? Math.min(1.0, count * 0.3) : 0.0
-  }
-
-  private async computeHistoryCoChange(symbolIdA: string, symbolIdB: string): Promise<number> {
-    // Pre-collect symbol_version_ids to avoid 4 correlated IN subqueries
-    const [svsA, svsB] = await Promise.all([
-      db.query(`SELECT symbol_version_id FROM symbol_versions WHERE symbol_id = $1 LIMIT 500`, [symbolIdA]),
-      db.query(`SELECT symbol_version_id FROM symbol_versions WHERE symbol_id = $1 LIMIT 500`, [symbolIdB]),
-    ])
-    const idsA = svsA.rows.map((r: { symbol_version_id: string }) => r.symbol_version_id)
-    const idsB = svsB.rows.map((r: { symbol_version_id: string }) => r.symbol_version_id)
-
-    if (idsA.length === 0 || idsB.length === 0) return 0.0
-
-    // Check inferred co_changed_with relations using direct array parameters
-    const result = await db.query(
-      `
-            SELECT confidence FROM inferred_relations
+  /**
+   * What the target shares with everything at once: how many test artifacts
+   * cover each other symbol version alongside it, and the strongest
+   * co_changed_with confidence to each. One query each per target.
+   */
+  private async loadTargetContext(targetSvId: string): Promise<TargetContext> {
+    const [tests, history] = await Promise.all([
+      db.query(`SELECT related_symbols FROM test_artifacts WHERE $1 = ANY(related_symbols)`, [targetSvId]),
+      db.query(
+        `
+            SELECT CASE WHEN src_symbol_version_id = $1 THEN dst_symbol_version_id ELSE src_symbol_version_id END AS other,
+                   MAX(confidence) AS confidence
+            FROM inferred_relations
             WHERE relation_type = 'co_changed_with'
-            AND (
-                (src_symbol_version_id = ANY($1) AND dst_symbol_version_id = ANY($2))
-                OR
-                (src_symbol_version_id = ANY($2) AND dst_symbol_version_id = ANY($1))
-            )
-            ORDER BY confidence DESC
-            LIMIT 1
+              AND (src_symbol_version_id = $1 OR dst_symbol_version_id = $1)
+            GROUP BY 1
         `,
-      [idsA, idsB],
-    )
+        [targetSvId],
+      ),
+    ])
 
-    return numberField(firstRow(result), "confidence") ?? 0.0
+    const sharedTests = new Map<string, number>()
+    for (const row of tests.rows as { related_symbols?: unknown }[]) {
+      if (!Array.isArray(row.related_symbols)) continue
+      for (const svId of row.related_symbols) {
+        if (typeof svId !== "string" || svId === targetSvId) continue
+        sharedTests.set(svId, (sharedTests.get(svId) ?? 0) + 1)
+      }
+    }
+
+    const coChangeConfidence = new Map<string, number>()
+    for (const row of history.rows as { other?: unknown; confidence?: unknown }[]) {
+      if (typeof row.other !== "string") continue
+      const confidence = Number(row.confidence)
+      coChangeConfidence.set(row.other, Number.isFinite(confidence) ? confidence : 0)
+    }
+
+    return { sharedTests, coChangeConfidence }
   }
 
   // ────────── Data Loaders ──────────

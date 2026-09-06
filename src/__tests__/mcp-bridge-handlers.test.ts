@@ -188,6 +188,7 @@ jest.mock("../analysis-engine/temporal-engine", () => ({
   temporalEngine: {
     getRiskScore: jest.fn(),
     getCoChangePartners: jest.fn(),
+    getFileCoChangePartners: jest.fn().mockResolvedValue([]),
   },
 }))
 

@@ -75,8 +75,6 @@ const IS_NAN_CHECK = /(?:Number\s*\.\s*)?isNaN\s*\(\s*([\w.]+)\s*\)/g
 const IS_FINITE_CHECK = /(?:Number\s*\.\s*)?isFinite\s*\(\s*([\w.]+)\s*\)/g
 
 // --- Null / undefined checks ---
-const NULLISH_COALESCE = /([\w.]+)\s*\?\?\s*([^;,\n]+)/g
-const OPTIONAL_CHAIN = /([\w.]+)\s*\?\.\s*([\w.]+)/g
 const NULL_CHECK_IF = /if\s*\(\s*([\w.]+)\s*(?:!==?|===?)\s*(?:null|undefined)\s*\)/g
 const NOT_NULL_CHECK_IF = /if\s*\(\s*([\w.]+)\s*(?:!=)\s*(?:null)\s*\)/g
 
@@ -228,8 +226,6 @@ const TS_GENERIC_CONSTRAINT = /<\s*(\w+)\s+extends\s+([^>,]+)/g
 const TS_UNION_TYPE = /(\w+(?:\s*\|\s*\w+)+)/g
 
 // --- Closure / nested function patterns ---
-const ARROW_FN = /(?:const|let|var)\s+(\w+)\s*=\s*(?:\([^)]*\)|[\w]+)\s*=>/g
-const NESTED_FUNCTION = /function\s+(\w+)\s*\(/g
 const RETURN_STATEMENT = /return\s+([^;]+)/g
 
 // ---------------------------------------------------------------------------
@@ -281,6 +277,31 @@ function truncExpr(s: string, maxLen: number = 120): string {
 // ---------------------------------------------------------------------------
 // Deep Contract Synthesizer
 // ---------------------------------------------------------------------------
+
+/**
+ * Invariants kept per symbol. The 99th-percentile symbol on the local
+ * database carried 23, the largest 129; past a few dozen the list is a
+ * transcript of the body, and a capsule cannot spend tokens on it anyway.
+ * The strongest survive, so what is dropped is the weakest evidence.
+ */
+export const MAX_INVARIANTS_PER_SYMBOL = 40
+
+/** Keep at most MAX_INVARIANTS_PER_SYMBOL candidates per symbol, strongest first, order otherwise preserved. */
+export function capPerSymbol(candidates: InvariantCandidate[]): InvariantCandidate[] {
+  const perSymbol = new Map<string, number>()
+  for (const c of candidates) {
+    if (c.scope_symbol_id) perSymbol.set(c.scope_symbol_id, (perSymbol.get(c.scope_symbol_id) ?? 0) + 1)
+  }
+  const over = new Set([...perSymbol].filter(([, n]) => n > MAX_INVARIANTS_PER_SYMBOL).map(([id]) => id))
+  if (over.size === 0) return candidates
+  const kept = new Set<InvariantCandidate>()
+  for (const symbolId of over) {
+    const own = candidates.filter((c) => c.scope_symbol_id === symbolId)
+    own.sort((a, b) => b.strength - a.strength)
+    for (const c of own.slice(0, MAX_INVARIANTS_PER_SYMBOL)) kept.add(c)
+  }
+  return candidates.filter((c) => !c.scope_symbol_id || !over.has(c.scope_symbol_id) || kept.has(c))
+}
 
 export class DeepContractSynthesizer {
   // -----------------------------------------------------------------------
@@ -400,13 +421,36 @@ export class DeepContractSynthesizer {
     }
 
     const totalPersisted = persisted + crossSymbolCount
+    const trimmed = await this.trimPerSymbol(repoId)
     timer({
       candidates_generated: totalCandidates,
       invariants_persisted: persisted,
       cross_symbol_invariants: crossSymbolCount,
       total_persisted: totalPersisted,
+      trimmed_over_cap: trimmed,
     })
     return totalPersisted
+  }
+
+  /**
+   * Enforce MAX_INVARIANTS_PER_SYMBOL on the rows themselves. The in-memory
+   * cap sees one batch of candidates; rows accumulate across batches, across
+   * the test-derived miner, and across snapshots through the upsert, so the
+   * only place the cap is true is the table. The strongest rows survive.
+   */
+  private async trimPerSymbol(repoId: string): Promise<number> {
+    const result = await db.query(
+      `DELETE FROM invariants i
+        USING (
+          SELECT invariant_id,
+                 row_number() OVER (PARTITION BY scope_symbol_id ORDER BY strength DESC, invariant_id) AS rn
+          FROM invariants
+          WHERE repo_id = $1 AND scope_symbol_id IS NOT NULL
+        ) ranked
+        WHERE i.invariant_id = ranked.invariant_id AND ranked.rn > $2`,
+      [repoId, MAX_INVARIANTS_PER_SYMBOL],
+    )
+    return result.rowCount ?? 0
   }
 
   /**
@@ -611,14 +655,15 @@ export class DeepContractSynthesizer {
 
     // Deduplicate candidates in memory before hitting DB
     const seen = new Set<string>()
-    const unique: InvariantCandidate[] = []
+    const deduped: InvariantCandidate[] = []
     for (const c of candidates) {
       const key = `${c.scope_symbol_id ?? "null"}::${c.expression}`
       if (!seen.has(key)) {
         seen.add(key)
-        unique.push(c)
+        deduped.push(c)
       }
     }
+    const unique = capPerSymbol(deduped)
 
     const BATCH_SIZE = 500
     let persisted = 0
@@ -842,31 +887,10 @@ export class DeepContractSynthesizer {
   // -----------------------------------------------------------------------
 
   private mineNullChecks(body: string, symbolId: string, out: InvariantCandidate[]): void {
-    // x ?? default
-    for (const m of allMatches(NULLISH_COALESCE, body)) {
-      out.push({
-        expression: `null_safety:${m[1]} has nullish fallback ${truncExpr(m[2] ?? "", 60)}`,
-        source_type: "assertion",
-        strength: 0.72,
-        validation_method: "code_body_nullish_coalesce",
-        scope_level: "symbol",
-        scope_symbol_id: symbolId,
-        category: "null_safety",
-      })
-    }
-
-    // x?.method()
-    for (const m of allMatches(OPTIONAL_CHAIN, body)) {
-      out.push({
-        expression: `null_safety:${m[1]} optional-chained to ${m[2]}`,
-        source_type: "assertion",
-        strength: 0.68,
-        validation_method: "code_body_optional_chain",
-        scope_level: "symbol",
-        scope_symbol_id: symbolId,
-        category: "null_safety",
-      })
-    }
+    // Only explicit checks are contracts. `x ?? d` and `x?.m()` describe how
+    // the body reads a value, not what it promises; recorded as invariants
+    // they were 7,920 of 75,889 rows on the local database and said nothing
+    // a caller could rely on.
 
     // if (x !== null) / if (x === undefined)
     for (const m of allMatches(NULL_CHECK_IF, body)) {
@@ -1828,22 +1852,10 @@ export class DeepContractSynthesizer {
   // -----------------------------------------------------------------------
 
   private mineClosureContracts(body: string, symbolId: string, out: InvariantCandidate[]): void {
-    // Detect nested arrow functions and named functions
-    const arrowFns = allMatches(ARROW_FN, body)
-    const nestedFns = allMatches(NESTED_FUNCTION, body)
-    const totalNested = arrowFns.length + nestedFns.length
-
-    if (totalNested > 0) {
-      out.push({
-        expression: `closure:contains ${totalNested} nested function(s) (${arrowFns.length} arrow, ${nestedFns.length} named)`,
-        source_type: "derived",
-        strength: 0.65,
-        validation_method: "code_body_closure_analysis",
-        scope_level: "symbol",
-        scope_symbol_id: symbolId,
-        category: "closure",
-      })
-    }
+    // How many functions a body nests, and whether it touches `this`, are
+    // facts about its shape, not promises to its callers. Emitted as
+    // invariants they were 10,756 of 75,889 rows on the local database.
+    // Return-path and higher-order facts below do constrain callers and stay.
 
     // Analyze return paths to infer return type contract
     const returnStatements = allMatches(RETURN_STATEMENT, body)
@@ -1900,19 +1912,6 @@ export class DeepContractSynthesizer {
         scope_level: "symbol",
         scope_symbol_id: symbolId,
         category: "higher_order",
-      })
-    }
-
-    // Detect captured outer-scope variables (closures referencing 'this')
-    if (/\bthis\s*\./.test(body)) {
-      out.push({
-        expression: `closure_binding:accesses instance state via this`,
-        source_type: "derived",
-        strength: 0.65,
-        validation_method: "code_body_closure_binding",
-        scope_level: "symbol",
-        scope_symbol_id: symbolId,
-        category: "closure_binding",
       })
     }
   }
@@ -3000,7 +2999,6 @@ export class DeepContractSynthesizer {
           .trim()
 
       case "null_check":
-      case "null_safety":
         return predicate
           .replace(/\b[a-z_]\w*\b/gi, "_VAR")
           .replace(/\s+/g, " ")

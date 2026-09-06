@@ -156,13 +156,13 @@ export class ConceptFamilyEngine {
     }
     log.info("Clustering complete", { cluster_count: rawClusters.length, snapshotId })
 
-    // Step 1b: Structural fallback — seed families from naming patterns
+    // Step 1b: Structural fallback — seed families from shared dependencies
     // when homolog edges are sparse (small repos).
     if (rawClusters.length <= 1) {
-      const structuralClusters = await this.clusterByNamingPatterns(snapshotId)
+      const structuralClusters = await this.clusterBySharedDependencies(snapshotId)
       if (structuralClusters.length > 0) {
         rawClusters.push(...structuralClusters)
-        log.info("Structural naming pattern clusters added", {
+        log.info("Shared-dependency clusters added", {
           structural_count: structuralClusters.length,
         })
       }
@@ -240,9 +240,12 @@ export class ConceptFamilyEngine {
       const outlierCount = outlierResults.filter((o) => o.is_outlier).length
       const contradictionCount = outlierResults.filter((o) => o.is_contradicting).length
 
-      // Persist family
-      const familyId = uuidv4()
-      await db.query(
+      // Persist family. Two clusters can produce the same name; the upsert
+      // then keeps the existing row and its id, so the members must be
+      // written under the id the database reports, not the one generated
+      // here. Using the generated id broke the members' foreign key on every
+      // repository with a repeated family name.
+      const inserted = await db.query(
         `
                 INSERT INTO concept_families (
                     family_id, repo_id, snapshot_id, family_name, family_type,
@@ -259,9 +262,10 @@ export class ConceptFamilyEngine {
                     member_count = EXCLUDED.member_count,
                     avg_confidence = EXCLUDED.avg_confidence,
                     contradiction_count = EXCLUDED.contradiction_count
+                RETURNING family_id
             `,
         [
-          familyId,
+          uuidv4(),
           repoId,
           snapshotId,
           familyName,
@@ -274,6 +278,11 @@ export class ConceptFamilyEngine {
           contradictionCount,
         ],
       )
+      const familyId = (inserted.rows[0] as { family_id?: string } | undefined)?.family_id
+      if (!familyId) {
+        log.warn("Family insert returned no id — members not written", { familyName, snapshotId })
+        continue
+      }
 
       // Persist members
       const memberStatements: { text: string; params: unknown[] }[] = []
@@ -466,77 +475,111 @@ export class ConceptFamilyEngine {
   }
 
   /**
-   * Structural fallback: cluster symbols by naming convention patterns.
-   * Groups classes/functions sharing suffixes like *Engine, *Service, *Handler,
-   * *Controller, *Repository, *Factory, *Middleware, *Validator, *Resolver.
-   * Used when homolog edges are sparse (small repos).
+   * Seed families from shared dependencies when homolog edges are sparse.
+   *
+   * The previous seed grouped symbols by name suffix — every *Service with
+   * every other — and joined them with a synthetic 0.45 edge, which made a
+   * family out of a naming convention. Two symbols that call the same set of
+   * things are doing related work whether or not their names agree, and the
+   * graph already records that: the edge here is the Jaccard overlap of their
+   * callee sets, and it exists only where they share at least two callees.
+   * A callee with hundreds of callers (a logger, a helper) says nothing about
+   * any two of them and is left out.
    */
-  private async clusterByNamingPatterns(snapshotId: string): Promise<RawCluster[]> {
+  private async clusterBySharedDependencies(snapshotId: string): Promise<RawCluster[]> {
+    const MAX_CALLERS_PER_CALLEE = 200
+    const MIN_SHARED = 2
+    const MIN_JACCARD = 0.5
+
     const result = await db.query(
       `
-            SELECT sv.symbol_version_id, s.canonical_name, s.kind
-            FROM symbol_versions sv
+            SELECT sr.src_symbol_version_id AS src, sr.dst_symbol_version_id AS dst, s.kind
+            FROM structural_relations sr
+            JOIN symbol_versions sv ON sv.symbol_version_id = sr.src_symbol_version_id
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             WHERE sv.snapshot_id = $1
-            AND s.kind IN ('class', 'function', 'method')
+              AND sr.relation_type IN ('calls', 'references', 'typed_as')
+              AND s.kind IN ('class', 'function', 'method')
         `,
       [snapshotId],
     )
 
-    const rows = result.rows as { symbol_version_id: string; canonical_name: string; kind: string }[]
-    const SUFFIXES = [
-      "Engine",
-      "Service",
-      "Handler",
-      "Controller",
-      "Repository",
-      "Factory",
-      "Middleware",
-      "Validator",
-      "Resolver",
-      "Provider",
-      "Manager",
-      "Adapter",
-      "Client",
-      "Worker",
-      "Processor",
-    ]
+    const callees = new Map<string, Set<string>>()
+    const kindOf = new Map<string, string>()
+    const callersOf = new Map<string, string[]>()
+    for (const row of result.rows as { src: string; dst: string; kind: string }[]) {
+      if (row.src === row.dst) continue
+      kindOf.set(row.src, row.kind)
+      let set = callees.get(row.src)
+      if (!set) callees.set(row.src, (set = new Set()))
+      if (!set.has(row.dst)) {
+        set.add(row.dst)
+        const list = callersOf.get(row.dst) ?? []
+        list.push(row.src)
+        callersOf.set(row.dst, list)
+      }
+    }
 
-    const buckets = new Map<string, string[]>()
-    for (const row of rows) {
-      for (const suffix of SUFFIXES) {
-        if (row.canonical_name.endsWith(suffix) && row.canonical_name.length > suffix.length) {
-          const key = `suffix:${suffix}`
-          const existing = buckets.get(key) || []
-          existing.push(row.symbol_version_id)
-          buckets.set(key, existing)
-          break
+    // Count shared callees per pair through the callee's caller list, so only
+    // pairs that share something are ever compared.
+    const shared = new Map<string, number>()
+    for (const callers of callersOf.values()) {
+      if (callers.length < 2 || callers.length > MAX_CALLERS_PER_CALLEE) continue
+      for (let i = 0; i < callers.length; i++) {
+        for (let j = i + 1; j < callers.length; j++) {
+          const a = callers[i]!
+          const b = callers[j]!
+          if (kindOf.get(a) !== kindOf.get(b)) continue
+          const key = a < b ? `${a}|${b}` : `${b}|${a}`
+          shared.set(key, (shared.get(key) ?? 0) + 1)
         }
       }
     }
 
+    const edges: EdgeRecord[] = []
+    for (const [key, common] of shared) {
+      if (common < MIN_SHARED) continue
+      const [a, b] = key.split("|") as [string, string]
+      const union = callees.get(a)!.size + callees.get(b)!.size - common
+      const jaccard = union > 0 ? common / union : 0
+      if (jaccard < MIN_JACCARD) continue
+      edges.push({ src: a, dst: b, confidence: jaccard, relation_type: "shared_dependencies" })
+    }
+    if (edges.length === 0) return []
+
+    // Connected components over the qualifying edges.
+    const adjacency = new Map<string, EdgeRecord[]>()
+    for (const edge of edges) {
+      for (const node of [edge.src, edge.dst]) {
+        const list = adjacency.get(node) ?? []
+        list.push(edge)
+        adjacency.set(node, list)
+      }
+    }
+    const seen = new Set<string>()
     const clusters: RawCluster[] = []
-    for (const [, members] of buckets) {
-      if (members.length < MIN_FAMILY_SIZE) continue
-      // Build synthetic edges between all members
-      const edges: EdgeRecord[] = []
-      for (let i = 0; i < members.length; i++) {
-        for (let j = i + 1; j < members.length; j++) {
-          edges.push({
-            src: members[i]!,
-            dst: members[j]!,
-            confidence: 0.45,
-            relation_type: "naming_pattern",
-          })
+    for (const start of adjacency.keys()) {
+      if (seen.has(start)) continue
+      const members: string[] = []
+      const internal: EdgeRecord[] = []
+      const stack = [start]
+      seen.add(start)
+      while (stack.length) {
+        const node = stack.pop()!
+        members.push(node)
+        for (const edge of adjacency.get(node) ?? []) {
+          if (edge.src === node) internal.push(edge)
+          const other = edge.src === node ? edge.dst : edge.src
+          if (!seen.has(other)) {
+            seen.add(other)
+            stack.push(other)
+          }
         }
       }
-      clusters.push({
-        member_sv_ids: members,
-        internal_edges: edges,
-        avg_confidence: 0.45,
-      })
+      if (members.length < MIN_FAMILY_SIZE) continue
+      const avg = internal.reduce((sum, e) => sum + e.confidence, 0) / Math.max(1, internal.length)
+      clusters.push({ member_sv_ids: members, internal_edges: internal, avg_confidence: avg })
     }
-
     return clusters
   }
 

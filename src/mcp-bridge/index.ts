@@ -1163,7 +1163,7 @@ registerTool(
   "scg_get_co_change_partners",
   {
     description:
-      "Get symbols that historically change together with a target symbol — based on git history co-change analysis.",
+      "Get what historically changes together with a symbol: symbol partners from git blame (line-level), and file partners from the commit log.",
     inputSchema: {
       symbol_id: z.string().uuid().describe("Symbol UUID"),
       repo_id: z.string().uuid().describe("Repository UUID"),

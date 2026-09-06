@@ -251,6 +251,35 @@ describe("HomologInferenceEngine.findHomologs", () => {
     expect(result).toEqual([])
   })
 
+  test("loads test coverage and co-change history once per target, and has no same-kind bucket", async () => {
+    const target = makeTarget()
+    const candidates = [1, 2, 3].map((i) => makeCandidate({ symbol_version_id: `sv-c${i}`, symbol_id: `sym-c${i}` }))
+
+    routeDbQueries([
+      { match: "WHERE sv.symbol_version_id = $1", result: { rows: [target], rowCount: 1 } },
+      { match: "sv.body_hash = $2", result: { rows: candidates, rowCount: 3 } },
+      { match: "behavioral_profiles", result: emptyResult() },
+      { match: "contract_profiles", result: emptyResult() },
+      // One test artifact covers the target and the first candidate.
+      { match: "test_artifacts", result: { rows: [{ related_symbols: ["sv-target", "sv-c1"] }], rowCount: 1 } },
+      { match: "co_changed_with", result: { rows: [{ other: "sv-c2", confidence: 0.8 }], rowCount: 1 } },
+    ])
+    mockComputeSemanticSimilarity.mockResolvedValue(0.9)
+
+    const result = await engine.findHomologs("sv-target", "snap-1", 0.0)
+
+    const sqls = mockDbQuery.mock.calls.map((call) => String(call[0]))
+    expect(sqls.filter((sql) => sql.includes("test_artifacts")).length).toBe(1)
+    expect(sqls.filter((sql) => sql.includes("co_changed_with")).length).toBe(1)
+    expect(sqls.some((sql) => sql.includes("s.kind = $2"))).toBe(false)
+
+    const byId = new Map(result.map((r) => [r.symbol_version_id, r]))
+    expect(byId.get("sv-c1")?.evidence.test_overlap).toBeCloseTo(0.3)
+    expect(byId.get("sv-c2")?.evidence.test_overlap).toBe(0)
+    expect(byId.get("sv-c2")?.evidence.history_co_change).toBeCloseTo(0.8)
+    expect(byId.get("sv-c1")?.evidence.history_co_change).toBe(0)
+  })
+
   test("skips candidate with same symbol_version_id as target", async () => {
     const target = makeTarget()
     // A candidate that has the same SVId as the target
@@ -622,14 +651,20 @@ describe("scoreCandidate (via findHomologs)", () => {
       // test_artifacts
       {
         match: "test_artifacts",
-        result: { rows: [{ cnt: options.testOverlapCount ?? 0 }], rowCount: 1 },
+        // One row per test artifact that covers both the target and the candidate.
+        result: {
+          rows: Array.from({ length: options.testOverlapCount ?? 0 }, () => ({
+            related_symbols: [target.symbol_version_id, "sv-c1"],
+          })),
+          rowCount: options.testOverlapCount ?? 0,
+        },
       },
-      // symbol_versions for history
-      { match: "FROM symbol_versions WHERE symbol_id", result: emptyResult() },
-      // inferred_relations for co-change
+      // inferred_relations for co-change: the target's partners, keyed by the other side
       {
         match: "inferred_relations",
-        result: options.historyCo ? { rows: [options.historyCo], rowCount: 1 } : emptyResult(),
+        result: options.historyCo
+          ? { rows: [{ other: "sv-c1", confidence: options.historyCo.confidence }], rowCount: 1 }
+          : emptyResult(),
       },
     ])
 

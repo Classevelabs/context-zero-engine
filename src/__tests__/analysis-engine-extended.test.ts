@@ -67,6 +67,8 @@ jest.mock("../db-driver/result", () => {
 
 // ── Imports (after mocks) ───────────────────────────────────────────
 import { BlastRadiusEngine } from "../analysis-engine/blast-radius"
+import { capPerSymbol, MAX_INVARIANTS_PER_SYMBOL } from "../analysis-engine/deep-contracts"
+import type { SymbolHistory } from "../analysis-engine/blame-co-change"
 import { DeepContractSynthesizer } from "../analysis-engine/deep-contracts"
 import { DispatchResolver } from "../analysis-engine/dispatch-resolver"
 import { EffectEngine } from "../analysis-engine/effect-engine"
@@ -240,6 +242,91 @@ describe("BlastRadiusEngine", () => {
       if (contractImpacts.length > 0) {
         expect(contractImpacts[0]!.impact_type).toBe("contract")
       }
+    })
+
+    test("a pure caller is a medium assumption to re-check, not a high-severity break", async () => {
+      mockQuery.mockImplementation(async (sql: string) => {
+        if (sql.includes("behavioral_profiles")) {
+          return {
+            rows: [
+              {
+                src_symbol_version_id: "caller-1",
+                canonical_name: "pureCaller",
+                symbol_id: "sym-1",
+                file_path: "src/a.ts",
+                range_start_line: 1,
+                range_end_line: 5,
+                purity_class: "pure",
+                network_calls: null,
+                db_writes: null,
+              },
+            ],
+            rowCount: 1,
+          }
+        }
+        return { rows: [], rowCount: 0 }
+      })
+      const report = await engine.computeBlastRadius("snap-1", ["sv-target"], 1)
+      expect(report.behavioral_impacts.map((i) => i.severity)).toEqual(["medium"])
+      expect(report.recommended_validation_scope).toBe("quick")
+    })
+
+    test("only an enforced invariant can be critical; a derived one tops out below high", async () => {
+      const invariant = (source_type: string, strength: number) => ({
+        invariant_id: `inv-${source_type}`,
+        expression: "x",
+        source_type,
+        strength,
+        canonical_name: "f",
+        symbol_id: "sym-1",
+        file_path: "src/a.ts",
+        range_start_line: 1,
+        range_end_line: 2,
+      })
+      mockQuery.mockImplementation(async (sql: string) => {
+        if (sql.includes("invariants")) {
+          return {
+            rows: [invariant("assertion", 0.95), invariant("derived", 0.95), invariant("derived", 0.8), invariant("type_constraint", 0.8)],
+            rowCount: 4,
+          }
+        }
+        return { rows: [], rowCount: 0 }
+      })
+      const report = await engine.computeBlastRadius("snap-1", ["sv-target"], 1)
+      expect(report.contract_impacts.map((i) => i.severity)).toEqual(["critical", "high", "low", "medium"])
+    })
+
+    test("file co-change partners are reported on the partner file's module symbol at low severity", async () => {
+      mockQuery.mockImplementation(async (sql: string) => {
+        if (sql.includes("SELECT DISTINCT f.path, s.repo_id")) {
+          return { rows: [{ path: "src/a.ts", repo_id: "repo-1" }], rowCount: 1 }
+        }
+        if (sql.includes("temporal_file_co_changes")) {
+          return {
+            rows: [
+              {
+                file_path: "src/b.ts",
+                jaccard_coefficient: 0.75,
+                co_change_count: 6,
+                symbol_id: "mod-b",
+                canonical_name: "src/b.ts",
+                range_start_line: 1,
+                range_end_line: 40,
+              },
+            ],
+            rowCount: 1,
+          }
+        }
+        return { rows: [], rowCount: 0 }
+      })
+      const report = await engine.computeBlastRadius("snap-1", ["sv-target"], 1)
+      expect(report.historical_impacts).toHaveLength(1)
+      const impact = report.historical_impacts[0]!
+      expect(impact.relation_type).toBe("file_co_changed_with")
+      expect(impact.severity).toBe("low")
+      expect(impact.symbol_id).toBe("mod-b")
+      expect(impact.evidence).toContain("6 commit(s)")
+      expect(report.recommended_validation_scope).toBe("quick")
     })
 
     test("returns strict scope for 20+ total impacts", async () => {
@@ -756,6 +843,16 @@ describe("EffectEngine", () => {
       expect(mine(code, "typescript")).toEqual([])
     })
 
+    test("mineFromFrameworkPatterns labels every entry as a heuristic with its own confidence", () => {
+      const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
+      const effects: EffectEntry[] = mine("user = db.findOne({ id: 1 })", "ruby")
+      expect(effects.length).toBeGreaterThan(0)
+      for (const effect of effects) {
+        expect(effect.source).toBe("heuristic_pattern")
+        expect(effect.confidence).toBe(0.5)
+      }
+    })
+
     test("mineFromFrameworkPatterns returns empty for empty code", () => {
       const mine = (engine as any).mineFromFrameworkPatterns.bind(engine)
       expect(mine("", "typescript")).toEqual([])
@@ -875,20 +972,43 @@ describe("DeepContractSynthesizer", () => {
       expect(candidates.some((c) => c.expression.includes("Array.isArray"))).toBe(true)
     })
 
-    test("detects nullish coalescing", async () => {
-      const body = "const val = input ?? defaultValue;"
+    test("does not record nullish coalescing or optional chaining as invariants", async () => {
+      const body = "const val = input ?? defaultValue; const name = user?.profile;"
       const candidates = await synth.mineFromBody("sv-1", body, "sym-1", "repo-1", "snap-1")
-      expect(
-        candidates.some((c) => c.expression.includes("null_safety") && c.expression.includes("nullish fallback")),
-      ).toBe(true)
+      expect(candidates.some((c) => c.expression.startsWith("null_safety:"))).toBe(false)
     })
 
-    test("detects optional chaining", async () => {
-      const body = "const name = user?.profile;"
+    test("still records an explicit null check", async () => {
+      const body = "if (input !== null) { return input; }"
       const candidates = await synth.mineFromBody("sv-1", body, "sym-1", "repo-1", "snap-1")
-      expect(
-        candidates.some((c) => c.expression.includes("null_safety") && c.expression.includes("optional-chained")),
-      ).toBe(true)
+      expect(candidates.some((c) => c.expression.startsWith("null_check:"))).toBe(true)
+    })
+
+    test("does not record nested-function counts or `this` access as invariants", async () => {
+      const body = "const inner = (x) => x + this.offset; function helper() {} if (!inner) return null; return { value: inner(1) };"
+      const candidates = await synth.mineFromBody("sv-1", body, "sym-1", "repo-1", "snap-1")
+      expect(candidates.some((c) => c.expression.startsWith("closure:"))).toBe(false)
+      expect(candidates.some((c) => c.expression.startsWith("closure_binding:"))).toBe(false)
+      // A return-path fact constrains callers and stays.
+      expect(candidates.some((c) => c.expression.startsWith("higher_order:") || c.expression.startsWith("return_shape:"))).toBe(true)
+    })
+
+    test("capPerSymbol keeps the strongest MAX_INVARIANTS_PER_SYMBOL of an over-full symbol and leaves others alone", () => {
+      const many = Array.from({ length: MAX_INVARIANTS_PER_SYMBOL + 10 }, (_, i) => ({
+        expression: `guard:${i}`,
+        source_type: "assertion" as const,
+        strength: (i % 10) / 10,
+        validation_method: "test",
+        scope_level: "symbol" as const,
+        scope_symbol_id: "busy",
+        category: "guard_clause",
+      }))
+      const few = [{ ...many[0]!, scope_symbol_id: "quiet", expression: "guard:q" }]
+      const kept = capPerSymbol([...many, ...few])
+      const busy = kept.filter((c) => c.scope_symbol_id === "busy")
+      expect(busy.length).toBe(MAX_INVARIANTS_PER_SYMBOL)
+      expect(Math.min(...busy.map((c) => c.strength))).toBeGreaterThanOrEqual(0.1)
+      expect(kept.filter((c) => c.scope_symbol_id === "quiet").length).toBe(1)
     })
 
     test("detects regex validators", async () => {
@@ -1451,55 +1571,108 @@ describe("TemporalEngine", () => {
     })
   })
 
+  const emptyHistory = (): SymbolHistory => ({
+    commitsBySymbol: new Map(),
+    blamedFiles: new Set(),
+    symbolsByFile: new Map(),
+    filesSkipped: 0,
+  })
+
+  /** Which table each batchInsert row went to. */
+  const insertedTables = (): string[] =>
+    mockBatchInsert.mock.calls.flatMap((call) =>
+      (call[0] as { text: string }[]).map((stmt) => /INSERT INTO (\w+)/.exec(stmt.text)?.[1] ?? "?"),
+    )
+
   describe("computeCoChanges", () => {
-    test("returns 0 when fileToSymbols is empty", async () => {
-      const commits = [makeGitCommit()]
-      const fileMap = new Map<string, string[]>()
-      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", commits, fileMap)
-      expect(result).toBe(0)
+    test("writes nothing when there is no history", async () => {
+      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", [], emptyHistory())
+      expect(result).toEqual({ symbol_pairs: 0, file_pairs: 0 })
+      expect(mockBatchInsert).not.toHaveBeenCalled()
     })
 
-    test("skips merge commits", async () => {
-      const commits = [makeGitCommit({ is_merge: true, files: ["src/a.ts", "src/b.ts"] })]
-      const fileMap = new Map([
-        ["src/a.ts", ["sym-a"]],
-        ["src/b.ts", ["sym-b"]],
-      ])
-      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", commits, fileMap)
-      expect(result).toBe(0)
+    test("skips merge commits for file pairs", async () => {
+      const commits = [
+        makeGitCommit({ hash: "a".repeat(40), is_merge: true, files: ["src/a.ts", "src/b.ts"] }),
+        makeGitCommit({ hash: "b".repeat(40), is_merge: true, files: ["src/a.ts", "src/b.ts"] }),
+      ]
+      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", commits, emptyHistory())
+      expect(result.file_pairs).toBe(0)
     })
 
-    test("persists co-change pairs with Jaccard coefficients", async () => {
+    test("file pairs come from the log; a symbol pair needs blame, not shared files", async () => {
       const commits = [
         makeGitCommit({ hash: "a".repeat(40), files: ["src/a.ts", "src/b.ts"] }),
         makeGitCommit({ hash: "b".repeat(40), files: ["src/a.ts", "src/b.ts"], date: new Date("2025-01-16") }),
       ]
-      const fileMap = new Map([
-        ["src/a.ts", ["sym-a"]],
-        ["src/b.ts", ["sym-b"]],
-      ])
-      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", commits, fileMap)
-      expect(result).toBe(1)
-      expect(mockBatchInsert).toHaveBeenCalled()
+      const history = emptyHistory()
+      history.symbolsByFile.set("src/a.ts", ["sym-a"])
+      history.symbolsByFile.set("src/b.ts", ["sym-b"])
+      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", commits, history)
+      expect(result).toEqual({ symbol_pairs: 0, file_pairs: 1 })
+      expect(insertedTables()).toEqual(["temporal_file_co_changes"])
+      const row = (mockBatchInsert.mock.calls[0]![0] as { params: unknown[] }[])[0]!.params
+      expect(row.slice(1, 7)).toEqual(["src/a.ts", "src/b.ts", 2, 2, 2, 1])
+    })
+
+    test("symbol pairs come from commits that last touched both symbols' lines", async () => {
+      const commits = [
+        makeGitCommit({ hash: "a".repeat(40), files: ["src/a.ts"] }),
+        makeGitCommit({ hash: "b".repeat(40), files: ["src/a.ts"], date: new Date("2025-01-16") }),
+      ]
+      const history = emptyHistory()
+      history.blamedFiles.add("src/a.ts")
+      history.commitsBySymbol.set("sym-a", new Set(["a".repeat(40), "b".repeat(40)]))
+      history.commitsBySymbol.set("sym-b", new Set(["a".repeat(40), "b".repeat(40), "c".repeat(40)]))
+      history.commitsBySymbol.set("sym-c", new Set(["c".repeat(40)]))
+      const result = await temporalEngine.computeCoChanges("repo-1", "snap-1", commits, history)
+      expect(result.symbol_pairs).toBe(1) // a–b twice; b–c only once, below CO_CHANGE_MIN_COUNT
+      const symbolRows = mockBatchInsert.mock.calls
+        .flatMap((call) => call[0] as { text: string; params: unknown[] }[])
+        .filter((stmt) => stmt.text.includes("temporal_co_changes"))
+      expect(symbolRows.length).toBe(1)
+      // symbol_a, symbol_b, co_change_count, total_a, total_b, jaccard = 2 / (2 + 3 - 2)
+      expect(symbolRows[0]!.params.slice(2, 8)).toEqual(["sym-a", "sym-b", 2, 2, 3, 2 / 3])
+    })
+
+    test("rewrites both tables so pairs history no longer supports do not linger", async () => {
+      await temporalEngine.computeCoChanges("repo-1", "snap-1", [], emptyHistory())
+      const deletes = mockQuery.mock.calls.map((call) => String(call[0])).filter((sql) => sql.includes("DELETE FROM"))
+      expect(deletes.some((sql) => sql.includes("temporal_file_co_changes"))).toBe(true)
+      expect(deletes.some((sql) => sql.includes("temporal_co_changes"))).toBe(true)
     })
   })
 
   describe("computeRiskScores", () => {
-    test("returns 0 when fileToSymbols is empty", async () => {
-      const commits = [makeGitCommit()]
-      const fileMap = new Map<string, string[]>()
-      const result = await temporalEngine.computeRiskScores("repo-1", "snap-1", commits, fileMap)
+    test("returns 0 when no symbol has history", async () => {
+      const result = await temporalEngine.computeRiskScores("repo-1", "snap-1", [makeGitCommit()], emptyHistory())
       expect(result).toBe(0)
     })
 
-    test("accumulates per-symbol statistics", async () => {
+    test("uses file-level commits for a file blame did not reach", async () => {
       const commits = [
         makeGitCommit({ files: ["src/a.ts"], is_bug_fix: true }),
         makeGitCommit({ hash: "b".repeat(40), files: ["src/a.ts"], date: new Date("2025-01-20") }),
       ]
-      const fileMap = new Map([["src/a.ts", ["sym-a"]]])
-      const result = await temporalEngine.computeRiskScores("repo-1", "snap-1", commits, fileMap)
+      const history = emptyHistory()
+      history.symbolsByFile.set("src/a.ts", ["sym-a"])
+      const result = await temporalEngine.computeRiskScores("repo-1", "snap-1", commits, history)
       expect(result).toBe(1)
+      const row = (mockBatchInsert.mock.calls[0]![0] as { params: unknown[] }[])[0]!.params
+      expect(row[4]).toBe(2) // change_frequency
+      expect(row[5]).toBe(1) // bug_fix_count
+    })
+
+    test("uses blame for a blamed file, so a sibling symbol untouched by the commits scores nothing", async () => {
+      const commits = [makeGitCommit({ hash: "a".repeat(40), files: ["src/a.ts"], is_bug_fix: true })]
+      const history = emptyHistory()
+      history.blamedFiles.add("src/a.ts")
+      history.symbolsByFile.set("src/a.ts", ["sym-a", "sym-untouched"])
+      history.commitsBySymbol.set("sym-a", new Set(["a".repeat(40)]))
+      const result = await temporalEngine.computeRiskScores("repo-1", "snap-1", commits, history)
+      expect(result).toBe(1)
+      const rows = mockBatchInsert.mock.calls.flatMap((call) => call[0] as { params: unknown[] }[])
+      expect(rows.map((r) => r.params[2])).toEqual(["sym-a"])
     })
   })
 
@@ -1531,6 +1704,103 @@ describe("TemporalEngine", () => {
 
 describe("ConceptFamilyEngine", () => {
   const cfEngine = new ConceptFamilyEngine()
+
+  describe("buildFamilies persistence", () => {
+    test("members are written under the family id the database returns, not a generated one", async () => {
+      const member = (id: string, name: string) => ({
+        symbol_version_id: id,
+        canonical_name: name,
+        kind: "function",
+        stable_key: `src/a.ts#${name}`,
+      })
+      mockQuery.mockImplementation(async (sql: string) => {
+        if (sql.includes("ir.relation_type != 'co_changed_with'")) {
+          return {
+            rows: [
+              { src_symbol_version_id: "sv-1", dst_symbol_version_id: "sv-2", confidence: 0.9, relation_type: "semantic_homolog" },
+              { src_symbol_version_id: "sv-2", dst_symbol_version_id: "sv-1", confidence: 0.9, relation_type: "semantic_homolog" },
+            ],
+            rowCount: 2,
+          }
+        }
+        if (sql.includes("s.canonical_name, s.kind, s.stable_key")) {
+          return { rows: [member("sv-1", "validateEmail"), member("sv-2", "validatePhone")], rowCount: 2 }
+        }
+        if (sql.includes("INSERT INTO concept_families")) {
+          // The upsert hit an existing row: the database reports that row's id.
+          return { rows: [{ family_id: "existing-family-id" }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      })
+
+      const result = await cfEngine.buildFamilies("repo-1", "snap-1")
+      expect(result.families_created).toBe(1)
+
+      const memberInserts = mockBatchInsert.mock.calls
+        .flatMap((call) => call[0] as { text: string; params: unknown[] }[])
+        .filter((stmt) => stmt.text.includes("concept_family_members"))
+      expect(memberInserts.length).toBe(2)
+      for (const stmt of memberInserts) expect(stmt.params[1]).toBe("existing-family-id")
+    })
+  })
+
+  describe("clusterBySharedDependencies", () => {
+    const cluster = (cfEngine as any).clusterBySharedDependencies.bind(cfEngine)
+    const edge = (src: string, dst: string, kind = "function") => ({ src, dst, kind })
+
+    test("seeds a family from symbols that call the same things, whatever their names are called", async () => {
+      mockQuery.mockResolvedValue({
+        rows: [
+          edge("parseUser", "validate"),
+          edge("parseUser", "normalize"),
+          edge("parseUser", "log"),
+          edge("loadOrder", "validate"),
+          edge("loadOrder", "normalize"),
+          edge("loadOrder", "log"),
+          edge("unrelatedTask", "log"),
+          edge("unrelatedTask", "fetch"),
+        ],
+        rowCount: 8,
+      })
+      const clusters = await cluster("snap-1")
+      expect(clusters).toHaveLength(1)
+      expect(clusters[0].member_sv_ids.sort()).toEqual(["loadOrder", "parseUser"])
+      expect(clusters[0].internal_edges[0].relation_type).toBe("shared_dependencies")
+      // 3 shared of 3 ∪ 3 → Jaccard 1
+      expect(clusters[0].avg_confidence).toBeCloseTo(1)
+    })
+
+    test("a shared name suffix alone is not a family", async () => {
+      mockQuery.mockResolvedValue({
+        rows: [edge("UserService", "db"), edge("MailService", "smtp"), edge("AuthService", "jwt")],
+        rowCount: 3,
+      })
+      expect(await cluster("snap-1")).toEqual([])
+    })
+
+    test("requires at least two shared callees and a Jaccard of 0.5", async () => {
+      mockQuery.mockResolvedValue({
+        rows: [
+          edge("a", "shared1"),
+          edge("a", "only-a-1"),
+          edge("a", "only-a-2"),
+          edge("b", "shared1"),
+          edge("b", "only-b-1"),
+          edge("b", "only-b-2"),
+        ],
+        rowCount: 6,
+      })
+      expect(await cluster("snap-1")).toEqual([])
+    })
+
+    test("does not pair symbols of different kinds", async () => {
+      mockQuery.mockResolvedValue({
+        rows: [edge("fn", "x"), edge("fn", "y"), edge("Klass", "x", "class"), edge("Klass", "y", "class")],
+        rowCount: 4,
+      })
+      expect(await cluster("snap-1")).toEqual([])
+    })
+  })
 
   describe("classifyFamilyType", () => {
     test("returns custom for empty members", () => {

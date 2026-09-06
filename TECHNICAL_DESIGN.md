@@ -327,7 +327,7 @@ Creates typed inferred relations using multi-evidence scoring:
 ## 7.6 Change & Temporal Engines (transactional editor, temporal engine, runtime evidence)
 Orchestrates:
 - 9-state transaction lifecycle with planning, patching, validation, propagation, commit/rollback
-- Git history mining with co-change pair computation (Jaccard similarity) and risk scoring
+- Git history mining: file co-change pairs from the log (`temporal_file_co_changes`), symbol co-change pairs from `git blame` line attribution (`temporal_co_changes`, Jaccard over commit sets, within a wall-clock budget), and per-symbol risk scoring from the same attribution
 - Runtime trace ingestion with observed edge persistence and evidence retrieval
 - Opt-in constrained subprocess execution with resource/time limits
 
@@ -1492,8 +1492,9 @@ Input:
 - optional min_jaccard (default 0.3)
 
 Output:
-- co-change partners ranked by Jaccard similarity
-- total count
+- symbol co-change partners ranked by Jaccard similarity (from git blame line attribution)
+- file co-change partners for the symbol's files (from the commit log)
+- total count of symbol partners
 
 ### `scg_ingest_runtime_trace`
 Input:

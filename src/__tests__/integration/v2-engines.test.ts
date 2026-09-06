@@ -1182,11 +1182,12 @@ describe("DeepContractSynthesizer", () => {
       expect(candidates.some((c) => c.expression.includes("instanceof"))).toBe(true)
     })
 
-    test("detects nullish coalescing", async () => {
+    test("does not record nullish coalescing as an invariant", async () => {
+      // `x ?? d` is how the body reads a value, not a promise to callers.
       const body = "const val = input ?? defaultValue;"
       const candidates = await synthesizer.mineFromBody("sv-1", body, "sym-1", "repo", "snap", "typescript")
 
-      expect(candidates.some((c) => c.expression.includes("null_safety"))).toBe(true)
+      expect(candidates.some((c) => c.expression.includes("null_safety"))).toBe(false)
     })
 
     test("detects regex validators", async () => {

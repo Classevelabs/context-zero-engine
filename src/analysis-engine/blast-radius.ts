@@ -52,7 +52,7 @@ export class BlastRadiusEngine {
       this.computeBehavioralImpact(targetSymbolVersionIds),
       this.computeContractImpact(targetSymbolVersionIds),
       this.computeHomologImpact(snapshotId, targetSymbolVersionIds),
-      this.computeHistoricalImpact(targetSymbolVersionIds),
+      this.computeHistoricalImpact(snapshotId, targetSymbolVersionIds),
     ])
 
     // Deduplicate across dimensions — a symbol can appear in multiple
@@ -196,7 +196,11 @@ export class BlastRadiusEngine {
     }[]) {
       if (!row.purity_class) continue
 
-      // Callers with pure/read_only purity that call into changed code are at risk
+      // A pure or read-only caller assumes its callee stays that way. That
+      // is a real assumption to re-check, not a known break: a change to
+      // the callee may keep the property. Rating every such caller "high"
+      // made the validation scope strict for ordinary edits, and the
+      // structural dimension already rates direct callers high.
       if (row.purity_class === "pure" || row.purity_class === "read_only") {
         impacts.push({
           symbol_id: row.symbol_id,
@@ -207,7 +211,7 @@ export class BlastRadiusEngine {
           impact_type: "behavioral",
           relation_type: "purity_assumption",
           confidence: 0.8,
-          severity: "high",
+          severity: "medium",
           evidence: `Caller has purity=${row.purity_class} but calls changed symbol`,
           recommended_action: "validate_contract",
         })
@@ -255,6 +259,20 @@ export class BlastRadiusEngine {
       range_start_line: number
       range_end_line: number
     }[]) {
+      // Only an invariant the code itself enforces (an assertion, a
+      // validation schema) can be "critical" to break; one derived from the
+      // body's shape describes the body and tops out at medium. Strength
+      // alone used to decide, so every 0.9 body-derived observation made the
+      // whole report strict.
+      const enforced = row.source_type === "assertion" || row.source_type === "schema"
+      const severity =
+        enforced && row.strength >= 0.9
+          ? "critical"
+          : row.strength >= 0.9
+            ? "high"
+            : row.strength >= 0.7 && row.source_type !== "derived"
+              ? "medium"
+              : "low"
       impacts.push({
         symbol_id: row.symbol_id,
         symbol_name: row.canonical_name,
@@ -264,7 +282,7 @@ export class BlastRadiusEngine {
         impact_type: "contract",
         relation_type: `invariant:${row.source_type}`,
         confidence: row.strength,
-        severity: row.strength >= 0.9 ? "critical" : row.strength >= 0.7 ? "high" : "medium",
+        severity,
         evidence: `Invariant may be violated: ${row.expression}`,
         recommended_action: "validate_contract",
       })
@@ -330,13 +348,18 @@ export class BlastRadiusEngine {
 
   /**
    * Dimension 5: Historical co-change analysis.
-   * Finds symbols that historically changed together with the targets.
+   *
+   * Two granularities, each reported as what it is. Symbol partners come
+   * from co_changed_with relations, which blame supports line by line. File
+   * partners come from the commit log and are exact but coarse, so they are
+   * attached to the partner file's module symbol at low severity rather than
+   * fanned out over every symbol in the file, which is what the old
+   * file-derived symbol pairs amounted to.
    */
-  private async computeHistoricalImpact(targetIds: string[]): Promise<BlastRadiusImpact[]> {
+  private async computeHistoricalImpact(snapshotId: string, targetIds: string[]): Promise<BlastRadiusImpact[]> {
     const impacts: BlastRadiusImpact[] = []
     if (targetIds.length === 0) return impacts
 
-    // Historical co-change is derived from inferred_relations with type co_changed_with
     const placeholders = targetIds.map((_, i) => `$${i + 1}`).join(",")
 
     const result = await db.query(
@@ -377,6 +400,68 @@ export class BlastRadiusEngine {
         confidence: row.confidence,
         severity: row.confidence >= 0.8 ? "medium" : "low",
         evidence: `Historically co-changed with target symbol`,
+        recommended_action: "manual_review",
+      })
+    }
+
+    const targetFiles = (
+      await db.query(
+        `
+            SELECT DISTINCT f.path, s.repo_id
+            FROM symbol_versions sv
+            JOIN symbols s ON s.symbol_id = sv.symbol_id
+            JOIN files f ON f.file_id = sv.file_id
+            WHERE sv.symbol_version_id IN (${placeholders})
+        `,
+        targetIds,
+      )
+    ).rows as { path: string; repo_id: string }[]
+    const paths = [...new Set(targetFiles.map((row) => row.path))]
+    const repoId = targetFiles[0]?.repo_id
+    if (!repoId || paths.length === 0) return impacts
+
+    const filePartners = await db.query(
+      `
+            SELECT x.path AS file_path, x.jaccard_coefficient, x.co_change_count,
+                   s.symbol_id, s.canonical_name, sv.range_start_line, sv.range_end_line
+            FROM (
+                SELECT CASE WHEN tfc.file_a = ANY($2) THEN tfc.file_b ELSE tfc.file_a END AS path,
+                       tfc.jaccard_coefficient, tfc.co_change_count
+                FROM temporal_file_co_changes tfc
+                WHERE tfc.repo_id = $3
+                  AND (tfc.file_a = ANY($2) OR tfc.file_b = ANY($2))
+                  AND tfc.jaccard_coefficient >= 0.50
+            ) x
+            JOIN files f ON f.snapshot_id = $1 AND f.path = x.path
+            JOIN symbol_versions sv ON sv.file_id = f.file_id AND sv.snapshot_id = $1
+            JOIN symbols s ON s.symbol_id = sv.symbol_id AND s.kind = 'module'
+            WHERE NOT (x.path = ANY($2))
+            ORDER BY x.jaccard_coefficient DESC
+            LIMIT 200
+        `,
+      [snapshotId, paths, repoId],
+    )
+
+    for (const row of filePartners.rows as {
+      file_path: string
+      jaccard_coefficient: number
+      co_change_count: number
+      symbol_id: string
+      canonical_name: string
+      range_start_line: number
+      range_end_line: number
+    }[]) {
+      impacts.push({
+        symbol_id: row.symbol_id,
+        symbol_name: row.canonical_name,
+        file_path: row.file_path,
+        start_line: row.range_start_line,
+        end_line: row.range_end_line,
+        impact_type: "historical",
+        relation_type: "file_co_changed_with",
+        confidence: row.jaccard_coefficient,
+        severity: "low",
+        evidence: `File changed together with a target's file in ${row.co_change_count} commit(s)`,
         recommended_action: "manual_review",
       })
     }

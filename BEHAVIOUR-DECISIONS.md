@@ -15,6 +15,109 @@ against, and how a regression would show up to somebody using the engine.
 
 ---
 
+## 2026-09-06 — Symbol co-change comes from blame; file co-change from the log
+
+**Decision.** `temporal_co_changes` holds symbol pairs whose lines were last
+touched by the same commit, attributed by `git blame --porcelain` per file
+within `SCG_TEMPORAL_BLAME_BUDGET_MS` (60 s, four files in flight, 15 s per
+file, files over 20,000 lines skipped). `temporal_file_co_changes` (migration
+029) holds file pairs from the commit log. Both tables are rewritten per run.
+Risk scores use blame where a file was blamed and the file's commits where it
+was not, and the ingest log reports both counts. Blast radius reports file
+partners on the partner file's module symbol at low severity.
+
+**Why it is not arbitrary.** A diff hunk cannot be mapped onto today's symbol
+ranges, because the lines have moved since; blame can, exactly, for the last
+change to each line. The old derivation paired every symbol in a changed file
+with every other: 87,804 rows and 28 MB on the local database, every one a
+claim about symbols that the data could not support, and blast radius named
+whole files as a symbol's partners. File history is kept because it is exact
+at its own granularity, and it is kept separate so no reader mistakes one for
+the other. The budget exists because blame is one process per file and a
+large repository has more files than one ingest should wait on; what the
+budget does not reach is stated, not guessed.
+
+**Verified against.** `blame-co-change.test.ts` builds a real repository in a
+temporary directory and checks that each symbol is attributed to the commits
+that touched its lines, that untracked and oversized files are refused, and
+that a zero budget starts nothing. Temporal tests check that shared files
+alone produce no symbol pair, that a pair needs two shared commits, and that
+both tables are cleared before being rewritten. Observed in a fresh
+database on this engine's repository (71 commits): 159 of 161 files blamed in
+3.9 s, 650 file pairs, 90 symbol pairs, 142 relations, 6,178 risk rows, zero
+error lines; gin and flask (one commit each in the corpus) blamed fully in
+1.6 s and 1.2 s.
+
+**Regression looks like.** `get_co_change_partners` again returns every
+symbol of a neighbouring file as a partner; `temporal_co_changes` grows back
+toward tens of thousands of rows per repository; the ingest log shows
+`files_blamed` at 0 while the repository is a git checkout.
+
+---
+
+## 2026-09-06 — An invariant is a promise to callers, and only an enforced one can be critical
+
+**Decision.** The deep contract miner no longer emits `null_safety` (`??`,
+`?.`), `closure` (nested-function count) or `closure_binding` (uses `this`),
+and `persistInvariants` keeps at most `MAX_INVARIANTS_PER_SYMBOL` (40) per
+symbol, strongest first. Blast radius rates a contract impact critical only
+for an `assertion` or `schema` invariant at strength 0.9 or above; a `derived`
+one never reaches high. A pure or read-only caller is a medium behavioral
+impact. Effect entries carry `source`, and heuristic ones `confidence: 0.5`.
+
+**Why it is not arbitrary.** Measured on the local database: the three
+dropped categories were 18,676 of 75,889 invariant rows, at strengths 0.65 to
+0.72, and none of them told a caller what it may pass or expect. Per-symbol
+counts had a 99th percentile of 23 and a maximum of 129; past a few dozen the
+list is a transcript of the body and a capsule cannot spend tokens on it. The
+severity rules follow from what the words mean: only something the code
+enforces can be broken, and a caller's purity assumption is a thing to
+re-check, which the structural dimension already rates high for direct
+callers. Heuristic effects stay because the tree-sitter languages have no
+type resolver; labelling them is what lets a reader weigh them.
+
+**Verified against.** `mineFromBody` tests assert the dropped prefixes are
+absent while `null_check`, `return_shape` and `higher_order` remain;
+`capPerSymbol` keeps the strongest 40 of an over-full symbol and leaves others
+untouched; blast-radius tests pin the severity of each source type and of a
+pure caller; the pattern miner labels every entry.
+
+**Regression looks like.** Invariant rows per symbol climb past 40; capsule
+contract sections fill with `closure:` lines; `compute_blast_radius` answers
+`strict` for an edit whose only impacts are pure callers and body-derived
+observations.
+
+---
+
+## 2026-09-06 — A concept family is seeded by shared dependencies, not a shared suffix
+
+**Decision.** When homolog edges are sparse, `clusterBySharedDependencies`
+groups symbols of one kind whose callee sets overlap: Jaccard of the sets,
+at least two shared callees, at least 0.5, callees with more than 200 callers
+ignored. `clusterByNamingPatterns` (suffix buckets joined at a synthetic
+0.45) is gone, and so is the homolog "same kind" candidate bucket.
+
+**Why it is not arbitrary.** A suffix is a naming convention; two symbols
+that call the same things are doing related work whether or not their names
+agree, and the graph already records that. A logger with hundreds of callers
+says nothing about any two of them, hence the caller cap. The homolog bucket
+returned twenty rows in planner order and each cost seven scoring
+dimensions, two of which were database queries per candidate; those two are
+now loaded once per target.
+
+**Verified against.** Family tests: symbols sharing three callees form one
+family at confidence 1; three `*Service` symbols with disjoint callees form
+none; one shared callee, or different kinds, form none. Homolog test: one
+`test_artifacts` query and one `co_changed_with` query per `findHomologs`,
+no `s.kind = $2` bucket, and the per-candidate scores read from the loaded
+maps.
+
+**Regression looks like.** Small repositories grow families named after
+suffixes with 0.45 confidence; homolog candidate counts jump by twenty for
+every target; query counts per `find_homologs` scale with the candidates.
+
+---
+
 ## 2026-09-05 — A MinHash signature is stored only for a view of 8 or more tokens
 
 **Decision.** `MINHASH_MIN_TOKENS` in `similarity.ts` is 8. Below it a view

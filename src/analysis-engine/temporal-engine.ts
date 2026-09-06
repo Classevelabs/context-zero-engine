@@ -20,6 +20,8 @@ import { v4 as uuidv4 } from "uuid"
 import { db } from "../db-driver"
 import { Logger } from "../logger"
 import { resolveExistingPath } from "../path-security"
+import { temporal as temporalConfig } from "../config"
+import { blameFile, commitsPerSymbol, withinBudget, type SymbolHistory, type SymbolRange } from "./blame-co-change"
 
 const log = new Logger("temporal-engine")
 
@@ -43,7 +45,13 @@ export interface GitCommit {
 /** Top-level result returned by computeTemporalIntelligence. */
 export interface TemporalResult {
   commits_mined: number
+  /** Symbol pairs whose lines were last touched by the same commits (from blame). */
   co_change_pairs: number
+  /** File pairs that changed in the same commits (from the log). */
+  file_co_change_pairs: number
+  /** Files whose lines were attributed to commits; the rest keep file-level history. */
+  files_blamed: number
+  files_unblamed: number
   risk_scores_computed: number
   duration_ms: number
 }
@@ -71,6 +79,22 @@ export interface CoChangePartner {
   co_change_count: number
   jaccard_coefficient: number
   last_co_change: Date | null
+}
+
+/** A file that changes together with one of a symbol's files. */
+export interface FileCoChangePartner {
+  file: string
+  partner: string
+  co_change_count: number
+  jaccard_coefficient: number
+  last_co_change: Date | null
+}
+
+/** Accumulator for one unordered pair while counting co-changes. */
+interface PairStats {
+  count: number
+  firstDate: Date | null
+  lastDate: Date | null
 }
 
 /** Per-symbol accumulator used during risk computation. */
@@ -135,6 +159,58 @@ const DEFAULT_MAX_COMMITS = 5000
 /** Batch size for DB inserts. */
 const DB_BATCH_SIZE = 500
 
+/**
+ * Members of one commit that take part in pairing. A commit touching more
+ * files or symbols than this is a sweep (a rename, a formatter run), and the
+ * pairs it would produce say nothing about any two of them.
+ */
+const MAX_MEMBERS_PER_COMMIT = 50
+
+/** Blame processes in flight at once. */
+const BLAME_CONCURRENCY = 4
+
+/** Wall-clock bound on one blame process. */
+const BLAME_FILE_TIMEOUT_MS = 15_000
+
+/**
+ * Byte order of the UTF-8 encoding, which is what the database's "C"
+ * collation compares. JavaScript's default sort orders UTF-16 code units,
+ * and the database's locale collation orders "_" and case differently
+ * again; a pair ordered by either of those failed the table's order check.
+ */
+function byteOrder(a: string, b: string): number {
+  return Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"))
+}
+
+/** Count every unordered pair of `members` once for a commit dated `date`. `members` is in byte order. */
+function countPairs(members: string[], date: Date | null, pairs: Map<string, PairStats>): void {
+  for (let i = 0; i < members.length; i++) {
+    for (let j = i + 1; j < members.length; j++) {
+      const key = `${members[i]}|${members[j]}`
+      const existing = pairs.get(key)
+      if (!existing) {
+        pairs.set(key, { count: 1, firstDate: date, lastDate: date })
+        continue
+      }
+      existing.count++
+      if (date) {
+        if (!existing.firstDate || date < existing.firstDate) existing.firstDate = date
+        if (!existing.lastDate || date > existing.lastDate) existing.lastDate = date
+      }
+    }
+  }
+}
+
+function splitPair(key: string): [string, string] {
+  const pipe = key.indexOf("|")
+  return [key.substring(0, pipe), key.substring(pipe + 1)]
+}
+
+function jaccard(shared: number, totalA: number, totalB: number): number {
+  const union = totalA + totalB - shared
+  return union > 0 ? shared / union : 0
+}
+
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
@@ -149,8 +225,9 @@ export class TemporalEngine {
    *
    * Orchestration:
    *   1. Mine git log -> GitCommit[]
-   *   2. Compute co-change pairs -> temporal_co_changes + inferred_relations
-   *   3. Compute risk scores -> temporal_risk_scores
+   *   2. Blame the snapshot's files -> commits per symbol
+   *   3. Compute co-change pairs -> temporal_file_co_changes, temporal_co_changes, inferred_relations
+   *   4. Compute risk scores -> temporal_risk_scores
    */
   public async computeTemporalIntelligence(
     repoId: string,
@@ -167,6 +244,9 @@ export class TemporalEngine {
       const result: TemporalResult = {
         commits_mined: 0,
         co_change_pairs: 0,
+        file_co_change_pairs: 0,
+        files_blamed: 0,
+        files_unblamed: 0,
         risk_scores_computed: 0,
         duration_ms: Date.now() - startMs,
       }
@@ -174,17 +254,19 @@ export class TemporalEngine {
       return result
     }
 
-    // Pre-compute the file→symbol map once for both engines to avoid duplicate DB queries
-    const fileToSymbols = await this.resolveFileSymbolMap(repoId, snapshotId)
+    const history = await this.collectSymbolHistory(repoBasePath, snapshotId)
 
-    const [coChangePairs, riskScores] = await Promise.all([
-      this.computeCoChanges(repoId, snapshotId, commits, fileToSymbols),
-      this.computeRiskScores(repoId, snapshotId, commits, fileToSymbols),
+    const [coChanges, riskScores] = await Promise.all([
+      this.computeCoChanges(repoId, snapshotId, commits, history),
+      this.computeRiskScores(repoId, snapshotId, commits, history),
     ])
 
     const result: TemporalResult = {
       commits_mined: commits.length,
-      co_change_pairs: coChangePairs,
+      co_change_pairs: coChanges.symbol_pairs,
+      file_co_change_pairs: coChanges.file_pairs,
+      files_blamed: history.blamedFiles.size,
+      files_unblamed: history.filesSkipped,
       risk_scores_computed: riskScores,
       duration_ms: Date.now() - startMs,
     }
@@ -262,116 +344,158 @@ export class TemporalEngine {
   }
 
   /**
-   * Compute co-change pairs from commit history and persist to
-   * temporal_co_changes. High-Jaccard pairs also get an
-   * inferred_relation (co_changed_with).
+   * Attribute the snapshot's symbols to the commits that last touched their
+   * lines, within the configured blame budget.
    *
-   * Returns the number of co-change pairs persisted.
+   * A commit's diff hunks cannot be mapped onto today's symbol ranges (the
+   * lines have moved since), but blame names, for each current line, the
+   * commit that last changed it. Files that cannot be blamed (untracked,
+   * binary, past the size bound) or that the budget does not reach keep
+   * file-level history, and are counted so the ingest log says so.
+   */
+  public async collectSymbolHistory(repoBasePath: string, snapshotId: string): Promise<SymbolHistory> {
+    repoBasePath = resolveExistingPath(repoBasePath)
+    const timer = log.startTimer("collectSymbolHistory", { snapshotId })
+
+    const rows = (
+      await db.query(
+        `SELECT f.path, s.symbol_id, sv.range_start_line, sv.range_end_line
+           FROM symbol_versions sv
+           JOIN symbols s ON s.symbol_id = sv.symbol_id
+           JOIN files f ON f.file_id = sv.file_id
+          WHERE sv.snapshot_id = $1 AND s.kind <> 'module'`,
+        [snapshotId],
+      )
+    ).rows as { path: string; symbol_id: string; range_start_line: number; range_end_line: number }[]
+
+    const rangesByFile = new Map<string, SymbolRange[]>()
+    const symbolsByFile = new Map<string, string[]>()
+    for (const row of rows) {
+      const ranges = rangesByFile.get(row.path) ?? []
+      ranges.push({ symbol_id: row.symbol_id, range_start_line: row.range_start_line, range_end_line: row.range_end_line })
+      rangesByFile.set(row.path, ranges)
+      const ids = symbolsByFile.get(row.path) ?? []
+      if (!ids.includes(row.symbol_id)) ids.push(row.symbol_id)
+      symbolsByFile.set(row.path, ids)
+    }
+
+    const commitsBySymbol = new Map<string, Set<string>>()
+    const blamedFiles = new Set<string>()
+    let unblamable = 0
+    const { skipped } = await withinBudget(
+      [...rangesByFile.entries()],
+      BLAME_CONCURRENCY,
+      temporalConfig.blameBudgetMs,
+      async ([path, ranges]) => {
+        const shas = await blameFile(repoBasePath, path, BLAME_FILE_TIMEOUT_MS)
+        if (!shas) {
+          unblamable++
+          return
+        }
+        blamedFiles.add(path)
+        for (const [symbolId, commits] of commitsPerSymbol(shas, ranges)) commitsBySymbol.set(symbolId, commits)
+      },
+    )
+
+    timer({ files: rangesByFile.size, blamed: blamedFiles.size, unblamable, budget_skipped: skipped })
+    return { commitsBySymbol, blamedFiles, symbolsByFile, filesSkipped: unblamable + skipped }
+  }
+
+  /**
+   * Persist file-level co-change from the commit log and symbol-level
+   * co-change from blame, then refresh the co_changed_with relations.
+   *
+   * Symbol pairs used to be derived from files: every symbol in a changed
+   * file paired with every other, which claimed things about symbols that
+   * no line supported (28 MB of them on the local database, and whole files
+   * reported as a symbol's partners). File pairs are exact and now live in
+   * their own table; a symbol pair exists only where the same commit last
+   * touched lines of both symbols. Both tables are rewritten per run, so a
+   * pair that history no longer supports does not linger.
    */
   public async computeCoChanges(
     repoId: string,
     snapshotId: string,
     commits: GitCommit[],
-    precomputedFileToSymbols?: Map<string, string[]>,
-  ): Promise<number> {
+    history: SymbolHistory,
+  ): Promise<{ symbol_pairs: number; file_pairs: number }> {
     const timer = log.startTimer("computeCoChanges", { repoId, commitCount: commits.length })
-
-    // Step 1: Resolve file paths -> symbol IDs.
-    const fileToSymbols = precomputedFileToSymbols ?? (await this.resolveFileSymbolMap(repoId, snapshotId))
-
-    if (fileToSymbols.size === 0) {
-      log.warn("No file-to-symbol mappings found — co-change analysis skipped", { repoId })
-      timer({ pairs: 0 })
-      return 0
-    }
-
-    // Step 2: For each commit, collect the set of symbol IDs that changed.
-    //         Then for each pair (a, b), increment co-change counts.
-    const pairCounts = new Map<
-      string,
-      {
-        count: number
-        firstDate: Date
-        lastDate: Date
-      }
-    >()
-    const symbolChangeCounts = new Map<string, number>()
-
-    for (const commit of commits) {
-      if (commit.is_merge) continue // skip merge commits — they duplicate child commit files
-
-      // Collect unique symbol IDs touched by this commit
-      const touchedSymbols = new Set<string>()
-      for (const filePath of commit.files) {
-        const symbols = fileToSymbols.get(filePath)
-        if (symbols) {
-          for (const symId of symbols) {
-            touchedSymbols.add(symId)
-          }
-        }
-      }
-
-      // Increment per-symbol change counts
-      for (const symId of touchedSymbols) {
-        symbolChangeCounts.set(symId, (symbolChangeCounts.get(symId) || 0) + 1)
-      }
-
-      // Compute all pairs (order-normalized: a < b)
-      // Cap at 50 symbols per commit to prevent O(n^2) explosion
-      // (50 symbols = 1,225 pairs max, which is manageable)
-      const symbolList = Array.from(touchedSymbols).sort().slice(0, 50)
-      for (let i = 0; i < symbolList.length; i++) {
-        for (let j = i + 1; j < symbolList.length; j++) {
-          const symA = symbolList[i]!
-          const symB = symbolList[j]!
-          const key = `${symA}|${symB}`
-          const existing = pairCounts.get(key)
-          if (existing) {
-            existing.count++
-            if (commit.date < existing.firstDate) existing.firstDate = commit.date
-            if (commit.date > existing.lastDate) existing.lastDate = commit.date
-          } else {
-            pairCounts.set(key, {
-              count: 1,
-              firstDate: commit.date,
-              lastDate: commit.date,
-            })
-          }
-        }
-      }
-    }
-
-    // Step 3: Filter and compute Jaccard, then persist.
+    const commitBySha = new Map(commits.map((c) => [c.hash, c]))
     const now = new Date()
-    let persisted = 0
+
+    // File pairs, from the log.
+    const filePairs = new Map<string, PairStats>()
+    const fileChangeCounts = new Map<string, number>()
+    for (const commit of commits) {
+      if (commit.is_merge) continue // a merge lists its children's files again
+      const files = [...new Set(commit.files)].sort(byteOrder).slice(0, MAX_MEMBERS_PER_COMMIT)
+      for (const file of files) fileChangeCounts.set(file, (fileChangeCounts.get(file) ?? 0) + 1)
+      countPairs(files, commit.date, filePairs)
+    }
+
+    await db.query(`DELETE FROM temporal_file_co_changes WHERE repo_id = $1`, [repoId])
+    let filePersisted = 0
     let batch: { text: string; params: unknown[] }[] = []
-
-    for (const [key, data] of pairCounts) {
+    for (const [key, data] of filePairs) {
       if (data.count < CO_CHANGE_MIN_COUNT) continue
+      const [fileA, fileB] = splitPair(key)
+      const changesA = fileChangeCounts.get(fileA) ?? 0
+      const changesB = fileChangeCounts.get(fileB) ?? 0
+      batch.push({
+        text: `INSERT INTO temporal_file_co_changes
+                    (repo_id, file_a, file_b, co_change_count, total_changes_a, total_changes_b,
+                     jaccard_coefficient, first_co_change, last_co_change, computed_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        params: [
+          repoId,
+          fileA,
+          fileB,
+          data.count,
+          changesA,
+          changesB,
+          jaccard(data.count, changesA, changesB),
+          data.firstDate,
+          data.lastDate,
+          now,
+        ],
+      })
+      filePersisted++
+      if (batch.length >= DB_BATCH_SIZE) {
+        await db.batchInsert(batch)
+        batch = []
+      }
+    }
+    if (batch.length > 0) await db.batchInsert(batch)
 
-      const pipeIndex = key.indexOf("|")
-      const symbolA = key.substring(0, pipeIndex)
-      const symbolB = key.substring(pipeIndex + 1)
-      const changesA = symbolChangeCounts.get(symbolA) || 0
-      const changesB = symbolChangeCounts.get(symbolB) || 0
-      const union = changesA + changesB - data.count
-      const jaccard = union > 0 ? data.count / union : 0
+    // Symbol pairs, from blame: the same commit last touched lines of both.
+    const symbolsByCommit = new Map<string, string[]>()
+    for (const [symbolId, shas] of history.commitsBySymbol) {
+      for (const sha of shas) {
+        const list = symbolsByCommit.get(sha) ?? []
+        list.push(symbolId)
+        symbolsByCommit.set(sha, list)
+      }
+    }
+    const symbolPairs = new Map<string, PairStats>()
+    for (const [sha, symbols] of symbolsByCommit) {
+      const members = [...new Set(symbols)].sort(byteOrder).slice(0, MAX_MEMBERS_PER_COMMIT)
+      countPairs(members, commitBySha.get(sha)?.date ?? null, symbolPairs)
+    }
 
+    await db.query(`DELETE FROM temporal_co_changes WHERE repo_id = $1`, [repoId])
+    let symbolPersisted = 0
+    batch = []
+    for (const [key, data] of symbolPairs) {
+      if (data.count < CO_CHANGE_MIN_COUNT) continue
+      const [symbolA, symbolB] = splitPair(key)
+      const changesA = history.commitsBySymbol.get(symbolA)?.size ?? 0
+      const changesB = history.commitsBySymbol.get(symbolB)?.size ?? 0
       batch.push({
         text: `INSERT INTO temporal_co_changes
                     (co_change_id, repo_id, symbol_a_id, symbol_b_id,
                      co_change_count, total_changes_a, total_changes_b,
                      jaccard_coefficient, first_co_change, last_co_change, computed_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                    ON CONFLICT (repo_id, symbol_a_id, symbol_b_id)
-                    DO UPDATE SET
-                        co_change_count = EXCLUDED.co_change_count,
-                        total_changes_a = EXCLUDED.total_changes_a,
-                        total_changes_b = EXCLUDED.total_changes_b,
-                        jaccard_coefficient = EXCLUDED.jaccard_coefficient,
-                        first_co_change = EXCLUDED.first_co_change,
-                        last_co_change = EXCLUDED.last_co_change,
-                        computed_at = EXCLUDED.computed_at`,
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         params: [
           uuidv4(),
           repoId,
@@ -380,29 +504,24 @@ export class TemporalEngine {
           data.count,
           changesA,
           changesB,
-          jaccard,
+          jaccard(data.count, changesA, changesB),
           data.firstDate,
           data.lastDate,
           now,
         ],
       })
-      persisted++
-
+      symbolPersisted++
       if (batch.length >= DB_BATCH_SIZE) {
         await db.batchInsert(batch)
         batch = []
       }
     }
+    if (batch.length > 0) await db.batchInsert(batch)
 
-    if (batch.length > 0) {
-      await db.batchInsert(batch)
-    }
-
-    // Step 4: Create inferred_relations for high-Jaccard pairs.
     await this.createCoChangeRelations(repoId, snapshotId)
 
-    timer({ pairs: persisted })
-    return persisted
+    timer({ symbol_pairs: symbolPersisted, file_pairs: filePersisted })
+    return { symbol_pairs: symbolPersisted, file_pairs: filePersisted }
   }
 
   /**
@@ -413,13 +532,27 @@ export class TemporalEngine {
     repoId: string,
     snapshotId: string,
     commits: GitCommit[],
-    precomputedFileToSymbols?: Map<string, string[]>,
+    history: SymbolHistory,
   ): Promise<number> {
     const timer = log.startTimer("computeRiskScores", { repoId, snapshotId, commitCount: commits.length })
+    const commitBySha = new Map(commits.map((c) => [c.hash, c]))
 
-    const fileToSymbols = precomputedFileToSymbols ?? (await this.resolveFileSymbolMap(repoId, snapshotId))
-    if (fileToSymbols.size === 0) {
-      log.warn("No file-to-symbol mappings — risk scoring skipped", { repoId })
+    // Commits per symbol: blame where the file was blamed, the file's own
+    // commits where it was not. Both counts are in the ingest log.
+    const commitsBySymbol = new Map<string, Set<string>>(history.commitsBySymbol)
+    for (const commit of commits) {
+      if (commit.is_merge) continue
+      for (const file of commit.files) {
+        if (history.blamedFiles.has(file)) continue
+        for (const symbolId of history.symbolsByFile.get(file) ?? []) {
+          const set = commitsBySymbol.get(symbolId) ?? new Set<string>()
+          set.add(commit.hash)
+          commitsBySymbol.set(symbolId, set)
+        }
+      }
+    }
+    if (commitsBySymbol.size === 0) {
+      log.warn("No symbol has change history — risk scoring skipped", { repoId })
       timer({ scores: 0 })
       return 0
     }
@@ -429,52 +562,33 @@ export class TemporalEngine {
     const thirtyDaysAgo = new Date()
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
 
-    for (const commit of commits) {
-      if (commit.is_merge) continue
-
-      const touchedSymbols = new Set<string>()
-      for (const filePath of commit.files) {
-        const symbols = fileToSymbols.get(filePath)
-        if (symbols) {
-          for (const symId of symbols) {
-            touchedSymbols.add(symId)
-          }
-        }
+    for (const [symbolId, shas] of commitsBySymbol) {
+      const s: SymbolStats = {
+        total_changes: 0,
+        bug_fix_count: 0,
+        bug_fix_dates: [],
+        revert_count: 0,
+        regression_count: 0,
+        recent_churn_30d: 0,
+        authors: new Set<string>(),
+        last_change_date: null,
       }
-
-      for (const symId of touchedSymbols) {
-        let s = stats.get(symId)
-        if (!s) {
-          s = {
-            total_changes: 0,
-            bug_fix_count: 0,
-            bug_fix_dates: [],
-            revert_count: 0,
-            regression_count: 0,
-            recent_churn_30d: 0,
-            authors: new Set<string>(),
-            last_change_date: null,
-          }
-          stats.set(symId, s)
-        }
-
+      for (const sha of shas) {
         s.total_changes++
+        // Blame can reach past the mined log window; such a change counts,
+        // and its author and date are simply unknown.
+        const commit = commitBySha.get(sha)
+        if (!commit) continue
         s.authors.add(commit.author_email)
-
         if (commit.is_bug_fix) {
           s.bug_fix_count++
           s.bug_fix_dates.push(commit.date)
         }
-        if (commit.is_revert) {
-          s.revert_count++
-        }
-        if (commit.date >= thirtyDaysAgo) {
-          s.recent_churn_30d++
-        }
-        if (!s.last_change_date || commit.date > s.last_change_date) {
-          s.last_change_date = commit.date
-        }
+        if (commit.is_revert) s.revert_count++
+        if (commit.date >= thirtyDaysAgo) s.recent_churn_30d++
+        if (!s.last_change_date || commit.date > s.last_change_date) s.last_change_date = commit.date
       }
+      stats.set(symbolId, s)
     }
 
     // Detect regressions: same symbol fixed more than once within REGRESSION_WINDOW_DAYS
@@ -627,6 +741,40 @@ export class TemporalEngine {
     )
 
     return result.rows as CoChangePartner[]
+  }
+
+  /**
+   * Files that change together with the files a symbol lives in. This is
+   * the file-granular history, exact but coarse; symbol partners come from
+   * getCoChangePartners.
+   */
+  public async getFileCoChangePartners(
+    symbolId: string,
+    repoId: string,
+    minJaccard: number = 0.1,
+  ): Promise<FileCoChangePartner[]> {
+    minJaccard = Number.isFinite(minJaccard) ? Math.min(1, Math.max(0, minJaccard)) : 0.1
+    const result = await db.query(
+      `
+            WITH own AS (
+                SELECT DISTINCT f.path
+                FROM symbol_versions sv
+                JOIN files f ON f.file_id = sv.file_id
+                WHERE sv.symbol_id = $1
+            )
+            SELECT own.path AS file,
+                   CASE WHEN tfc.file_a = own.path THEN tfc.file_b ELSE tfc.file_a END AS partner,
+                   tfc.co_change_count, tfc.jaccard_coefficient, tfc.last_co_change
+            FROM own
+            JOIN temporal_file_co_changes tfc
+              ON tfc.repo_id = $2 AND (tfc.file_a = own.path OR tfc.file_b = own.path)
+            WHERE tfc.jaccard_coefficient >= $3
+            ORDER BY tfc.jaccard_coefficient DESC
+            LIMIT 200
+        `,
+      [symbolId, repoId, minJaccard],
+    )
+    return result.rows as FileCoChangePartner[]
   }
 
   /**
@@ -965,56 +1113,19 @@ export class TemporalEngine {
   }
 
   /**
-   * Build a map from file path -> symbol IDs using the files and
-   * symbol_versions tables. Uses the given snapshot (so it works
-   * even before the snapshot is marked 'complete').
-   *
-   * This enables mapping git-log file paths to the symbols defined
-   * in those files.
-   */
-  private async resolveFileSymbolMap(repoId: string, snapshotId: string): Promise<Map<string, string[]>> {
-    const result = await db.query(
-      `
-            SELECT f.path, s.symbol_id
-            FROM symbol_versions sv
-            JOIN symbols s ON s.symbol_id = sv.symbol_id
-            JOIN files f ON f.file_id = sv.file_id
-            WHERE s.repo_id = $1
-              AND sv.snapshot_id = $2
-        `,
-      [repoId, snapshotId],
-    )
-
-    const fileMap = new Map<string, string[]>()
-    const seen = new Set<string>() // dedup symbol_id per path
-
-    for (const row of result.rows as { path: string; symbol_id: string }[]) {
-      const key = `${row.path}|${row.symbol_id}`
-      if (seen.has(key)) continue
-      seen.add(key)
-
-      const existing = fileMap.get(row.path)
-      if (existing) {
-        existing.push(row.symbol_id)
-      } else {
-        fileMap.set(row.path, [row.symbol_id])
-      }
-    }
-
-    log.debug("Resolved file-to-symbol map", {
-      files: fileMap.size,
-      symbols: seen.size,
-    })
-
-    return fileMap
-  }
-
-  /**
    * Create co_changed_with inferred_relations for high-Jaccard
    * co-change pairs. Looks up the current symbol_version_ids for
    * the latest complete snapshot, then upserts inferred_relations.
    */
   private async createCoChangeRelations(repoId: string, snapshotId: string): Promise<number> {
+    // The pairs were just rewritten; relations from an earlier run of this
+    // snapshot would otherwise outlive the history that produced them.
+    await db.query(
+      `DELETE FROM inferred_relations
+        WHERE relation_type = 'co_changed_with' AND valid_from_snapshot_id = $1`,
+      [snapshotId],
+    )
+
     // Get high-Jaccard pairs
     const pairsResult = await db.query(
       `

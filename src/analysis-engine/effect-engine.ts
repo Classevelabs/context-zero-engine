@@ -53,6 +53,17 @@ export type EffectKind =
  * A single typed effect entry. Every effect has a kind plus a domain-specific
  * descriptor field (resource, event, target, etc.) and a human-readable detail.
  */
+/**
+ * Where an effect entry came from. A behavioral profile is type-resolved
+ * (for TypeScript, checker-verified); a contract profile is declared; a
+ * heuristic pattern is a regular expression over the body text and can be
+ * wrong. Readers get to tell them apart.
+ */
+export type EffectSource = "behavioral_profile" | "contract_profile" | "heuristic_pattern"
+
+/** Confidence carried by an entry a regular expression found. */
+export const HEURISTIC_PATTERN_CONFIDENCE = 0.5
+
 export interface EffectEntry {
   kind: EffectKind
   /** Domain key — resource path, event name, error type, etc. */
@@ -61,6 +72,10 @@ export interface EffectEntry {
   detail: string
   /** Whether this effect was observed directly or propagated from a callee */
   provenance: "direct" | "transitive"
+  /** How the effect was found. Absent on entries written before sources were recorded. */
+  source?: EffectSource
+  /** Confidence in this entry alone; only heuristic entries carry one. */
+  confidence?: number
   /** If transitive, the originating symbol version ID */
   origin_symbol_version_id?: string
   /** If transitive, call-graph distance from the direct observation (1 = immediate callee) */
@@ -674,12 +689,12 @@ export class EffectEngine {
 
       // Mine from behavioral profile
       if (bp) {
-        effects.push(...this.mineFromBehavioralProfile(bp))
+        effects.push(...withSource(this.mineFromBehavioralProfile(bp), "behavioral_profile"))
       }
 
       // Mine from contract profile
       if (cp) {
-        effects.push(...this.mineFromContractProfile(cp))
+        effects.push(...withSource(this.mineFromContractProfile(cp), "contract_profile"))
       }
 
       // Mine from framework patterns (body source + signature)
@@ -782,14 +797,14 @@ export class EffectEngine {
     const bpResult = await db.query(`SELECT * FROM behavioral_profiles WHERE symbol_version_id = $1`, [symbolVersionId])
     const bp = bpResult.rows[0] as BehavioralProfile | undefined
     if (bp) {
-      effects.push(...this.mineFromBehavioralProfile(bp))
+      effects.push(...withSource(this.mineFromBehavioralProfile(bp), "behavioral_profile"))
     }
 
     // Mine from contract profile in DB (if any)
     const cpResult = await db.query(`SELECT * FROM contract_profiles WHERE symbol_version_id = $1`, [symbolVersionId])
     const cp = cpResult.rows[0] as ContractProfile | undefined
     if (cp) {
-      effects.push(...this.mineFromContractProfile(cp))
+      effects.push(...withSource(this.mineFromContractProfile(cp), "contract_profile"))
     }
 
     // Mine from framework patterns (body source)
@@ -1056,6 +1071,9 @@ export class EffectEngine {
               origin_symbol_version_id:
                 calleeEffect.provenance === "transitive" ? calleeEffect.origin_symbol_version_id : calleeId,
               hops,
+              // A lifted effect is exactly as trustworthy as where it was found.
+              ...(calleeEffect.source ? { source: calleeEffect.source } : {}),
+              ...(calleeEffect.confidence !== undefined ? { confidence: calleeEffect.confidence } : {}),
             })
             callerKeys.add(transitiveKey)
             callerChanged = true
@@ -1188,6 +1206,8 @@ export class EffectEngine {
                 origin_symbol_version_id:
                   calleeEffect.provenance === "transitive" ? calleeEffect.origin_symbol_version_id : calleeId,
                 hops,
+                ...(calleeEffect.source ? { source: calleeEffect.source } : {}),
+                ...(calleeEffect.confidence !== undefined ? { confidence: calleeEffect.confidence } : {}),
               })
               memberKeys.add(key)
               memberChanged = true
@@ -1250,6 +1270,8 @@ export class EffectEngine {
                 provenance: "transitive",
                 origin_symbol_version_id: effect.provenance === "transitive" ? effect.origin_symbol_version_id : nodeId,
                 hops: 1,
+                ...(effect.source ? { source: effect.source } : {}),
+                ...(effect.confidence !== undefined ? { confidence: effect.confidence } : {}),
               })
               nodeKeys.add(key)
               changed = true
@@ -1882,6 +1904,8 @@ export class EffectEngine {
               descriptor: template.descriptor,
               detail: template.detail,
               provenance: "direct",
+              source: "heuristic_pattern",
+              confidence: HEURISTIC_PATTERN_CONFIDENCE,
             })
           }
         }
@@ -1948,6 +1972,10 @@ export class EffectEngine {
       .replace(/\s+/g, "_")
       .replace(/[^a-z0-9_.-]/g, "")
   }
+}
+
+function withSource(effects: EffectEntry[], source: EffectSource): EffectEntry[] {
+  return effects.map((effect) => ({ ...effect, source }))
 }
 
 export const effectEngine = new EffectEngine()

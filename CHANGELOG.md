@@ -15,6 +15,66 @@ re-embeds it against the stored corpus. Nothing else is lost.
 
 ### Fixed
 
+- **Historical co-change claimed symbol pairs that no line supported.**
+  Symbol pairs were derived from files: every symbol in a changed file
+  "co-changed" with every other, capped at fifty per commit, so one commit
+  touching two ordinary files produced up to 1,225 symbol pairs. On the local
+  database that was 87,804 rows and 28 MB, and blast radius listed whole
+  files as a symbol's historical partners. File-level history is exact and
+  now has its own table (`temporal_file_co_changes`, migration 029). Symbol
+  pairs come from `git blame`: the commits that last touched each symbol's
+  lines, so two symbols co-changed only when the same commit last touched
+  lines of both. Blame runs within a wall-clock budget
+  (`SCG_TEMPORAL_BLAME_BUDGET_MS`, 60 s); files it does not reach keep
+  file-level history and are counted in the ingest log. Risk scores use the
+  same attribution. Both tables are rewritten on every run, so a pair that
+  history no longer supports does not linger, and `get_co_change_partners`
+  returns symbol partners and file partners as separate lists. Rows computed
+  before the migration are removed; the next ingest of each repository
+  recomputes them. Measured in a fresh database on this engine's own repository (71
+  commits, 164 files): 159 of 161 files blamed in 3.9 s, 650 file pairs,
+  90 symbol pairs, 142 relations, 6,178 risk rows; gin's 98 files blamed
+  in 1.6 s and flask's 66 in 1.2 s. Lines the working tree has changed
+  since the last commit belong to no commit and are left out.
+- **Blast radius rated every pure caller "high" and every strong
+  body-derived invariant "critical".** A pure or read-only caller's
+  assumption is something to re-check, not a known break, and is now medium;
+  the structural dimension already rates direct callers high. An invariant
+  is critical only when the code enforces it (an assertion or a validation
+  schema) at strength 0.9 or above; one derived from the body's shape tops
+  out below high. File co-change partners are reported on the partner file's
+  module symbol at low severity instead of being fanned out over every
+  symbol in the file.
+- **Effects found by regular expressions looked the same as type-resolved
+  ones.** Every effect entry now says where it came from (`source`:
+  `behavioral_profile`, `contract_profile` or `heuristic_pattern`), and a
+  heuristic entry carries its own `confidence` of 0.5. Nothing is removed;
+  readers can now tell a checker-verified network call from a word match.
+- **A quarter of all invariants described the body instead of constraining
+  it.** `null_safety` (`x ?? d`, `x?.m()`), `closure` (a count of nested
+  functions) and `closure_binding` (uses `this`) were 18,676 of 75,889
+  invariant rows on the local database and promised callers nothing. They
+  are no longer emitted; explicit null checks, return shapes and
+  higher-order facts stay. A symbol also keeps at most 40 invariants,
+  strongest first: the 99th-percentile symbol carried 23, the largest 129.
+- **Concept families were seeded by name suffix.** When homolog edges were
+  sparse, every `*Service` was joined to every other `*Service` at a
+  synthetic 0.45, which made a family out of a naming convention. The seed
+  now groups symbols of one kind by the callees they share: the edge is the
+  Jaccard overlap of their callee sets, needs at least two shared callees
+  and an overlap of 0.5, and ignores callees with more than 200 callers.
+- **Concept family members were lost whenever two clusters shared a name.**
+  The family upsert kept the existing row and its id, but the members were
+  written under a freshly generated id, so the foreign key failed, the
+  transaction rolled back, and the whole family pass was skipped as
+  "non-fatal": one error line per ingest on gin, flask and this engine, and
+  no family members for any of them. Members now use the id the database
+  returns.
+- **Homolog search scored twenty arbitrary same-kind symbols per target and
+  ran two queries per candidate.** The "same kind" bucket returned whichever
+  rows the planner produced first and each cost seven scoring dimensions; it
+  is gone. Test overlap and co-change history are now loaded once per target
+  and looked up per candidate, instead of two queries each.
 - **Tree-sitter languages and Python kept a fraction of the relations they
   extracted.** Three defects, one mechanism. A relation whose source is the
   file itself — an import, a module-level call — had no symbol to come from:

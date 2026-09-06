@@ -188,6 +188,20 @@ export const retention = Object.freeze({
   retentionEnabled: envBool("SCG_RETENTION_ENABLED", true),
 })
 
+// ─── Temporal Configuration ─────────────────────────────────────────────────
+
+export const temporal = Object.freeze({
+  /**
+   * Wall-clock budget for blaming a snapshot's files.
+   *
+   * Symbol-level change history comes from `git blame`, one process per
+   * file, and a large repository has more files than one ingest should wait
+   * on. Files the budget does not reach keep file-level history, which is
+   * exact, and are counted in the ingest log; nothing is guessed for them.
+   */
+  blameBudgetMs: envInt("SCG_TEMPORAL_BLAME_BUDGET_MS", 60_000),
+})
+
 // ─── Watch Configuration ────────────────────────────────────────────────────
 
 export const watcher = Object.freeze({

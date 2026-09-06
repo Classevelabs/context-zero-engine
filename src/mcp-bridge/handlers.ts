@@ -2150,11 +2150,17 @@ async function handleGetCoChangePartnersImpl(
   if (!isUUID(symbol_id) || !isUUID(repo_id)) return errorResult("symbol_id and repo_id required")
 
   const { temporalEngine } = await import("../analysis-engine/temporal-engine")
-  const partners = await temporalEngine.getCoChangePartners(symbol_id, repo_id, min_jaccard)
+  // Two granularities, each named: symbol partners are what blame supports
+  // line by line; file partners are the exact, coarser log history.
+  const [partners, filePartners] = await Promise.all([
+    temporalEngine.getCoChangePartners(symbol_id, repo_id, min_jaccard),
+    temporalEngine.getFileCoChangePartners(symbol_id, repo_id, min_jaccard),
+  ])
 
   return textResult({
     symbol_id,
     co_change_partners: partners,
+    file_co_change_partners: filePartners,
     total: partners.length,
   })
 }
