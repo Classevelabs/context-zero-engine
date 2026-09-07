@@ -408,7 +408,10 @@ if (jsonOut) {
     path.resolve(jsonOut),
     JSON.stringify(
       {
-        repo: REPO_PATH, name: REPO_NAME, source: src,
+        // basename, not the absolute path — these files are committed to a
+        // public repo and REPO_PATH is wherever the machine happened to run.
+        // Matches bench-quality.mjs / bench-context-quality.mjs.
+        repo: path.basename(REPO_PATH), name: REPO_NAME, source: src,
         ingest: {
           coldMs: cold.ms, coldPeakRss: cold.peakRssBytes,
           warmMs: warm.ms, warmVectorsAdded: warmAdded,
