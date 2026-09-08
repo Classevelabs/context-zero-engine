@@ -75,6 +75,29 @@ describe("Repository execution gate", () => {
     expect(isRepositoryExecutionAllowed({ NODE_ENV: "test" })).toBe(true)
   })
 
+  test("runs the target exactly once even when it exits non-zero", async () => {
+    // Regression: the Linux path wrapped the command as `unshare … || bare`,
+    // and `||` fired on ANY non-zero exit, so a failing command ran twice. The
+    // target now runs once regardless of platform or exit code. A command that
+    // appends one line and then fails must leave exactly one line, and the
+    // non-zero code must be reported faithfully rather than masked by a re-run.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "contextzero-once-"))
+    const marker = path.join(cwd, "runs.log")
+    try {
+      const script = `require('fs').appendFileSync(${JSON.stringify(marker)}, 'x\\n'); process.exit(3)`
+      const result = await sandboxExec(process.execPath, ["-e", script], {
+        cwd,
+        timeoutMs: 10_000,
+        maxOutputBytes: 4_096,
+      })
+      expect(result.exitCode).toBe(3)
+      const runs = fs.readFileSync(marker, "utf-8").trim().split("\n").filter(Boolean)
+      expect(runs).toHaveLength(1)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   test("rejects before an untrusted command can create a marker file", async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "contextzero-exec-gate-"))
     const marker = path.join(cwd, "spawned.txt")

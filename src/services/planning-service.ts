@@ -15,7 +15,7 @@ import { behavioralEngine } from "../analysis-engine/behavioral"
 import { contractEngine } from "../analysis-engine/contracts"
 import { transactionalChangeEngine } from "../transactional-editor"
 import { UserFacingError, classifyConfidenceBand } from "../types"
-import type { CapsuleMode, TransactionState } from "../types"
+import type { CapsuleMode } from "../types"
 import { v4 as uuidv4 } from "uuid"
 import { Logger } from "../logger"
 
@@ -90,9 +90,6 @@ const DEFAULT_MAX_CANDIDATES = 5
 /** Blast radius thresholds for capsule mode recommendation */
 const HIGH_IMPACT_THRESHOLD = 20
 const MEDIUM_IMPACT_THRESHOLD = 5
-
-/** Valid transaction states for propagation */
-const PROPAGATION_VALID_STATES: TransactionState[] = ["propagation_pending", "validated"]
 
 // ────────── Service Functions ──────────
 
@@ -418,20 +415,9 @@ export async function applyPropagation(options: ApplyPropagationOptions): Promis
     targetSvId: options.target_symbol_version_id,
   })
 
-  // Step 1: Load transaction and verify state
-  const txn = await transactionalChangeEngine.getTransaction(options.txn_id)
-  if (!txn) {
-    throw UserFacingError.notFound(`Transaction ${options.txn_id}`)
-  }
-
-  if (!PROPAGATION_VALID_STATES.includes(txn.state)) {
-    throw UserFacingError.badRequest(
-      `Transaction ${options.txn_id} is in state '${txn.state}', ` +
-        `but propagation requires one of: ${PROPAGATION_VALID_STATES.join(", ")}`,
-    )
-  }
-
-  // Step 2: Verify the target symbol version exists
+  // Verify the target symbol version exists — a propagation names a homolog the
+  // graph knows, and applying to a phantom target is a caller error worth
+  // rejecting before we touch the filesystem.
   const svResult = await db.query(
     `
         SELECT sv.symbol_version_id, f.path as file_path
@@ -441,49 +427,28 @@ export async function applyPropagation(options: ApplyPropagationOptions): Promis
     `,
     [options.target_symbol_version_id],
   )
-
-  const targetRow = firstRow(svResult)
-  if (!targetRow) {
+  if (!firstRow(svResult)) {
     throw UserFacingError.notFound(`Target symbol version ${options.target_symbol_version_id}`)
   }
 
-  // Step 3: Apply the patch
-  // The transactional engine's applyPatch requires 'planned' state, so for
-  // propagation we directly record the patch in the transaction's patches array
-  // and mark that validation is needed.
-  let patchApplied = false
-  try {
-    await db.query(
-      `
-            UPDATE change_transactions
-            SET patches = patches || $1::jsonb,
-                updated_at = NOW()
-            WHERE txn_id = $2
-        `,
-      [
-        JSON.stringify([
-          {
-            file_path: options.patch.file_path,
-            new_content: options.patch.new_content,
-          },
-        ]),
-        options.txn_id,
-      ],
-    )
-    patchApplied = true
-  } catch (err) {
-    log.error("Failed to apply propagation patch", err instanceof Error ? err : new Error(String(err)), {
-      txnId: options.txn_id,
-      targetSvId: options.target_symbol_version_id,
-    })
-    patchApplied = false
-  }
+  // Apply the patch to disk through the transactional engine's safe write path —
+  // path-safety, a durable backup for rollback, an atomic staged write, and
+  // compensation on failure — which also records the patch in the transaction so
+  // rollback and re-validation see it. The engine owns the (race-free, locked)
+  // state check. A failure throws and is surfaced to the caller, rather than
+  // being reported as a soft `patch_applied: false` that hid real write errors —
+  // and, before this, the patch was only appended to a JSON column and never
+  // written to the file at all.
+  await transactionalChangeEngine.applyPropagationPatch(options.txn_id, {
+    file_path: options.patch.file_path,
+    new_content: options.patch.new_content,
+  })
 
   const result: PropagationResult = {
     txn_id: options.txn_id,
     target_symbol_version_id: options.target_symbol_version_id,
-    patch_applied: patchApplied,
-    validation_needed: patchApplied,
+    patch_applied: true,
+    validation_needed: true,
   }
 
   timer()

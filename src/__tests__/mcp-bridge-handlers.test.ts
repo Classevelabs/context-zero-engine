@@ -1483,6 +1483,18 @@ describe("handleReadSource", () => {
     const body = parseResult(result) as { error: string }
     expect(body.error).toContain("No symbol versions found")
   })
+
+  test("scopes the batch query to the stated repo_id", async () => {
+    // The repo_id parameter is required, so a symbol_version_id from another
+    // repository must be excluded by the query rather than served across it.
+    mockDbQuery.mockResolvedValue({ rows: [] })
+    await handleReadSource({ repo_id: VALID_UUID_2, symbol_version_id: VALID_UUID }, log)
+    const batchCall = mockDbQuery.mock.calls.find(
+      ([sql]) => typeof sql === "string" && sql.includes("FROM symbol_versions sv") && sql.includes("s.repo_id ="),
+    )
+    expect(batchCall).toBeDefined()
+    expect(batchCall![1]).toContain(VALID_UUID_2)
+  })
 })
 
 // ═══════════════════════════════════════════════════════════

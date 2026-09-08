@@ -777,6 +777,50 @@ function extractFullCallChain(node: SyntaxNode, language: SupportedLanguage): st
       return node.namedChild(0)?.text || ""
     }
 
+    case "variable_name": {
+      // PHP: `$h` is a variable_name wrapping a bare name. The `$` is syntax,
+      // not part of the identifier, so the chain carries `h` — otherwise every
+      // PHP receiver would be a name no symbol table can ever match. Bash also
+      // has a `variable_name` node and the same unwrapping is correct there.
+      const inner = node.childForFieldName("name") || node.namedChild(0)
+      return inner ? inner.text : node.text.replace(/^\$/, "")
+    }
+
+    case "member_call_expression": {
+      // PHP: `$obj->method(...)`. Fields are `object` and `name`.
+      const obj = node.childForFieldName("object")
+      const name = node.childForFieldName("name")
+      const objChain = obj ? extractFullCallChain(obj, language) : ""
+      const memberName = name ? name.text : ""
+      return objChain ? `${objChain}.${memberName}` : memberName
+    }
+
+    case "scoped_call_expression": {
+      // PHP: `Helper::finish(...)`. Kept as `Owner::member` because the
+      // resolver already splits on `::` and looks the pair up by owner.
+      const scope = node.childForFieldName("scope")
+      const name = node.childForFieldName("name")
+      const scopeChain = scope ? extractFullCallChain(scope, language) : ""
+      const memberName = name ? name.text : ""
+      return scopeChain ? `${scopeChain}::${memberName}` : memberName
+    }
+
+    case "qualified_name": {
+      // PHP: `App\Support\Helper` — the trailing name is what a symbol table
+      // holds. Guarded by language because C# also has a `qualified_name` node
+      // and its separator is `.`, so an unguarded split would quietly change a
+      // language this case was never written for.
+      if (language !== "php") return node.text || ""
+      const parts = node.text.split("\\").filter(Boolean)
+      return parts.length ? parts[parts.length - 1]! : node.text
+    }
+
+    case "command_name": {
+      // Bash: the word being invoked.
+      const word = node.namedChild(0)
+      return word ? word.text : node.text
+    }
+
     case "macro_invocation": {
       // Rust: macro_name!(args) — extract macro name for call tracking
       const macroNode = node.childForFieldName("macro") || node.namedChild(0)
@@ -2388,6 +2432,64 @@ function walkForRelations(
     }
   }
 
+  // PHP calls. tree-sitter-php names none of its call nodes `call_expression`
+  // or `call`, so the generic branch above never fired for PHP and the language
+  // produced a symbol list with no edges at all — measured at 3,329 symbols and
+  // 0 relations on guzzle. Each of the three forms is resolved through
+  // extractFullCallChain, which now understands them.
+  if (language === "php") {
+    if (type === "function_call_expression") {
+      const fn = node.childForFieldName("function")
+      const targetName = fn ? extractFullCallChain(fn, language) : ""
+      if (targetName) {
+        relations.push({
+          source_key: sourceKey,
+          target_name: targetName,
+          relation_type: "calls" as StructuralRelationType,
+        })
+      }
+    }
+    if (type === "member_call_expression" || type === "scoped_call_expression") {
+      const targetName = extractFullCallChain(node, language)
+      if (targetName) {
+        relations.push({
+          source_key: sourceKey,
+          target_name: targetName,
+          relation_type: "calls" as StructuralRelationType,
+        })
+      }
+    }
+    // `new Helper()` — the constructed class is a dependency of this body in
+    // exactly the way a call is, and it is how PHP code names its collaborators.
+    if (type === "object_creation_expression") {
+      const classNode = node.namedChild(0)
+      const targetName = classNode ? extractFullCallChain(classNode, language) : ""
+      if (targetName) {
+        relations.push({
+          source_key: sourceKey,
+          target_name: targetName,
+          relation_type: "calls" as StructuralRelationType,
+        })
+      }
+    }
+  }
+
+  // Bash commands. tree-sitter-bash models an invocation as `command` with a
+  // `name` field, which the generic branch also never matched. `source`/`.` are
+  // module-level imports and are recorded as such by extractImportRelations, so
+  // they are not also counted here as calls to a command named "source".
+  if (language === "bash" && type === "command") {
+    const nameNode = node.childForFieldName("name")
+    const targetName = nameNode ? extractFullCallChain(nameNode, language) : ""
+    if (targetName && targetName !== "source" && targetName !== ".") {
+      relations.push({
+        source_key: sourceKey,
+        target_name: targetName,
+        relation_type: "calls" as StructuralRelationType,
+      })
+    }
+  }
+
   // Recurse into children
   for (let i = 0; i < node.childCount; i++) {
     const child = node.child(i)
@@ -2703,6 +2805,52 @@ function extractImportRelations(
       }
       break
     }
+    case "php": {
+      // `use App\Support\Helper;` and `use App\Support\Other as Alias;`
+      // The imported symbol is the trailing name of the qualified path; the
+      // alias, when present, is a second `name` under the same clause and is
+      // what the body will actually write, so both are recorded.
+      const clauses = rootNode.descendantsOfType("namespace_use_clause")
+      for (const clause of clauses) {
+        const qualified = clause.descendantsOfType("qualified_name")[0]
+        const imported = qualified ? qualified.text.replace(/^\\+/, "") : clause.text.replace(/^\\+/, "")
+        if (!imported) continue
+        relations.push({
+          source_key: sourceKey,
+          target_name: imported,
+          relation_type: "imports" as StructuralRelationType,
+        })
+        const trailing = imported.split("\\").filter(Boolean).pop()
+        const aliasNode = clause.namedChildren.find((c) => c.type === "name")
+        const alias = aliasNode?.text
+        if (alias && alias !== trailing) {
+          relations.push({
+            source_key: sourceKey,
+            target_name: alias,
+            relation_type: "imports" as StructuralRelationType,
+          })
+        }
+      }
+      break
+    }
+    case "bash": {
+      // `source ./lib.sh` and its `.` synonym are the only import a shell has.
+      const commands = rootNode.descendantsOfType("command")
+      for (const cmd of commands) {
+        const nameNode = cmd.childForFieldName("name")
+        const verb = nameNode?.text?.trim()
+        if (verb !== "source" && verb !== ".") continue
+        const target = cmd.childForFieldName("argument") || cmd.namedChild(1)
+        const sourced = target?.text?.replace(/['"]/g, "").trim()
+        if (!sourced) continue
+        relations.push({
+          source_key: sourceKey,
+          target_name: sourced,
+          relation_type: "imports" as StructuralRelationType,
+        })
+      }
+      break
+    }
   }
 }
 
@@ -2973,6 +3121,27 @@ function extractInheritanceRelations(
             target_name: superclass.text,
             relation_type: "inherits" as StructuralRelationType,
           })
+        }
+      }
+      break
+    }
+    case "php": {
+      // tree-sitter-php keeps `extends` in a base_clause and `implements` in a
+      // class_interface_clause; an interface's own `extends` list is a
+      // base_clause too, so both shapes are read the same way.
+      if (node.type === "class_declaration" || node.type === "interface_declaration") {
+        for (const clauseType of ["base_clause", "class_interface_clause"]) {
+          for (const clause of node.descendantsOfType(clauseType)) {
+            for (const named of clause.namedChildren) {
+              const target = named.text.replace(/^\\+/, "")
+              if (!target) continue
+              relations.push({
+                source_key: stableKey,
+                target_name: target,
+                relation_type: "inherits" as StructuralRelationType,
+              })
+            }
+          }
         }
       }
       break

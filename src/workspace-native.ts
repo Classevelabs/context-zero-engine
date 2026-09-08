@@ -7,6 +7,7 @@ import { promisify } from "util"
 import { extractWithTreeSitter, type SupportedLanguage } from "./adapters/universal"
 import { Logger } from "./logger"
 import { isPathWithinBase, resolveExistingPath } from "./path-security"
+import { buildSafeRegex } from "./regex-safety"
 import type { BehaviorHint, ExtractedSymbol } from "./types"
 
 const execFileAsync = promisify(execFile)
@@ -414,44 +415,27 @@ export async function discoverWorkspaceFiles(
   }
 }
 
-const isReDoSSuspect = (pattern: string): boolean => {
-  // Reject patterns with nested quantifiers (most common ReDoS source)
-  const nestedQuantifier = /([+*]|\{[\d,]+\})\s*\)[\s]*([+*]|\{[\d,]+\})/
-  // Reject patterns with overlapping alternations inside quantifiers
-  const overlappingAlt = /\([^)]*\|[^)]*\)\s*[+*{]/
-  // Reject backreferences (can cause exponential behavior)
-  const backreference = /\\[1-9]/
-  // Reject excessive nesting
-  const deepNesting = /\([^)]*\([^)]*\([^)]*\)/
-  return (
-    nestedQuantifier.test(pattern) ||
-    overlappingAlt.test(pattern) ||
-    backreference.test(pattern) ||
-    deepNesting.test(pattern)
-  )
+/**
+ * Compile a search pattern using the shared ReDoS guard ({@link buildSafeRegex}),
+ * refusing catastrophic-backtracking shapes and falling back to a literal search.
+ * Logs the fallback to both the caller's logger and this module's, as before.
+ */
+function buildRegex(pattern: string, wsLog?: WorkspaceLogger): { regex: RegExp; mode: "regex" | "literal" } {
+  return buildSafeRegex(pattern, {
+    debug: (message, data) => {
+      wsLog?.debug?.(message, { pattern, ...data })
+      log.debug(message, { pattern, ...data })
+    },
+  })
 }
 
-function buildRegex(pattern: string, wsLog?: WorkspaceLogger): { regex: RegExp; mode: "regex" | "literal" } {
-  try {
-    if (isReDoSSuspect(pattern)) {
-      throw new Error("ReDoS-suspect pattern")
-    }
-    return { regex: new RegExp(pattern, "gi"), mode: "regex" }
-  } catch (error) {
-    wsLog?.debug?.("Workspace search falling back to literal pattern", {
-      pattern,
-      error: error instanceof Error ? error.message : String(error),
-    })
-    log.debug("Workspace search falling back to literal pattern", {
-      pattern,
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return {
-      regex: new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
-      mode: "literal",
-    }
-  }
-}
+/**
+ * Wall-clock budget for a native workspace search. The shared guard already
+ * refuses patterns that could hang on a single line; this bounds the aggregate
+ * cost of scanning a very large tree. Checked between files, matching the
+ * indexed search service's inline behaviour.
+ */
+const NATIVE_SEARCH_DEADLINE_MS = 10_000
 
 /**
  * Parsed symbols per file, reused while the file's size and mtime hold.
@@ -699,10 +683,16 @@ export async function searchWorkspaceCode(
   let binaryFilesSkipped = 0
   let unreadableFiles = 0
   let scannedFiles = 0
+  let timedOut = false
+  const deadline = Date.now() + NATIVE_SEARCH_DEADLINE_MS
 
   for (const file of discovery.files) {
     if (matches.length >= maxResults) break
     if (scannedFiles >= SEARCH_FILE_CAP) break
+    if (Date.now() > deadline) {
+      timedOut = true
+      break
+    }
     if (filePattern) {
       const normalizedPath = file.relativePath.toLowerCase()
       if (!normalizedPath.includes(filePattern) && !normalizedPath.endsWith(filePattern)) {
@@ -749,7 +739,7 @@ export async function searchWorkspaceCode(
     match_mode: mode,
     matches,
     scanned_files: scannedFiles,
-    truncated: discovery.truncated || matches.length >= maxResults || scannedFiles >= SEARCH_FILE_CAP,
+    truncated: discovery.truncated || matches.length >= maxResults || scannedFiles >= SEARCH_FILE_CAP || timedOut,
     binary_files_skipped: binaryFilesSkipped,
     unreadable_files: unreadableFiles,
   }

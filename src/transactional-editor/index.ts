@@ -40,6 +40,7 @@ import { UserFacingError } from "../types"
 import type {
   TransactionState,
   PatchSet,
+  PatchEntry,
   ValidationReport,
   ValidationMode,
   PropagationCandidate,
@@ -56,6 +57,8 @@ const RECOVERABLE_STATES: TransactionState[] = [
   "propagation_pending",
   "failed",
 ]
+/** States in which a propagation patch may be applied to a homolog target. */
+const PROPAGATION_VALID_STATES: TransactionState[] = ["propagation_pending", "validated"]
 const DEFAULT_STALE_TRANSACTION_MS = readPositiveIntEnv("SCG_STALE_TRANSACTION_MS", 6 * 60 * 60 * 1000)
 const DEFAULT_RECOVERY_BATCH_SIZE = readPositiveIntEnv("SCG_STALE_TRANSACTION_BATCH_SIZE", 100)
 
@@ -257,26 +260,7 @@ export class TransactionalChangeEngine {
           }
         }
 
-        const staged = new Map<string, string>()
-        const landed: PreparedPatch[] = []
-        try {
-          for (const patch of prepared) {
-            await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
-            staged.set(
-              patch.fullPath,
-              await this.stageFile(txnId, patch.fullPath, patch.newContent, patch.originalMode),
-            )
-          }
-
-          for (const patch of prepared) {
-            await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
-            const tmpPath = staged.get(patch.fullPath)
-            if (!tmpPath) throw new Error(`Missing staged file for ${patch.filePath}`)
-            await fsp.rename(tmpPath, patch.fullPath)
-            staged.delete(patch.fullPath)
-            landed.push(patch)
-          }
-
+        await this.stageRenameAndFinalize(basePath, txnId, prepared, async () => {
           const updated = await db.queryWithClient(
             client,
             `UPDATE change_transactions
@@ -287,17 +271,7 @@ export class TransactionalChangeEngine {
           if (updated.rowCount !== 1) {
             throw new Error(`Transaction ${txnId} changed state while applying patches`)
           }
-        } catch (writeErr) {
-          await this.cleanupTempFiles(staged.values())
-          const restorationErrors = await this.restoreLandedFiles(basePath, txnId, landed)
-          if (restorationErrors.length > 0) {
-            log.error("Patch compensation incomplete; durable backups were preserved", writeErr, {
-              txnId,
-              failedFiles: restorationErrors,
-            })
-          }
-          throw writeErr
-        }
+        })
       })
       if (conflictError) throw conflictError
     } catch (writeErr) {
@@ -315,6 +289,95 @@ export class TransactionalChangeEngine {
 
     // Store patches and advance to 'patched'
     log.info("Transaction state changed", { txnId, newState: "patched" })
+    timer()
+  }
+
+  /**
+   * Apply a single propagation patch to a homolog target on an already-validated
+   * transaction.
+   *
+   * This is the write half of propagation. Computing proposals records nothing on
+   * disk; this method takes one chosen patch and applies it through the SAME
+   * machinery as applyPatch — path-safety via preparePatches, a durable backup
+   * row for rollback, an atomic staged write, and compensation on failure —
+   * while recording the patch in the transaction's `patches` array so both
+   * rollback and re-validation see it. The transaction stays in its propagation
+   * state; it does not transition. Valid only from a propagation state.
+   *
+   * Before this existed, apply_propagation appended the patch to `patches` and
+   * returned success without ever touching the file, and validation then passed
+   * on the unmodified original — a change reported as applied that did not exist.
+   */
+  public async applyPropagationPatch(txnId: string, patch: PatchEntry, repoBasePath?: string): Promise<void> {
+    const timer = log.startTimer("applyPropagationPatch", { txnId })
+    const txn = await this.loadTransaction(txnId)
+    if (!txn) throw UserFacingError.notFound(`Transaction ${txnId}`)
+    if (!PROPAGATION_VALID_STATES.includes(txn.state)) {
+      throw UserFacingError.badRequest(
+        `applyPropagationPatch requires transaction in one of [${PROPAGATION_VALID_STATES.join(", ")}], got '${txn.state}'`,
+      )
+    }
+
+    const basePath = repoBasePath || (await this.getRepoBasePath(txnId))
+    const prepared = (await this.preparePatches(basePath, [patch]))[0]
+    if (!prepared) throw UserFacingError.badRequest("No valid propagation patch to apply")
+    const lockOrder = [prepared.fullPath]
+
+    await db.transaction(async (client: PoolClient) => {
+      const locked = await db.queryWithClient(
+        client,
+        `SELECT state FROM change_transactions WHERE txn_id = $1 FOR UPDATE`,
+        [txnId],
+      )
+      const row = firstRow(locked)
+      if (!row) throw UserFacingError.notFound(`Transaction ${txnId}`)
+      const state = requireStringField(row, "state", `Transaction ${txnId}`) as TransactionState
+      if (!PROPAGATION_VALID_STATES.includes(state)) {
+        throw UserFacingError.badRequest(
+          `applyPropagationPatch requires transaction in one of [${PROPAGATION_VALID_STATES.join(", ")}], got '${state}'`,
+        )
+      }
+
+      await this.acquireFileLocks(client, lockOrder)
+      await this.extendFilesystemTransactionTimeout(client)
+
+      // Capture the current content for local compensation, and preserve it for
+      // rollback — but only insert a backup row when this file has none under
+      // this transaction yet. A file already patched earlier in the transaction
+      // has its TRUE original backed up; a second backup here would overwrite
+      // that with post-patch content and corrupt a later rollback.
+      const original = await this.readFileSnapshot(prepared.fullPath, prepared.filePath)
+      prepared.originalContent = original.content
+      prepared.originalMode = original.mode
+      const existingBackup = await db.queryWithClient(
+        client,
+        `SELECT 1 FROM transaction_file_backups WHERE txn_id = $1 AND file_path = $2 LIMIT 1`,
+        [txnId, prepared.filePath],
+      )
+      if ((existingBackup.rowCount ?? 0) === 0) {
+        await db.queryWithClient(
+          client,
+          `INSERT INTO transaction_file_backups
+              (backup_id, txn_id, file_path, original_content, original_mode)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [uuidv4(), txnId, prepared.filePath, original.content, original.mode],
+        )
+      }
+
+      await this.stageRenameAndFinalize(basePath, txnId, [prepared], async () => {
+        const updated = await db.queryWithClient(
+          client,
+          `UPDATE change_transactions
+           SET patches = patches || $1::jsonb, updated_at = NOW()
+           WHERE txn_id = $2 AND state = $3`,
+          [JSON.stringify([{ file_path: prepared.filePath, new_content: prepared.newContent }]), txnId, state],
+        )
+        if (updated.rowCount !== 1) {
+          throw new Error(`Transaction ${txnId} changed state during propagation apply`)
+        }
+      })
+    })
+    log.info("Propagation patch applied", { txnId, file: prepared.filePath })
     timer()
   }
 
@@ -1392,6 +1455,55 @@ export class TransactionalChangeEngine {
       }
     }
     return failures
+  }
+
+  /**
+   * Stage every patch's new content, rename them into place, then run
+   * `finalize` — the DB write that records the change — all under the caller's
+   * file locks and DB transaction. Each rename is atomic; a multi-file batch
+   * cannot be, so any failure (including inside `finalize`) restores the files
+   * that already landed from their backups and removes staged temp files, then
+   * rethrows. Shared by applyPatch's write phase and applyPropagationPatch so
+   * there is one implementation of the atomic-write-with-compensation core.
+   */
+  private async stageRenameAndFinalize(
+    basePath: string,
+    txnId: string,
+    prepared: PreparedPatch[],
+    finalize: () => Promise<void>,
+  ): Promise<void> {
+    const staged = new Map<string, string>()
+    const landed: PreparedPatch[] = []
+    try {
+      for (const patch of prepared) {
+        await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
+        staged.set(
+          patch.fullPath,
+          await this.stageFile(txnId, patch.fullPath, patch.newContent, patch.originalMode),
+        )
+      }
+
+      for (const patch of prepared) {
+        await this.ensureSafeParent(basePath, patch.filePath, patch.fullPath)
+        const tmpPath = staged.get(patch.fullPath)
+        if (!tmpPath) throw new Error(`Missing staged file for ${patch.filePath}`)
+        await fsp.rename(tmpPath, patch.fullPath)
+        staged.delete(patch.fullPath)
+        landed.push(patch)
+      }
+
+      await finalize()
+    } catch (writeErr) {
+      await this.cleanupTempFiles(staged.values())
+      const restorationErrors = await this.restoreLandedFiles(basePath, txnId, landed)
+      if (restorationErrors.length > 0) {
+        log.error("Patch compensation incomplete; durable backups were preserved", writeErr, {
+          txnId,
+          failedFiles: restorationErrors,
+        })
+      }
+      throw writeErr
+    }
   }
 
   private resolveBackupPath(realBase: string, filePath: string): string {

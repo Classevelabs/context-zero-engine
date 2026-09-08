@@ -629,6 +629,11 @@ export const INDEX_INTEGRITY_POLICIES: Record<string, IndexIntegrityPolicy> = {
   scg_get_class_hierarchy: "strict",
   scg_get_tests: "strict",
   scg_explain_relation: "strict",
+  // Reads the graph to build proposals, so it keeps the strict read-integrity
+  // guard — but it also transitions transaction state, so it is ALSO a
+  // privilege-gated mutation (PRIVILEGED_HTTP_PATHS + MUTATING_MCP_TOOLS). The
+  // two layers are orthogonal: this gate is about a misleadingly-empty answer,
+  // the privilege sets are about who may trigger the state change.
   scg_propagation_proposals: "strict",
   scg_compile_context_capsule: "strict",
   scg_smart_context: "strict",
@@ -1522,6 +1527,9 @@ async function handleReadSourceImpl(args: Record<string, unknown>, log: McpLogge
   // Symbol-scoped serving (batch)
   if (ids.length > 0) {
     const placeholders = ids.map((_, i) => `$${i + 1}`).join(",")
+    // Constrain to the stated repo_id. The parameter is required, so a
+    // symbol_version_id belonging to a DIFFERENT repository must return nothing
+    // rather than be served across the boundary the argument implies.
     const svResult = await db.query(
       `
             SELECT sv.symbol_version_id, sv.range_start_line, sv.range_end_line,
@@ -1533,8 +1541,9 @@ async function handleReadSourceImpl(args: Record<string, unknown>, log: McpLogge
             JOIN symbols s ON s.symbol_id = sv.symbol_id
             JOIN files f ON f.file_id = sv.file_id
             WHERE sv.symbol_version_id IN (${placeholders})
+              AND s.repo_id = $${ids.length + 1}
         `,
-      ids,
+      [...ids, repo_id],
     )
 
     if (svResult.rows.length === 0) return errorResult("No symbol versions found")

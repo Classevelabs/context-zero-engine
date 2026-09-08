@@ -1,0 +1,163 @@
+{
+  "repo": "nest",
+  "shared_universe_files": 1918,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 1027008,
+  "corpus_load_ms": 1167,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 4,
+      "lines_of_code": 816,
+      "tokens": 6702
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 207,
+      "tokens": 2839
+    },
+    "tokens_saved_pct": 57.6
+  },
+  "cost": {
+    "avg_capsule_tokens": 3568,
+    "naive_grep_read_tokens": 627437,
+    "contextzero_tokens": 214050,
+    "reduction_vs_naive": 2.9,
+    "naive_all_referencing_tokens": 637340,
+    "reduction_vs_all_referencing": 3,
+    "oracle_file_tokens": 327347,
+    "reduction_vs_oracle": 1.5,
+    "reduction_vs_oracle_median": 1.3,
+    "tasks_capsule_cost_more_than_reading": 14,
+    "tasks_capsule_cost_more_than_oracle": 22,
+    "tasks_where_reading_found_nothing": 0,
+    "worst_task_capsule_vs_reading": 13.14,
+    "median_task_capsule_vs_reading": 0.56
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 283,
+    "avg_per_task": 4.7,
+    "of_which_indexed_as_symbols_pct": 48.4,
+    "internal_imports_seen": 441,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 67.8,
+    "contextzero_recall_incl_failures_pct": 67.8,
+    "contextzero_recall_of_indexed_pct": 74.5,
+    "file_reading_recall_overall_pct": 0.4,
+    "contextzero_beats_files": 50,
+    "tied": 10,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 53.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 53.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 76.7,
+      "file_reading": 65
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.67,
+    "file_reading": 0.49
+  },
+  "capsule_composition": {
+    "avg_nodes": 13.7,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 44.6,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 13.3,
+    "contract_or_invariant_pct": 61.7,
+    "linked_test_pct": 50,
+    "effect_entries_total": 21,
+    "share_of_capsule_tokens_pct": 0.4,
+    "read_from_the_body_itself_pct": 33.3,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 75
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 14,
+    "p90_ms": 16
+  },
+  "weakest_tasks": [
+    {
+      "name": "RouterExplorer",
+      "imports_used": 44,
+      "indexed": 29,
+      "delivered": 5,
+      "nodes": 30,
+      "spent": 7942
+    },
+    {
+      "name": "decodeMember",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 1,
+      "nodes": 5,
+      "spent": 2032
+    },
+    {
+      "name": "AbstractInstanceResolver",
+      "imports_used": 12,
+      "indexed": 7,
+      "delivered": 4,
+      "nodes": 16,
+      "spent": 7955
+    },
+    {
+      "name": "PipesContextCreator",
+      "imports_used": 11,
+      "indexed": 5,
+      "delivered": 3,
+      "nodes": 19,
+      "spent": 7896
+    },
+    {
+      "name": "UnsupportedMediaTypeException",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 5,
+      "nodes": 21,
+      "spent": 6132
+    },
+    {
+      "name": "ParseFilePipe",
+      "imports_used": 10,
+      "indexed": 8,
+      "delivered": 8,
+      "nodes": 27,
+      "spent": 3928
+    },
+    {
+      "name": "describeConflict",
+      "imports_used": 4,
+      "indexed": 3,
+      "delivered": 3,
+      "nodes": 6,
+      "spent": 1024
+    },
+    {
+      "name": "UnauthorizedException",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 5,
+      "nodes": 21,
+      "spent": 5546
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import { resolveExistingPath } from "../path-security"
 import { UserFacingError } from "../types"
 import { scanFiles, type ScanParams, type ScanResult, type SearchMatch } from "./search-scan"
 import type { WorkerMessage } from "./search-worker"
+import { buildSafeRegex, literalRegex } from "../regex-safety"
 
 // ────────── Result Types ──────────
 
@@ -58,10 +59,6 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
     : fallback
 }
 
-function literalRegex(pattern: string): RegExp {
-  return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi")
-}
-
 export interface SearchCodeOptions {
   filePattern?: string
   maxResults?: number
@@ -73,109 +70,6 @@ export interface SearchCodeOptions {
 interface MinimalLogger {
   debug(message: string, data?: Record<string, unknown>): void
   warn(message: string, data?: Record<string, unknown>): void
-}
-
-// ────────── ReDoS Protection ──────────
-
-/**
- * Detect patterns with catastrophic-backtracking potential.
- *
- * The whole classic family is "a quantified group whose body can match the same
- * input more than one way" — i.e. a group carrying +/*\/{n,} that contains
- * either an alternation or another quantifier. That covers (a+)+, (a*)*,
- * (a|aa)+, (a|a?)+, (\w|\w\w)+ and friends.
- *
- * The previous pattern-pair only caught an inner quantifier written directly
- * inside a flat group, so overlapping-alternation forms went straight through:
- * `(a|aa)+$` took ~900ms against a 30-character line, and `(a|a?)+$` never
- * returned at all. Node has no regex timeout and the engine is single-threaded,
- * so one such search hangs the whole process across every indexed file.
- *
- * This over-approximates: a non-overlapping pattern like `(foo|bar)+` is also
- * flagged. That is deliberate — the fallback is an escaped literal search, which
- * still returns useful results, and callers are told via the `mode` field.
- * Detecting genuine overlap needs full regex analysis; refusing to backtrack on
- * anything of this shape is the honest trade.
- *
- * Residual risk: this is a static heuristic, not a proof. A guaranteed bound
- * needs the match to run off-thread with a hard kill. SEARCH_DEADLINE_MS below
- * caps the aggregate damage in the meantime.
- */
-function hasQuantifiedComplexGroup(pattern: string): boolean {
-  for (let i = 0; i < pattern.length; i++) {
-    if (pattern[i] === "\\") {
-      i++ // skip the escaped character
-      continue
-    }
-    if (pattern[i] !== "(") continue
-
-    // Walk to this group's matching ')', tracking escapes, nesting and classes.
-    let depth = 0
-    let inClass = false
-    let bodyHasAlternation = false
-    let bodyHasQuantifier = false
-    let end = -1
-    for (let j = i; j < pattern.length; j++) {
-      const ch = pattern[j]
-      if (ch === "\\") {
-        j++
-        continue
-      }
-      if (inClass) {
-        if (ch === "]") inClass = false
-        continue
-      }
-      if (ch === "[") {
-        inClass = true
-        continue
-      }
-      if (ch === "(") {
-        depth++
-        continue
-      }
-      if (ch === ")") {
-        depth--
-        if (depth === 0) {
-          end = j
-          break
-        }
-        continue
-      }
-      if (depth === 1) {
-        if (ch === "|") bodyHasAlternation = true
-        if (ch === "+" || ch === "*" || ch === "?" || ch === "{") bodyHasQuantifier = true
-      } else if (depth > 1) {
-        // A nested group is itself a way for the body to match ambiguously.
-        bodyHasQuantifier = true
-      }
-    }
-    if (end === -1) continue // unbalanced — new RegExp() will reject it anyway
-
-    const next = pattern[end + 1]
-    const groupIsQuantified = next === "+" || next === "*" || next === "{"
-    if (groupIsQuantified && (bodyHasAlternation || bodyHasQuantifier)) {
-      return true
-    }
-  }
-  return false
-}
-
-function buildSafeRegex(pattern: string, log?: MinimalLogger): { regex: RegExp; mode: "regex" | "literal" } {
-  const useRegex = !hasQuantifiedComplexGroup(pattern)
-  try {
-    if (!useRegex) throw new Error("ReDoS-suspect pattern")
-    return { regex: new RegExp(pattern, "gi"), mode: "regex" }
-  } catch (error) {
-    if (log) {
-      log.debug("Falling back to literal search pattern", {
-        error: error instanceof Error ? error.message : String(error),
-      })
-    }
-    return {
-      regex: literalRegex(pattern),
-      mode: "literal",
-    }
-  }
 }
 
 // ────────── Bounded Execution ──────────

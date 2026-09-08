@@ -122,6 +122,24 @@ describe("Rate Limiter", () => {
     expect(mock.getStatus()).toBe(429)
   })
 
+  test("a strict per-route limit cannot be evaded by re-spelling the path", () => {
+    // Express routes /SCG_INGEST_REPO and /scg_ingest_repo/ to the same handler.
+    // Spend the 5-per-5-minute budget on the canonical spelling…
+    for (let i = 0; i < 5; i++) {
+      const { req, res, next } = createMock("/scg_ingest_repo")
+      rateLimitMiddleware(req, res, next)
+      expect(next).toHaveBeenCalled()
+    }
+    // …then every alternate spelling must be throttled by the SAME bucket,
+    // not handed a fresh default (60/min) one.
+    for (const variant of ["/SCG_INGEST_REPO", "/scg_ingest_repo/", "/Scg_Ingest_Repo/"]) {
+      const blocked = createMock(variant)
+      rateLimitMiddleware(blocked.req, blocked.res, blocked.next)
+      expect(blocked.next).not.toHaveBeenCalled()
+      expect(blocked.getStatus()).toBe(429)
+    }
+  })
+
   test("admin mutation endpoints have a five-per-five-minute limit", () => {
     for (let i = 0; i < 5; i++) {
       const { req, res, next } = createMock("/scg_admin_cleanup_stale")

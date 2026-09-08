@@ -32,6 +32,7 @@ import { effectEngine } from "../analysis-engine/effect-engine"
 import { deepContractSynthesizer } from "../analysis-engine/deep-contracts"
 import { conceptFamilyEngine } from "../analysis-engine/concept-families"
 import { temporalEngine } from "../analysis-engine/temporal-engine"
+import { isTestFilePath, detectTestFramework } from "../test-conventions"
 import { db } from "../db-driver"
 import { firstRow, optionalStringField } from "../db-driver/result"
 import { ingestion as ingestionConfig } from "../config"
@@ -1725,16 +1726,14 @@ export class Ingestor {
   ): Promise<number> {
     let count = 0
 
-    // Identify test symbols
-    const testSvs = svRows.filter(
-      (sv) => sv.file_path.includes(".test.") || sv.file_path.includes(".spec.") || sv.file_path.includes("__tests__"),
-    )
+    // Identify test symbols. The convention table is shared so that "is this a
+    // test?" has one answer across the engine; it used to be spelled inline
+    // here as `.test.` / `.spec.` / `__tests__`, which is JavaScript's naming
+    // and nobody else's, so every other language linked no tests at all.
+    const testSvs = svRows.filter((sv) => isTestFilePath(sv.file_path))
 
     // Build a name→svId map for non-test symbols (for body-scanning fallback)
-    const nonTestSvs = svRows.filter(
-      (sv) =>
-        !sv.file_path.includes(".test.") && !sv.file_path.includes(".spec.") && !sv.file_path.includes("__tests__"),
-    )
+    const nonTestSvs = svRows.filter((sv) => !isTestFilePath(sv.file_path))
     const nameToSvId = new Map<string, string>()
     for (const sv of nonTestSvs) {
       // Only index names with 3+ chars to avoid false matches on 'a', 'i', etc.
@@ -1789,15 +1788,10 @@ export class Ingestor {
 
       const relatedSymbols = Array.from(relatedSet)
 
-      // Detect test framework
-      let framework = "unknown"
-      if (testSv.file_path.includes(".test.ts") || testSv.file_path.includes(".test.js")) {
-        framework = "jest"
-      } else if (testSv.file_path.includes(".spec.ts") || testSv.file_path.includes(".spec.js")) {
-        framework = "jest" // or mocha
-      } else if (testSv.file_path.endsWith(".py")) {
-        framework = "pytest"
-      }
+      // Detect test framework. The old chain ended in a `.py` branch that could
+      // never run: reaching it required already matching `.test.`/`.spec.`,
+      // which no Python test file is named.
+      const framework = detectTestFramework(testSv.file_path)
 
       await coreDataService.insertTestArtifact({
         symbol_version_id: testSv.symbol_version_id,

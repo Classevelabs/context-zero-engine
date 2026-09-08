@@ -1,0 +1,163 @@
+{
+  "repo": "django",
+  "shared_universe_files": 2978,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 5029401,
+  "corpus_load_ms": 1216,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 3,
+      "lines_of_code": 1701,
+      "tokens": 16296
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 121,
+      "tokens": 1757
+    },
+    "tokens_saved_pct": 89.2
+  },
+  "cost": {
+    "avg_capsule_tokens": 2361,
+    "naive_grep_read_tokens": 2331912,
+    "contextzero_tokens": 141661,
+    "reduction_vs_naive": 16.5,
+    "naive_all_referencing_tokens": 2705116,
+    "reduction_vs_all_referencing": 19.1,
+    "oracle_file_tokens": 723549,
+    "reduction_vs_oracle": 5.1,
+    "reduction_vs_oracle_median": 5.4,
+    "tasks_capsule_cost_more_than_reading": 2,
+    "tasks_capsule_cost_more_than_oracle": 5,
+    "tasks_where_reading_found_nothing": 0,
+    "worst_task_capsule_vs_reading": 1.2,
+    "median_task_capsule_vs_reading": 0.14
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 156,
+    "avg_per_task": 2.6,
+    "of_which_indexed_as_symbols_pct": 46.2,
+    "internal_imports_seen": 564,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 37.2,
+    "contextzero_recall_incl_failures_pct": 37.2,
+    "contextzero_recall_of_indexed_pct": 69.4,
+    "file_reading_recall_overall_pct": 0.6,
+    "contextzero_beats_files": 28,
+    "tied": 32,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 16.7
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 16.7
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 50,
+      "file_reading": 35
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.47,
+    "file_reading": 0.3
+  },
+  "capsule_composition": {
+    "avg_nodes": 7.3,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 29.5,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 56.7,
+    "contract_or_invariant_pct": 81.7,
+    "linked_test_pct": 30,
+    "effect_entries_total": 131,
+    "share_of_capsule_tokens_pct": 3.9,
+    "read_from_the_body_itself_pct": 27.5,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 58.8
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 36,
+    "p90_ms": 45
+  },
+  "weakest_tasks": [
+    {
+      "name": "label_and_url_for_value",
+      "imports_used": 4,
+      "indexed": 3,
+      "delivered": 1,
+      "nodes": 2,
+      "spent": 1132
+    },
+    {
+      "name": "ManyToManyField",
+      "imports_used": 19,
+      "indexed": 13,
+      "delivered": 6,
+      "nodes": 22,
+      "spent": 7938
+    },
+    {
+      "name": "ExclusionConstraint",
+      "imports_used": 15,
+      "indexed": 8,
+      "delivered": 5,
+      "nodes": 20,
+      "spent": 7946
+    },
+    {
+      "name": "CookieStorage",
+      "imports_used": 8,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 15,
+      "spent": 4988
+    },
+    {
+      "name": "GEOSCoordSeq",
+      "imports_used": 21,
+      "indexed": 3,
+      "delivered": 3,
+      "nodes": 19,
+      "spent": 7562
+    },
+    {
+      "name": "get_prep_value",
+      "imports_used": 4,
+      "indexed": 3,
+      "delivered": 3,
+      "nodes": 6,
+      "spent": 1102
+    },
+    {
+      "name": "_pre_process_request",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 4,
+      "nodes": 10,
+      "spent": 3483
+    },
+    {
+      "name": "contribute_to_class",
+      "imports_used": 7,
+      "indexed": 3,
+      "delivered": 3,
+      "nodes": 9,
+      "spent": 2775
+    }
+  ]
+}

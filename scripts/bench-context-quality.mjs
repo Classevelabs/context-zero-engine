@@ -4,6 +4,9 @@
  *
  *   node scripts/bench-context-quality.mjs [tasks] [/path/to/indexed/repo]
  *
+ * Set CZ_BENCH_REPO_NAME when the repository was ingested under a name that is
+ * not its directory name; the snapshot is looked up by the registered name.
+ *
  * A token reduction on its own proves nothing — an empty response is a 100%
  * reduction. Two things have to be true at once: the context has to be small,
  * and it has to still contain what the change depends on. Both are measured
@@ -66,6 +69,13 @@ const { db } = await load("dist/db-driver/index.js")
 
 const REPO = path.resolve(process.argv[3] || process.cwd())
 const N = parseInt(process.argv[2] || "40", 10)
+// The snapshot is found by the name the repository was REGISTERED under, which
+// is not always its directory name — `bench-e2e.mjs <path> <name>` takes that
+// name explicitly, and any repository ingested under a label of its own has the
+// same mismatch. Deriving it from the basename alone made those repositories
+// unmeasurable: the engine's own tree registers as "engine-ts" but sits in
+// context-zero-engine/, so the run died at snapshot lookup.
+const REPO_NAME = process.env.CZ_BENCH_REPO_NAME || path.basename(REPO)
 const BUDGET = parseInt(process.env.CZ_BENCH_BUDGET || "8000", 10)
 const MIN_NAME = parseInt(process.env.CZ_BENCH_MIN_NAME || "12", 10)
 const DIAGNOSE = process.env.CZ_BENCH_DIAGNOSE === "1"
@@ -88,10 +98,14 @@ const snapRes = await db.query(
   "SELECT s.snapshot_id FROM snapshots s JOIN repositories r USING(repo_id)" +
     " WHERE r.name ILIKE $1 AND s.index_status = 'complete'" +
     " ORDER BY s.indexed_at DESC LIMIT 1",
-  [path.basename(REPO) + "%"],
+  [REPO_NAME + "%"],
 )
 if (snapRes.rowCount === 0) {
-  console.error('No complete snapshot for a repository named like "' + path.basename(REPO) + '".')
+  console.error(
+    'No complete snapshot for a repository named like "' +
+      REPO_NAME +
+      '". If it was ingested under a different name, set CZ_BENCH_REPO_NAME to it.',
+  )
   process.exit(1)
 }
 // CZ_BENCH_SNAPSHOT pins a specific snapshot, so the same ground truth can be
@@ -793,6 +807,32 @@ console.log(
         oracle_file_tokens: sum((r) => r.oracleTokens),
         reduction_vs_oracle: +(sum((r) => r.oracleTokens) / sum((r) => r.spent)).toFixed(1),
         reduction_vs_oracle_median: +median((r) => r.oracleTokens / Math.max(1, r.spent)).toFixed(1),
+
+        // Where the capsule is NOT the cheaper answer. A ratio quoted as a
+        // median hides the tail, and the tail is the case a user hits on a
+        // small symbol in a small file: the capsule carries callers, effects
+        // and contracts that the file itself does not, and for a short
+        // function that overhead can exceed simply reading the file. Reporting
+        // the count and the worst case is the difference between a measurement
+        // and an advertisement.
+        tasks_capsule_cost_more_than_reading: rows.filter((r) => r.spent > r.naiveTokens).length,
+        tasks_capsule_cost_more_than_oracle: rows.filter((r) => r.spent > r.oracleTokens).length,
+        // A symbol no other file mentions gives the grep-and-read baseline
+        // nothing to open, so its cost is zero and every ratio against it is
+        // a division by nothing — one such task reported a "7315x worse" case
+        // that described an empty denominator rather than a real regression.
+        // Those tasks are counted separately and kept out of the ratio.
+        tasks_where_reading_found_nothing: rows.filter((r) => r.naiveTokens <= 0).length,
+        worst_task_capsule_vs_reading: (() => {
+          const comparable = rows.filter((r) => r.naiveTokens > 0)
+          return comparable.length ? +Math.max(...comparable.map((r) => r.spent / r.naiveTokens)).toFixed(2) : null
+        })(),
+        median_task_capsule_vs_reading: (() => {
+          const comparable = rows.filter((r) => r.naiveTokens > 0).map((r) => r.spent / r.naiveTokens)
+          if (!comparable.length) return null
+          const sorted = comparable.sort((a, b) => a - b)
+          return +sorted[Math.floor(sorted.length / 2)].toFixed(2)
+        })(),
       },
 
       import_coverage_at_equal_budget: {

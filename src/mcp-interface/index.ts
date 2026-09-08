@@ -35,7 +35,6 @@ import { ingestor } from "../ingestor"
 import {
   authMiddleware,
   destroyAuthCleanup,
-  isRequestAuthenticated,
   requireAdminKey,
   requirePrivilegedHttpRoute,
   validateAdminApiKeyConfiguration,
@@ -327,20 +326,29 @@ async function resolveRepoBasePathForTxn(txnId: string): Promise<string | null> 
 
 // ────────── Health & Readiness ──────────
 
+// Public liveness probe. Identical for every caller — no branch on whether a
+// key was presented. The detailed diagnostics moved to /health_detail (below),
+// which is authenticated: serving them here, on a path that bypasses auth,
+// lockout and rate limiting, made an unauthenticated caller able to tell a
+// valid API key from an invalid one by the response shape, unthrottled.
 app.get(
   "/health",
-  safeHandler(async (req, res) => {
+  safeHandler(async (_req, res) => {
+    const health = await db.healthCheck()
+    res.status(health.connected ? 200 : 503).json({
+      status: health.connected ? "healthy" : "degraded",
+    })
+  }),
+)
+
+// Detailed diagnostics — behind authMiddleware (not a PUBLIC_PATH), so a wrong
+// key is rejected exactly like any other authenticated route: lockout-tracked
+// and rate-limited, which is what removes the oracle.
+app.get(
+  "/health_detail",
+  safeHandler(async (_req, res) => {
     const health = await db.healthCheck()
     const status = health.connected ? 200 : 503
-
-    // Minimal response for unauthenticated callers (k8s probes, load balancers).
-    // Detailed diagnostics only for requests carrying a valid API key.
-    if (!isRequestAuthenticated(req)) {
-      res.status(status).json({
-        status: health.connected ? "healthy" : "degraded",
-      })
-      return
-    }
 
     const { symbolCache, profileCache, capsuleCache, homologCache, queryCache } = await import("../cache")
     const cacheStats = {
@@ -390,17 +398,22 @@ app.get(
   }),
 )
 
+// Public readiness probe — constant for every caller, same reasoning as /health.
 app.get(
   "/ready",
-  safeHandler(async (req, res) => {
+  safeHandler(async (_req, res) => {
     const health = await db.healthCheck()
+    res.status(health.connected ? 200 : 503).json({
+      ready: health.connected,
+    })
+  }),
+)
 
-    if (!isRequestAuthenticated(req)) {
-      res.status(health.connected ? 200 : 503).json({
-        ready: health.connected,
-      })
-      return
-    }
+// Detailed readiness — authenticated (not a PUBLIC_PATH).
+app.get(
+  "/ready_detail",
+  safeHandler(async (_req, res) => {
+    const health = await db.healthCheck()
 
     // Migration currency check
     let migrationCount = 0
@@ -1114,6 +1127,8 @@ app.post(
     // Symbol-scoped DB serving (batch)
     if (ids.length > 0) {
       const placeholders = ids.map((_, i) => `$${i + 1}`).join(",")
+      // Constrain to the stated repo_id — a symbol_version_id from another
+      // repository must return nothing, not be served across that boundary.
       const svResult = await db.query(
         `
                 SELECT sv.symbol_version_id, sv.range_start_line, sv.range_end_line,
@@ -1124,8 +1139,9 @@ app.post(
                 JOIN symbols s ON s.symbol_id = sv.symbol_id
                 JOIN files f ON f.file_id = sv.file_id
                 WHERE sv.symbol_version_id IN (${placeholders})
+                  AND s.repo_id = $${ids.length + 1}
             `,
-        ids,
+        [...ids, repo_id],
       )
 
       if (svResult.rows.length === 0) {

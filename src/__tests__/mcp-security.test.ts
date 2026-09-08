@@ -48,6 +48,7 @@ describe("MCP mutation classification", () => {
     "scg_commit_change",
     "scg_rollback_change",
     "scg_prepare_change",
+    "scg_propagation_proposals",
     "scg_apply_propagation",
     "scg_admin_cleanup_stale",
   ])("classifies %s as privileged mutation", (tool) => {

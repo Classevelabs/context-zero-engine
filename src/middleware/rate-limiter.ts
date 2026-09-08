@@ -13,6 +13,7 @@
 import { Request, Response, NextFunction } from "express"
 import * as crypto from "crypto"
 import { Logger } from "../logger"
+import { normalizeRoutePath } from "./auth"
 
 const log = new Logger("rate-limiter")
 
@@ -41,6 +42,7 @@ const ROUTE_LIMITS: Record<string, RateConfig> = {
   // Write/mutation endpoints
   "/scg_ingest_repo": { maxRequests: 5, windowMs: RATE_WINDOW_5_MIN },
   "/scg_create_change_transaction": { maxRequests: 20, windowMs: RATE_WINDOW_1_MIN },
+  "/scg_propagation_proposals": { maxRequests: 20, windowMs: RATE_WINDOW_1_MIN },
   "/scg_apply_patch": { maxRequests: 30, windowMs: RATE_WINDOW_1_MIN },
   "/scg_validate_change": { maxRequests: 20, windowMs: RATE_WINDOW_1_MIN },
   "/scg_commit_change": { maxRequests: 10, windowMs: RATE_WINDOW_1_MIN },
@@ -173,15 +175,22 @@ function getCompositeKey(req: Request): string {
  * as the window key, defeating X-Forwarded-For rotation attacks.
  */
 export function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
-  if (req.path === "/health" || req.path === "/ready") {
+  // Express routes case-insensitively and ignores a trailing slash, so
+  // `/SCG_INGEST_REPO` and `/scg_ingest_repo/` reach the same handler as
+  // `/scg_ingest_repo`. Look up the limit and key the bucket on the SAME
+  // normalized form the router dispatches on — otherwise a caller drops a
+  // strict per-route limit to the permissive default, and earns a fresh
+  // bucket, just by changing the spelling. Mirrors requirePrivilegedHttpRoute.
+  const routePath = normalizeRoutePath(req.path)
+  if (routePath === "/health" || routePath === "/ready") {
     next()
     return
   }
 
-  const config = ROUTE_LIMITS[req.path] || ROUTE_LIMITS["__default__"]!
+  const config = ROUTE_LIMITS[routePath] || ROUTE_LIMITS["__default__"]!
   const clientIp = req.ip || req.socket.remoteAddress || "unknown"
   const compositeKey = getCompositeKey(req)
-  const key = `${compositeKey}:${req.path}`
+  const key = `${compositeKey}:${routePath}`
 
   const result = limiter.check(key, config)
 

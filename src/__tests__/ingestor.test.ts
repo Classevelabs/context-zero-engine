@@ -2298,12 +2298,13 @@ describe("Ingestor — populateTestArtifacts", () => {
       },
     ])
 
-    // The test filter checks file_path for .test. or .spec. or __tests__
-    // "tests/test_utils.py" won't match those exact patterns, so it won't be a test artifact
+    // `tests/test_utils.py` is what pytest collects, so it is a test artifact
+    // and its framework is pytest. This assertion used to be the opposite of
+    // the name above it — it pinned the JavaScript-only filter, under which no
+    // Python, Go, Rust, Java, Ruby, C# or PHP test linked to anything.
     await ingestor.ingestRepo("/repo", "test-repo", "abc123")
 
-    // Since file_path doesn't contain .test. or .spec. or __tests__, it won't be a test
-    expect(mockInsertTestArtifact).not.toHaveBeenCalled()
+    expect(mockInsertTestArtifact).toHaveBeenCalledWith(expect.objectContaining({ framework: "pytest" }))
   })
 
   test("detects .spec.ts files as tests", async () => {

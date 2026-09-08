@@ -43,6 +43,9 @@ const CATASTROPHIC = [
   "(x+x+)+y", //        two quantifiers in one group
   "((a)*)*$", //        nested group under a quantifier
   "(a+){2,}$", //       counted quantifier on an ambiguous group
+  "a*a*a*a*a*a*a*a*a*a*a*a*b", // group-free repeated atom — previously ALLOWED, hung on a 41-char line
+  String.raw`\d+\d+\d+\d+\d+\d+\d+x`, // group-free repeated escape class
+  "[a-z]*[a-z]*[a-z]*[a-z]*!", //      group-free repeated character class
 ]
 
 /** Ordinary search patterns that must keep working as real regexes. */

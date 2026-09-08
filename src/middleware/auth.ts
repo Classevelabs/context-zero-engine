@@ -43,6 +43,7 @@ export const PRIVILEGED_HTTP_PATHS = new Set([
   "/scg_ingest_runtime_trace",
   "/scg_plan_change",
   "/scg_prepare_change",
+  "/scg_propagation_proposals",
   "/scg_apply_propagation",
   "/scg_review_homolog",
 ])
@@ -453,7 +454,7 @@ export function requireAdminKey(req: Request, res: Response, next: NextFunction)
  * PRIVILEGED_HTTP_PATHS have only this gate, so it has to match on the same
  * form Express routed on.
  */
-function normalizeRoutePath(pathname: string): string {
+export function normalizeRoutePath(pathname: string): string {
   let normalized = pathname.toLowerCase()
   while (normalized.length > 1 && normalized.endsWith("/")) {
     normalized = normalized.slice(0, -1)

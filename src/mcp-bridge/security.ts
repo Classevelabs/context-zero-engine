@@ -5,6 +5,10 @@ export const MUTATING_MCP_TOOLS = new Set([
   "scg_validate_change",
   "scg_commit_change",
   "scg_rollback_change",
+  // Computes proposals AND transitions the transaction validated →
+  // propagation_pending and stores a propagation report. That state change is a
+  // mutation, so it must not be reachable with a read-only credential.
+  "scg_propagation_proposals",
   "scg_register_repo",
   "scg_ingest_repo",
   "scg_persist_homologs",
@@ -27,11 +31,11 @@ export function isMutatingMcpTool(toolName: string): boolean {
  * Whether a tool is registered — and therefore listed — for this process.
  *
  * Every listed tool's schema rides in the model's context on every turn, and
- * the 61 schemas together came to 49 KB, about 12,000 tokens per turn. While
- * SCG_MCP_MUTATIONS_ENABLED is off the 17 mutation tools are refused outright,
- * so listing them bought nothing but that cost. A tool a session cannot call
- * is not listed; the session note from {@link unlistedMutationToolsNote} says
- * once, at connect, where they went.
+ * the full set of schemas came to about 49 KB, roughly 12,000 tokens per turn.
+ * While SCG_MCP_MUTATIONS_ENABLED is off the mutation tools are refused
+ * outright, so listing them bought nothing but that cost. A tool a session
+ * cannot call is not listed; the session note from
+ * {@link unlistedMutationToolsNote} says once, at connect, where they went.
  */
 export function shouldRegisterTool(toolName: string, features: { mutationsEnabled: boolean }): boolean {
   return features.mutationsEnabled || !isMutatingMcpTool(toolName)

@@ -116,19 +116,94 @@ function isUnshareAvailable(): boolean {
 }
 
 /**
+ * Whether unshare can actually create the namespace here — not merely whether
+ * the binary is on PATH. `which unshare` succeeds on kernels that then refuse
+ * `unshare --pid` (user namespaces disabled, seccomp, an unprivileged
+ * container). This runs the real setup once against /bin/true and caches the
+ * result, so a working host commits to isolation with a single invocation and a
+ * broken one falls back to bare execution — without ever routing through a
+ * shell `||`, which fired on any non-zero exit and re-ran the target command.
+ */
+let _unshareUsable: boolean | null = null
+function isUnshareUsable(): boolean {
+  if (_unshareUsable !== null) return _unshareUsable
+  if (!isUnshareAvailable()) {
+    _unshareUsable = false
+    return false
+  }
+  try {
+    execSync("unshare -r --pid --fork --mount-proc /bin/true", { stdio: "ignore", timeout: 5_000 })
+    _unshareUsable = true
+  } catch {
+    _unshareUsable = false
+    log.warn(
+      "unshare(1) is present but cannot create a PID namespace here — sandbox processes " +
+        "will run WITHOUT namespace isolation. Enable unprivileged user namespaces to restore it.",
+    )
+  }
+  return _unshareUsable
+}
+
+/**
+ * Base directory for all sandbox scratch space, scoped to the current user so a
+ * multi-user host cannot share one predictable path. Created and verified by
+ * {@link ensureOwnedDir} before use.
+ */
+function sandboxBaseDir(): string {
+  const uid = process.platform !== "win32" && typeof process.getuid === "function" ? String(process.getuid()) : "shared"
+  return path.join(os.tmpdir(), `contextzero-sandbox-${uid}`)
+}
+
+/**
+ * Create `dir` as a directory the current user owns, with no group/other
+ * access, and reject a symlink or a foreign-owned directory at the path.
+ *
+ * The sandbox HOME used to sit at a path derived from the repo path under a
+ * shared temp root, created with a recursive mkdir. On a multi-user host any
+ * other local user could pre-place that directory — or a symlink pointing
+ * elsewhere — and thereby control HOME and the npm cache for every sandboxed
+ * tool. Owning-and-non-symlink is the standard secure-tempdir guarantee within
+ * Node's portable primitives (no openat2/O_NOFOLLOW on directories).
+ */
+function ensureOwnedDir(dir: string): void {
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 })
+  } catch (err) {
+    if (!(err && typeof err === "object" && "code" in err && (err as { code?: string }).code === "EEXIST")) {
+      throw err
+    }
+  }
+  const st = fs.lstatSync(dir)
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`Refusing to use sandbox directory ${dir}: it is a symlink or not a directory`)
+  }
+  if (process.platform !== "win32" && typeof process.getuid === "function") {
+    if (st.uid !== process.getuid()) {
+      throw new Error(`Refusing to use sandbox directory ${dir}: it is owned by another user`)
+    }
+    // Tighten permissions we own but that carry group/other bits.
+    if ((st.mode & 0o077) !== 0) fs.chmodSync(dir, 0o700)
+  }
+}
+
+/**
  * Build a sanitized environment for subprocess execution.
  * Strips all sensitive variables, preserves only what's needed for builds.
  * Runtime secrets, credentials, and production tokens are never exposed.
  */
 function getSandboxHome(cwd: string): string {
   const digest = crypto.createHash("sha256").update(path.resolve(cwd)).digest("hex").slice(0, 16)
-  return path.join(os.tmpdir(), "contextzero-sandbox", digest)
+  return path.join(sandboxBaseDir(), digest)
 }
 
 export function buildSanitizedEnv(cwd: string, extra?: Record<string, string>): Record<string, string> {
   const sandboxHome = getSandboxHome(cwd)
   const npmCacheDir = path.join(sandboxHome, ".npm")
-  fs.mkdirSync(npmCacheDir, { recursive: true })
+  // Create each level ourselves, verifying ownership and rejecting a symlink at
+  // every step, instead of a recursive mkdir into a shared, predictable path.
+  ensureOwnedDir(sandboxBaseDir())
+  ensureOwnedDir(sandboxHome)
+  ensureOwnedDir(npmCacheDir)
 
   const safe: Record<string, string> = {}
 
@@ -292,29 +367,23 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
       // --pid --fork = new PID namespace, fork so child becomes PID 1
       // --mount-proc = mount a private /proc showing only the namespace
       //
-      // In dev/test we keep a fallback to bare execution if unshare fails
-      // at runtime (kernel feature disabled on the host). In production
-      // this fallback is dropped: a runtime unshare failure must surface
-      // as a non-zero exit code so we don't silently degrade isolation
-      // (which would let a sandboxed child read /proc/<parent>/environ
-      // for DB_PASSWORD, SCG_API_KEYS, etc.).
+      // Whether to wrap in a PID namespace is decided ONCE, before spawning —
+      // never with a shell `||` fallback. That fallback ran
+      // `unshare … || /bin/sh -c <cmd>`, and `||` fires on ANY non-zero exit,
+      // so a target that legitimately failed (a failing test, a tsc error) ran
+      // a SECOND time under bare execution — doubling its side effects and
+      // reporting the re-run's output. Production commits to unshare whenever
+      // the binary is present, so a runtime namespace failure surfaces as a
+      // spawn error rather than silently degrading isolation; dev/test probes
+      // whether unshare actually works and otherwise runs bare. Both paths
+      // invoke the target exactly once.
       const innerCmd = `${ulimitPrefix} && exec ${escapedCommand} ${escapedArgs}`
       const isProduction = (process.env["NODE_ENV"] || "").toLowerCase() === "production"
-      if (isUnshareAvailable()) {
-        spawnCommand = "/bin/sh"
-        if (isProduction) {
-          spawnArgs = ["-c", `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)}`]
-        } else {
-          spawnArgs = [
-            "-c",
-            `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)} 2>/dev/null || ` +
-              `/bin/sh -c ${escapeShell(innerCmd)}`,
-          ]
-        }
-      } else {
-        spawnCommand = "/bin/sh"
-        spawnArgs = ["-c", innerCmd]
-      }
+      const useUnshare = isProduction ? isUnshareAvailable() : isUnshareUsable()
+      spawnCommand = "/bin/sh"
+      spawnArgs = useUnshare
+        ? ["-c", `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)}`]
+        : ["-c", innerCmd]
     }
 
     const child = spawn(spawnCommand, spawnArgs, {

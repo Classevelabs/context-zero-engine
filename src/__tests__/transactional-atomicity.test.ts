@@ -107,6 +107,14 @@ describe("TransactionalChangeEngine filesystem atomicity", () => {
           backups.clear()
           return { rows: [], rowCount: 1 }
         }
+        if (normalized.startsWith("SELECT 1 FROM transaction_file_backups")) {
+          const has = backups.has(String(params[1]))
+          return { rows: has ? [{ "?column?": 1 }] : [], rowCount: has ? 1 : 0 }
+        }
+        if (normalized.includes("SET patches = patches || $1::jsonb")) {
+          storedPatches = [...storedPatches, ...JSON.parse(String(params[0]))]
+          return { rows: [], rowCount: 1 }
+        }
         throw new Error(`Unexpected client SQL in test: ${normalized}`)
       }),
     }
@@ -283,5 +291,61 @@ describe("TransactionalChangeEngine filesystem atomicity", () => {
     expect(fs.readFileSync(target, "utf8")).toBe("external-edit")
     expect(state).toBe("failed")
     expect(backups.size).toBe(1)
+  })
+
+  test("applyPropagationPatch writes the homolog file, backs it up, and rollback restores it", async () => {
+    // Regression: apply_propagation used to append the patch to a JSON column
+    // and never touch the file, so the change was reported applied while the
+    // file kept its original content and validation passed on code that did not
+    // exist. The patch must now actually land on disk, with a durable backup.
+    const target = path.join(repoRoot, "src", "homolog.ts")
+    fs.writeFileSync(target, "original-homolog")
+    state = "validated"
+
+    const engine = new TransactionalChangeEngine()
+    await engine.applyPropagationPatch(
+      "txn-001",
+      { file_path: "src/homolog.ts", new_content: "propagated-homolog" },
+      repoRoot,
+    )
+
+    // The file is genuinely written — the core of the fix.
+    expect(fs.readFileSync(target, "utf8")).toBe("propagated-homolog")
+    // The patch is recorded so rollback and re-validation see it.
+    expect(storedPatches).toContainEqual({ file_path: "src/homolog.ts", new_content: "propagated-homolog" })
+    // A durable backup of the true original exists.
+    expect(backups.get("src/homolog.ts")?.original_content).toBe("original-homolog")
+    // The transaction does not change state.
+    expect(state).toBe("validated")
+
+    // Rollback restores the original from the backup.
+    await engine.rollback("txn-001")
+    expect(fs.readFileSync(target, "utf8")).toBe("original-homolog")
+    expect(state).toBe("rolled_back")
+  })
+
+  test("applyPropagationPatch refuses a transaction that is not in a propagation state", async () => {
+    state = "planned"
+    const engine = new TransactionalChangeEngine()
+    await expect(
+      engine.applyPropagationPatch(
+        "txn-001",
+        { file_path: "src/homolog.ts", new_content: "x" },
+        repoRoot,
+      ),
+    ).rejects.toThrow("applyPropagationPatch requires transaction in one of")
+  })
+
+  test("applyPropagationPatch rejects a path traversal target before writing", async () => {
+    state = "validated"
+    const engine = new TransactionalChangeEngine()
+    await expect(
+      engine.applyPropagationPatch(
+        "txn-001",
+        { file_path: "../escape.ts", new_content: "x" },
+        repoRoot,
+      ),
+    ).rejects.toThrow()
+    expect(fs.existsSync(path.join(repoRoot, "..", "escape.ts"))).toBe(false)
   })
 })

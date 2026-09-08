@@ -1,0 +1,163 @@
+{
+  "repo": "gh-cli",
+  "shared_universe_files": 937,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 2096591,
+  "corpus_load_ms": 757,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 3,
+      "lines_of_code": 1014,
+      "tokens": 8581
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 209,
+      "tokens": 2513
+    },
+    "tokens_saved_pct": 70.7
+  },
+  "cost": {
+    "avg_capsule_tokens": 3076,
+    "naive_grep_read_tokens": 924743,
+    "contextzero_tokens": 184539,
+    "reduction_vs_naive": 5,
+    "naive_all_referencing_tokens": 962422,
+    "reduction_vs_all_referencing": 5.2,
+    "oracle_file_tokens": 510097,
+    "reduction_vs_oracle": 2.8,
+    "reduction_vs_oracle_median": 2.8,
+    "tasks_capsule_cost_more_than_reading": 4,
+    "tasks_capsule_cost_more_than_oracle": 13,
+    "tasks_where_reading_found_nothing": 0,
+    "worst_task_capsule_vs_reading": 1.66,
+    "median_task_capsule_vs_reading": 0.34
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 112,
+    "avg_per_task": 1.9,
+    "of_which_indexed_as_symbols_pct": 100,
+    "internal_imports_seen": 306,
+    "internal_imports_unresolved_pct": 0,
+    "contextzero_recall_overall_pct": 72.3,
+    "contextzero_recall_incl_failures_pct": 72.3,
+    "contextzero_recall_of_indexed_pct": 72.3,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 35,
+    "tied": 25,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 33.3
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 33.3
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 81.7,
+      "file_reading": 43.3
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.35,
+    "file_reading": 0.36
+  },
+  "capsule_composition": {
+    "avg_nodes": 9.2,
+    "duplicate_node_pct": 0,
+    "duplicate_token_pct": 0,
+    "budget_utilization_pct": 38.4,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 30,
+    "contract_or_invariant_pct": 90,
+    "linked_test_pct": 38.3,
+    "effect_entries_total": 27,
+    "share_of_capsule_tokens_pct": 0.6,
+    "read_from_the_body_itself_pct": 51.9,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 55.6
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 12,
+    "p90_ms": 14
+  },
+  "weakest_tasks": [
+    {
+      "name": "newEnforcementCriteria",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 1,
+      "nodes": 9,
+      "spent": 5463
+    },
+    {
+      "name": "NewCmdDiscussion",
+      "imports_used": 8,
+      "indexed": 8,
+      "delivered": 3,
+      "nodes": 5,
+      "spent": 3616
+    },
+    {
+      "name": "resolveHosts",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 2,
+      "nodes": 7,
+      "spent": 3818
+    },
+    {
+      "name": "renderAllFiles",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 3,
+      "nodes": 16,
+      "spent": 3842
+    },
+    {
+      "name": "PromptWhenAmbiguousBaseRepoFunc",
+      "imports_used": 6,
+      "indexed": 6,
+      "delivered": 4,
+      "nodes": 15,
+      "spent": 5908
+    },
+    {
+      "name": "GetWorkflows",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 17,
+      "spent": 3687
+    },
+    {
+      "name": "fetchDescriptions",
+      "imports_used": 3,
+      "indexed": 3,
+      "delivered": 2,
+      "nodes": 13,
+      "spent": 2703
+    },
+    {
+      "name": "preloadPrChecks",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 3,
+      "nodes": 6,
+      "spent": 2765
+    }
+  ]
+}

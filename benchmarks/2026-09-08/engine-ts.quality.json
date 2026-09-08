@@ -1,0 +1,155 @@
+{
+  "repo": "context-zero-engine",
+  "shared_universe_files": 176,
+  "indexed_files_missing_on_disk": 0,
+  "universe_tokens": 788263,
+  "corpus_load_ms": 367,
+  "tasks": 60,
+  "tasks_attempted": 60,
+  "failed_tasks": 0,
+  "failed_task_samples": [],
+  "naive_baseline_file_cap": 25,
+  "capsule_token_budget": 8000,
+  "min_symbol_name_length": 12,
+  "one_typical_task": {
+    "reading_files": {
+      "files_opened": 2,
+      "lines_of_code": 2767,
+      "tokens": 27135
+    },
+    "contextzero": {
+      "requests": 1,
+      "lines_of_code": 243,
+      "tokens": 3147
+    },
+    "tokens_saved_pct": 88.4
+  },
+  "cost": {
+    "avg_capsule_tokens": 3513,
+    "naive_grep_read_tokens": 1900145,
+    "contextzero_tokens": 210770,
+    "reduction_vs_naive": 9,
+    "naive_all_referencing_tokens": 1900145,
+    "reduction_vs_all_referencing": 9,
+    "oracle_file_tokens": 1403662,
+    "reduction_vs_oracle": 6.7,
+    "reduction_vs_oracle_median": 5.9,
+    "tasks_capsule_cost_more_than_reading": 0,
+    "tasks_capsule_cost_more_than_oracle": 1,
+    "tasks_where_reading_found_nothing": 0,
+    "worst_task_capsule_vs_reading": 0.99,
+    "median_task_capsule_vs_reading": 0.13
+  },
+  "import_coverage_at_equal_budget": {
+    "resolved_imports_used_total": 92,
+    "avg_per_task": 1.5,
+    "of_which_indexed_as_symbols_pct": 96.7,
+    "internal_imports_seen": 318,
+    "internal_imports_unresolved_pct": 0.3,
+    "contextzero_recall_overall_pct": 43.5,
+    "contextzero_recall_incl_failures_pct": 43.5,
+    "contextzero_recall_of_indexed_pct": 41.6,
+    "file_reading_recall_overall_pct": 0,
+    "contextzero_beats_files": 22,
+    "tied": 38,
+    "file_reading_beats_contextzero": 0
+  },
+  "structure_at_equal_budget": {
+    "has_implementation_pct": {
+      "contextzero": 100,
+      "file_reading": 5
+    },
+    "has_interface_pct": {
+      "contextzero": 100,
+      "file_reading": 5
+    },
+    "has_verified_caller_pct": {
+      "contextzero": 90,
+      "file_reading": 25
+    }
+  },
+  "facts_per_1k_tokens": {
+    "contextzero": 1.02,
+    "file_reading": 0.1
+  },
+  "capsule_composition": {
+    "avg_nodes": 11.4,
+    "duplicate_node_pct": 0.4,
+    "duplicate_token_pct": 0.1,
+    "budget_utilization_pct": 43.9,
+    "self_reported_vs_actual_tokens_pct": 100,
+    "tasks_over_budget": 0
+  },
+  "derived_context_not_obtainable_by_reading": {
+    "effect_signature_pct": 55,
+    "contract_or_invariant_pct": 86.7,
+    "linked_test_pct": 30,
+    "effect_entries_total": 114,
+    "share_of_capsule_tokens_pct": 2.3,
+    "read_from_the_body_itself_pct": 13.2,
+    "propagated_around_a_call_cycle_pct": 0,
+    "distinct_effect_sets_pct": 36.4
+  },
+  "latency": {
+    "avg_capsule_compile_ms": 18,
+    "p90_ms": 24
+  },
+  "weakest_tasks": [
+    {
+      "name": "ingestIncremental",
+      "imports_used": 30,
+      "indexed": 30,
+      "delivered": 0,
+      "nodes": 4,
+      "spent": 7927
+    },
+    {
+      "name": "runRetentionPolicy",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 2,
+      "nodes": 25,
+      "spent": 7907
+    },
+    {
+      "name": "ContractEngine",
+      "imports_used": 8,
+      "indexed": 7,
+      "delivered": 4,
+      "nodes": 15,
+      "spent": 5969
+    },
+    {
+      "name": "UncertaintyTracker",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 3,
+      "nodes": 9,
+      "spent": 3540
+    },
+    {
+      "name": "getRelationsForSymbol",
+      "imports_used": 4,
+      "indexed": 4,
+      "delivered": 3,
+      "nodes": 23,
+      "spent": 5341
+    },
+    {
+      "name": "validateStartupConfiguration",
+      "imports_used": 5,
+      "indexed": 5,
+      "delivered": 4,
+      "nodes": 14,
+      "spent": 2449
+    },
+    {
+      "name": "getSymbolDetails",
+      "imports_used": 6,
+      "indexed": 6,
+      "delivered": 5,
+      "nodes": 18,
+      "spent": 3694
+    }
+  ]
+}
