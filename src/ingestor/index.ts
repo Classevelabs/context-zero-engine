@@ -1885,6 +1885,14 @@ export class Ingestor {
               const stat = await fsp.stat(entryPath)
               if (stat.size <= MAX_FILE_SIZE) {
                 files.push(entryPath)
+              } else {
+                // Not silent: without this an over-limit source file vanishes
+                // from the index and the operator has no way to know it did.
+                log.warn("File skipped — exceeds size limit, will not be indexed", {
+                  path: entryPath,
+                  sizeBytes: stat.size,
+                  limitBytes: MAX_FILE_SIZE,
+                })
               }
             } catch {
               // Skip unreadable files
