@@ -56,27 +56,41 @@ export type SupportedLanguage =
 // Grammar loading (lazy, cached)
 // ---------------------------------------------------------------------------
 
-const grammarCache = new Map<SupportedLanguage, TreeSitterLanguage>()
+// A .tsx/.jsx file needs the JSX-aware grammar; a plain .ts file must NOT use it
+// (the .tsx grammar reads `<T>expr` type assertions as JSX and errors on them),
+// so grammar selection is a superset of SupportedLanguage: "tsx" is chosen by
+// file extension at the call site, independent of the node-mapping language.
+type GrammarKey = SupportedLanguage | "tsx"
 
-function getGrammar(language: SupportedLanguage): TreeSitterLanguage {
+const grammarCache = new Map<GrammarKey, TreeSitterLanguage>()
+
+function getGrammar(language: GrammarKey): TreeSitterLanguage {
   if (grammarCache.has(language)) return grammarCache.get(language)!
 
   let grammar: TreeSitterLanguage
   try {
     switch (language) {
       case "typescript": {
-        // tree-sitter-typescript exports .typescript and .tsx sub-grammars
+        // Plain .ts only. The .typescript sub-grammar preserves `<T>expr` type
+        // assertions; the .tsx grammar would misread them as JSX. .tsx files are
+        // routed to the "tsx" key at the call site.
         const tsLangs = require("tree-sitter-typescript")
         grammar = tsLangs.typescript
         break
       }
-      case "javascript": {
-        // tree-sitter-typescript depends on tree-sitter-javascript
-        // The typescript grammar can parse JS; alternatively we can use its
-        // tsx sub-grammar which is a superset. However, for maximum fidelity
-        // we use the typescript sub-grammar (it handles JS fine).
+      case "tsx": {
+        // .tsx (and .js/.jsx via "javascript") — the JSX-aware superset. Without
+        // it a React file parsed by the .typescript grammar becomes ERROR nodes
+        // across every tag, and its components and handlers emit no symbols.
         const tsLangs = require("tree-sitter-typescript")
-        grammar = tsLangs.typescript
+        grammar = tsLangs.tsx
+        break
+      }
+      case "javascript": {
+        // JS and JSX. JavaScript has no `<T>` assertion, so the JSX superset is
+        // safe here and is what lets JSX inside .js/.jsx parse at all.
+        const tsLangs = require("tree-sitter-typescript")
+        grammar = tsLangs.tsx
         break
       }
       case "python":
@@ -133,9 +147,9 @@ function getGrammar(language: SupportedLanguage): TreeSitterLanguage {
 // Parser pool (one parser per language, reused)
 // ---------------------------------------------------------------------------
 
-const parserCache = new Map<SupportedLanguage, TSParser>()
+const parserCache = new Map<GrammarKey, TSParser>()
 
-function getParser(language: SupportedLanguage): TSParser {
+function getParser(language: GrammarKey): TSParser {
   if (parserCache.has(language)) return parserCache.get(language)!
   const parser = new Parser()
   parser.setLanguage(getGrammar(language))
@@ -4311,7 +4325,11 @@ export class UniversalAdapter {
     // Parse
     let tree: TreeSitterTree
     try {
-      const parser = getParser(language)
+      // .tsx needs the JSX grammar; .ts must not use it. (.js/.jsx use the
+      // "javascript" key, which is already the JSX-aware grammar.)
+      const grammarKey: GrammarKey =
+        language === "typescript" && /\.tsx$/i.test(filePath) ? "tsx" : language
+      const parser = getParser(grammarKey)
       tree = parser.parse(source)
     } catch (err) {
       this.log.error("tree-sitter parse failed", err, { filePath, language })
