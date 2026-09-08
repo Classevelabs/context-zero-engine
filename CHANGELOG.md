@@ -5,6 +5,35 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.0] - 2026-09-08
+
+### Fixed
+- **A class is no longer emitted as its own dependency.** For a self-referential
+  class (recursive fields, factories, singletons, fluent builders, `new Self()`)
+  the container was re-admitted into its own dependency set and its full body was
+  pasted a second time — duplicating content, defeating the class-skeleton
+  optimisation, and crowding real dependencies out of a tight budget. The
+  member-dependency query now excludes the whole container scope. Regression:
+  `capsule-self-dep.test.ts`.
+- **JSX now parses in the native (tree-sitter) search path.** `.tsx`/`.jsx`
+  files were parsed with the non-JSX `.typescript` grammar, so React files
+  became ERROR nodes and their components and handlers emitted no symbols. They
+  now use the JSX-aware `.tsx` grammar (as does `.js`), while plain `.ts` keeps
+  the `.typescript` grammar so `<T>expr` type assertions still parse. Regression:
+  `universal-adapter-jsx.test.ts`. (The database ingest path uses the TypeScript
+  compiler API and was already correct.)
+- **Interface-method and enum-member references resolve under their owner.** They
+  are indexed as `Owner.member` but references built a bare `member` key, so
+  exact resolution missed and fell back to ambiguous bare-name matching.
+- **A file above the size limit is logged, not silently dropped**, so the
+  operator knows it was not indexed.
+
+### Changed
+- **An invalid `DB_SSL_MODE` now refuses to start** rather than silently falling
+  back to `disable` (no TLS). A typo such as `required` for `require` had
+  connected a remote database unencrypted; a security-relevant config value must
+  refuse, not guess.
+
 ## [2.14.1] - 2026-09-08
 
 ### Fixed

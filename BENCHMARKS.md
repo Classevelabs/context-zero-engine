@@ -1,6 +1,28 @@
 # Context Zero Engine — Benchmarks
 
-## Corpus sweep, 2026-09-06 (current)
+## Current headline — 2026-09-08 run
+
+The figures published on classeve.com come from one sweep on 2026-09-08: 955
+retrieval tasks across 18 repositories, 0 failed, at an 8,000-token capsule
+budget. Raw tables: `benchmarks/2026-09-08/BENCH-TABLES.md`. All measured on a
+consumer-grade developer machine — no server hardware, no clustering.
+
+| Metric | Value |
+|---|---:|
+| Median tokens saved (typical job) | **83.3%** |
+| Pooled reduction across the whole run | **10.1×** |
+| Median × vs reading the files | **9.4×** |
+| Median × vs an oracle that already knows the files | **6.7×** |
+| Dependency recall | scored on 8 of 18 repos (~6 in 10 where measured) |
+| Tasks where the capsule cost more than reading | 101 of 955 (10.6%) |
+
+Both the typical-job median (83.3%) and the whole-run pooled ratio (10.1×) are
+real and different measures — 10.1× pooled corresponds to ~90% pooled savings,
+not 83.3%; they are never the same number. The 2026-09-06 sweep below is a
+prior run at a 12,000-token budget, kept for its before/after ingest and
+storage tables; its per-task token figures are that run's, not this headline.
+
+## Corpus sweep, 2026-09-06 (prior sweep, 12,000-token budget)
 
 Every number in this section comes from one run of the two benchmark
 scripts on the build at the commit that introduced it, over 17 public

@@ -710,7 +710,9 @@ async function writeReport(data: {
   const tokenSummary = summarizeTokenRows(data.tokenRows)
   const caveats = collectBenchmarkCaveats(data)
   const now = new Date().toISOString()
-  const host = `${os.hostname()} / ${os.platform()} ${os.release()} / ${os.cpus()[0]?.model || "unknown CPU"}`
+  // Deliberately generic: never record the machine's hostname or CPU model —
+  // published reports must not carry the author's machine identity.
+  const host = `${os.platform()} ${os.arch()} · consumer-grade developer machine`
   const lines: string[] = []
 
   lines.push("# ContextZero Benchmark Report")

@@ -734,7 +734,9 @@ async function writeReport(
   results: TargetResult[],
   mcp: Awaited<ReturnType<typeof mcpSmoke>>,
 ): Promise<void> {
-  const host = `${os.hostname()} / ${os.platform()} ${os.release()} / ${os.cpus()[0]?.model || "unknown CPU"}`
+  // Deliberately generic: never record the machine's hostname or CPU model —
+  // published reports must not carry the author's machine identity.
+  const host = `${os.platform()} ${os.arch()} · consumer-grade developer machine`
   const lines: string[] = []
   lines.push("# ContextZero Multi-Language Benchmark Report")
   lines.push("")
