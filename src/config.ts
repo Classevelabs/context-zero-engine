@@ -113,15 +113,13 @@ export const database = Object.freeze({
     const mode = envString("DB_SSL_MODE", "disable")
     const VALID_SSL_MODES = new Set(["disable", "require", "verify-ca", "verify-full"])
     if (VALID_SSL_MODES.has(mode)) return mode as "disable" | "require" | "verify-ca" | "verify-full"
-    process.stderr.write(
-      JSON.stringify({
-        timestamp: new Date().toISOString(),
-        level: "warn",
-        subsystem: "config",
-        message: `Invalid DB_SSL_MODE "${mode}" — falling back to "disable". Valid: disable, require, verify-ca, verify-full`,
-      }) + "\n",
+    // A typo in a security-relevant field must fail loudly, never silently drop
+    // TLS: "required" (for "require") once let a remote DB connect unencrypted.
+    // This is the "never default a config read" rule — refuse, don't guess.
+    throw new Error(
+      `Invalid DB_SSL_MODE "${mode}". Valid: disable, require, verify-ca, verify-full — ` +
+        `refusing to start rather than connect without TLS.`,
     )
-    return "disable" as const
   })(),
   sslCaPath: envString("DB_SSL_CA"),
   migrationLockTimeoutMs: envInt("DB_MIGRATION_LOCK_TIMEOUT_MS", 10000),

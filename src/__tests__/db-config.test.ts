@@ -125,4 +125,17 @@ describe("Database config", () => {
     const { getConnectionConfig } = await import("../db-driver/config")
     expect(getConnectionConfig().ssl).toBe(false)
   })
+
+  test("refuses an invalid DB_SSL_MODE instead of silently disabling TLS", async () => {
+    jest.resetModules()
+    process.env["DB_SSL_MODE"] = "required" // a typo for "require"
+    await expect(import("../config")).rejects.toThrow(/DB_SSL_MODE/)
+  })
+
+  test("accepts a valid DB_SSL_MODE", async () => {
+    jest.resetModules()
+    process.env["DB_SSL_MODE"] = "require"
+    const cfg = await import("../config")
+    expect(cfg.database.sslMode).toBe("require")
+  })
 })
