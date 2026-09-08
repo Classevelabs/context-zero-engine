@@ -2019,6 +2019,47 @@ export class Ingestor {
       // from a path NEW since the snapshot (needs a file row created).
       const invalidatedSvIds: string[] = []
       const knownPaths = new Set<string>()
+      // Inbound edges — callers that live in OTHER files, pointing INTO a file
+      // we are about to re-index — are cascade-deleted the moment that file's
+      // symbol_versions are dropped (structural_relations.dst carries ON DELETE
+      // CASCADE), and the caller's own file is not re-extracted on this pass,
+      // so nothing re-emits them. That silently erased every "who calls this?"
+      // answer for the symbols an edited file defines. Capture those edges
+      // keyed by the callee's STABLE symbol_id before the delete, then re-point
+      // them to the callee's new symbol_version after re-extraction. Edges
+      // whose SOURCE is itself in the changed set are excluded — re-extraction
+      // re-emits those, so restoring them would only duplicate work.
+      const survivedInbound: {
+        src_symbol_version_id: string
+        dst_symbol_id: string
+        relation_type: string
+        strength: number
+        source: string
+        confidence: number
+      }[] = []
+      // Read before the delete transaction opens: the per-(repo, snapshot)
+      // advisory lock this pass holds keeps the pre-delete state stable, and
+      // reading here rather than inside the transaction keeps the deletion path
+      // untouched.
+      const inboundResult = await db.query(
+        `WITH changed_files AS (
+             SELECT file_id FROM files WHERE snapshot_id = $1 AND path = ANY($2::text[])
+           ),
+           changed_svs AS (
+             SELECT symbol_version_id FROM symbol_versions
+             WHERE file_id IN (SELECT file_id FROM changed_files)
+           )
+           SELECT sr.src_symbol_version_id, dv.symbol_id AS dst_symbol_id,
+                  sr.relation_type, sr.strength, sr.source, sr.confidence
+             FROM structural_relations sr
+             JOIN symbol_versions dv ON dv.symbol_version_id = sr.dst_symbol_version_id
+            WHERE dv.symbol_version_id IN (SELECT symbol_version_id FROM changed_svs)
+              AND sr.src_symbol_version_id NOT IN (SELECT symbol_version_id FROM changed_svs)`,
+        [snapshotId, changedPaths],
+      )
+      for (const row of inboundResult.rows as (typeof survivedInbound)[number][]) {
+        survivedInbound.push(row)
+      }
       await db.transaction(async (client: PoolClient) => {
         for (const changedPath of changedPaths) {
           const fileResult = await db.queryWithClient(
@@ -2337,6 +2378,42 @@ export class Ingestor {
       // the whole snapshot (copied-forward versions included).
       if (pendingRelations.length > 0) {
         relationsUpdated += await structuralGraphEngine.computeRelationsFromRaw(snapshotId, repoId, pendingRelations)
+      }
+
+      // Re-point the inbound edges captured before the delete to the callee's
+      // new symbol_version. A callee that still exists keeps its stable
+      // symbol_id, which resolves to exactly one symbol_version in this
+      // snapshot; a callee removed by the edit resolves to none, so its edges
+      // correctly stay gone. The source version is untouched — its file was not
+      // re-indexed — so the edge is valid to re-create. ON CONFLICT guards the
+      // case where resolution already re-emitted the same edge.
+      if (survivedInbound.length > 0) {
+        let restored = 0
+        await db.transaction(async (client: PoolClient) => {
+          for (const edge of survivedInbound) {
+            const dstResult = await db.queryWithClient(
+              client,
+              `SELECT symbol_version_id FROM symbol_versions WHERE symbol_id = $1 AND snapshot_id = $2`,
+              [edge.dst_symbol_id, snapshotId],
+            )
+            const newDst = optionalStringField(firstRow(dstResult), "symbol_version_id")
+            if (!newDst) continue
+            const ins = await db.queryWithClient(
+              client,
+              `INSERT INTO structural_relations
+                 (relation_id, src_symbol_version_id, dst_symbol_version_id, relation_type, strength, source, confidence)
+               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+               ON CONFLICT (src_symbol_version_id, dst_symbol_version_id, relation_type) DO NOTHING`,
+              [edge.src_symbol_version_id, newDst, edge.relation_type, edge.strength, edge.source, edge.confidence],
+            )
+            restored += ins.rowCount ?? 0
+          }
+        })
+        relationsUpdated += restored
+        log.debug("Incremental: re-pointed inbound caller edges", {
+          captured: survivedInbound.length,
+          restored,
+        })
       }
 
       // Incremental invalidation deletes semantic vectors through the

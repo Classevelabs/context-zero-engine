@@ -5,6 +5,19 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.1] - 2026-09-08
+
+### Fixed
+- **Incremental indexing no longer drops a file's inbound (caller) edges.**
+  Re-indexing a file deleted its `symbol_versions`, and because
+  `structural_relations.dst` cascades on delete, every edge pointing into that
+  file from other, unchanged files was removed and never re-emitted — so after
+  an edit `scg_blast_radius` / "who calls this?" answered as if the symbols had
+  no callers, until a cold re-ingest. The pass now captures those inbound edges
+  before the delete and re-points them to the re-created symbols. Affected
+  `npm run watch` and `scg_incremental_index`; the default watcher is off, so
+  cold ingests were never affected.
+
 ## [2.14.0] - 2026-09-08
 
 ### Documentation
