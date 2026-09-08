@@ -930,9 +930,14 @@ export class CapsuleCompiler {
                 AND nsv.range_start_line >= tgt.range_start_line
                 AND nsv.range_end_line <= tgt.range_end_line
             )`
+    // The whole scope is excluded from the dependency set, $1 (the container)
+    // included: a member typed as / returning / constructing its own container
+    // produces a member->$1 edge whose body IS the container, already shipped as
+    // the target. Keeping $1 here re-admitted the class as its own dependency and
+    // pasted its body a second time (regression: capsule-self-dep.test.ts).
     const srcPredicate = expand
       ? `sr.src_symbol_version_id IN (SELECT svid FROM scope)
-                AND sr.dst_symbol_version_id NOT IN (SELECT svid FROM scope WHERE svid <> $1)`
+                AND sr.dst_symbol_version_id NOT IN (SELECT svid FROM scope)`
       : `sr.src_symbol_version_id = $1`
     const result = await db.query(
       `
