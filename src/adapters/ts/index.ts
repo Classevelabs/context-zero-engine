@@ -572,6 +572,21 @@ function indexedNameFor(declaration: ts.Declaration, symbolName: string): string
   ) {
     return `${parent.name.text}.${symbolName}`
   }
+  // Interface members (MethodSignature/PropertySignature) and enum members are
+  // indexed under their owner too — see the interface/enum branch of visit(),
+  // which keys them as Owner.member. A reference to one must build the SAME key
+  // or exact resolution misses and it degrades to ambiguous bare-name matching.
+  if (
+    (ts.isMethodSignature(declaration) || ts.isPropertySignature(declaration)) &&
+    parent &&
+    ts.isInterfaceDeclaration(parent) &&
+    parent.name
+  ) {
+    return `${parent.name.text}.${symbolName}`
+  }
+  if (ts.isEnumMember(declaration) && parent && ts.isEnumDeclaration(parent) && parent.name) {
+    return `${parent.name.text}.${symbolName}`
+  }
   return symbolName
 }
 
