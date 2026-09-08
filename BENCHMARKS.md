@@ -505,7 +505,7 @@ From an instrumented full-analysis run on the engine's own codebase:
 
 | Aspect | Result |
 |---|---|
-| Behavioral purity distribution | 95.2% `pure`, 3.2% `read_only`, 1.3% `read_write`, 0.3% `side_effecting` — every symbol profiled |
+| Behavioral purity distribution | 95.2% `pure`, 3.2% `read_only`, 1.3% `read_write`, 0.3% `side_effecting` — every symbol profiled. `pure` is the classification when no side effect is detected in a symbol's own body, not a proof of purity; transitive effects are carried separately in effect signatures. |
 | Capsule budget utilization | `standard` mode: 99.96% of an 8,000-token budget; `strict`: 99%+ of 20,000 |
 | Profile cache hit rate | 97.1% under analytical workloads |
 | Semantic search scores | Calibrated TF-IDF cosine scores (e.g. 0.586 for "database transaction with rollback") — no inflated confidence |

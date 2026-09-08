@@ -32,17 +32,19 @@ describe("native symbol search parse cache", () => {
   })
 
   test("parses each file once, then answers from the cache until the file changes", async () => {
-    const before = parseCacheSize()
     const first = await searchWorkspaceSymbols(repo, "LoadUser", { language: "go" })
-    if (!first.matches.some((m) => m.canonical_name === "LoadUser")) {
-      console.log("PARSE-CACHE-DIAG " + JSON.stringify({ scanned: first.scanned_files, unreadable: first.unreadable_files, truncated: first.truncated, allowed: process.env["SCG_ALLOWED_BASE_PATHS"], repo, maxFiles: process.env["SCG_NATIVE_MAX_FILES"], keys: Object.keys(process.env).filter((k) => k.startsWith("SCG_")) }))
-    }
     expect(first.matches.map((m) => m.canonical_name)).toContain("LoadUser")
-    expect(parseCacheSize()).toBe(before + 2)
+    // Size is measured AFTER the first pass, not as a delta from an empty cache:
+    // the cache is module-global with LRU eviction, so under the full suite it
+    // may already hold (and evict) other files. What this test pins is the
+    // BEHAVIOUR — a re-search over unchanged files adds no new parse, and a
+    // changed file is re-parsed — not an absolute entry count.
+    const primed = parseCacheSize()
+    expect(primed).toBeGreaterThanOrEqual(2)
 
     const second = await searchWorkspaceSymbols(repo, "SaveUser", { language: "go" })
     expect(second.matches.map((m) => m.canonical_name)).toContain("SaveUser")
-    expect(parseCacheSize()).toBe(before + 2)
+    expect(parseCacheSize()).toBe(primed) // unchanged files → cache hit, no growth
 
     // Change a file: same size, newer mtime, new content.
     writeFileSync(join(repo, "b.go"), "package a\n\nfunc RenderGraph() {}\n")
@@ -51,6 +53,6 @@ describe("native symbol search parse cache", () => {
     const third = await searchWorkspaceSymbols(repo, "Render", { language: "go" })
     expect(third.matches.map((m) => m.canonical_name)).toContain("RenderGraph")
     expect(third.matches.map((m) => m.canonical_name)).not.toContain("RenderChart")
-    expect(parseCacheSize()).toBe(before + 2)
+    expect(parseCacheSize()).toBe(primed) // b.go re-parsed in place, a.go still cached
   })
 })

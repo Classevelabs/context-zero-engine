@@ -152,10 +152,13 @@ DB_PASSWORD=your-real-password
 SCG_ALLOWED_BASE_PATHS=/path/to/repos
 ```
 
-`.env` does not override a variable that is already set in the process
-environment. If `SCG_ALLOWED_BASE_PATHS` (or any `DB_*`/`SCG_*` name) exists as
-a system or user environment variable, that value wins and editing `.env` has
-no effect. Check before assuming the file is being read:
+When the MCP client launches the server it passes `CONTEXTZERO_ENV_FILE`, and
+that file's values are applied with override — so the file wins over any
+pre-existing `DB_*`/`SCG_*` shell or system variable. When you instead run a
+command directly with `CONTEXTZERO_ENV_FILE` unset (for example a bare
+`npm start`), the reverse holds: a variable already present in the environment
+wins and editing `.env` has no effect. `npm run doctor` reports which case
+applies; if a value looks wrong, check the shell:
 
 ```powershell
 $env:SCG_ALLOWED_BASE_PATHS

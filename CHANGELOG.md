@@ -5,7 +5,14 @@ All notable changes to Context Zero Engine are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.14.0] - 2026-09-08
+
+### Documentation
+- Corrected the MCP tool split (43 read + 18 mutating) and the HTTP route count
+  (62: 9 GET + 53 POST) across README and ARCHITECTURE, clarified `.env`
+  precedence under `CONTEXTZERO_ENV_FILE` in INSTALL, and scoped the uncertainty
+  and behavioral-purity descriptions to what the engine actually records.
+
 
 **Upgrade note.** Migration 025 changes how sparse vectors are stored and
 empties `semantic_vectors`; the table cannot be converted in SQL because the

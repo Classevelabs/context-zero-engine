@@ -72,8 +72,8 @@ with `node scripts/bench-context-quality.mjs`.
 | **Symbol Lineage** | Cross-snapshot identity tracking through renames and refactors. |
 | **Transactional Editing** | 9-state change lifecycle with DB-backed rollback and 6-level progressive validation. |
 | **Semantic Search** | Find code by what it does rather than what it is called. Runs locally on TF-IDF and MinHash similarity — no external API, no embedding service, no key to buy. |
-| **Uncertainty Tracking** | Every symbol carries a confidence score, tracked back to twelve specific reasons the engine might be wrong. It tells you what it is *not* sure about instead of presenting every answer as equally solid. |
-| **Self-Maintaining Index** | The graph follows the code. Edits are folded into the existing snapshot within seconds of hitting disk — no re-ingest, no scheduled job, no editor plugin. Repository-wide analysis is deferred under load and settled while you are idle, and whatever is outstanding is reported rather than assumed. |
+| **Uncertainty Tracking** | Where extraction is unsure — a recovered parse, an unresolved type, dynamic dispatch — the symbol is flagged, and those flags aggregate into a snapshot-level confidence. It surfaces what it is *not* sure about instead of presenting every answer as equally solid. |
+| **Self-Maintaining Index** | A file watcher folds each changed file into the existing snapshot within seconds of hitting disk — no scheduled job, no editor plugin. Repository-wide analysis is deferred under load and settled while you are idle, and whatever is outstanding is reported rather than assumed. |
 
 ## Languages
 
@@ -93,7 +93,7 @@ MCP-compatible client (Claude Desktop, Claude Code, Codex, Cursor, ...)
     |
     | MCP protocol (stdio)            HTTP clients
     |                                     |
-ContextZero MCP Bridge (61 tools)    REST API (60 routes)
+ContextZero MCP Bridge (61 tools)    REST API (62 routes)
     |                                     |
     +------------------+------------------+
     |
@@ -198,7 +198,7 @@ Any MCP client that speaks stdio works: the server is
 single `CONTEXTZERO_ENV_FILE` pointing at your `.env`).
 
 MCP uses a trusted local stdio child-process boundary; it is not a remote
-network authentication layer. The 44 read tools are listed by default. The 17
+network authentication layer. The 43 read tools are listed by default. The 18
 tools that ingest, edit, run retention cleanup, or validate are listed only
 after a local operator sets `SCG_MCP_MUTATIONS_ENABLED=true`; until then the
 session is told once, at connect, that they exist and where the switch is.
@@ -250,7 +250,7 @@ curl -X POST http://localhost:3100/scg_codebase_overview \
   -d '{"repo_id": "..."}'
 ```
 
-60 routes (7 GET + 53 POST) mirror the MCP tool surface plus health,
+62 routes (9 GET + 53 POST) mirror the MCP tool surface plus health,
 readiness, Prometheus metrics, cache, and admin endpoints. All non-health
 routes require API-key authentication (`X-API-Key` or `Authorization:
 Bearer`). State-changing, repository-registration, and validation-command
@@ -284,7 +284,7 @@ is where `SCG_REPOS_PATH` is mounted inside the container.
 | Native Workspace (no DB) | 3 | `scg_native_codebase_overview`, `scg_native_symbol_search`, `scg_native_search_code` |
 | Admin | 5 | `scg_admin_run_retention`, `scg_admin_db_stats`, `scg_admin_system_info` |
 
-A session lists the 44 read tools by default; the 17 that mutate appear once
+A session lists the 43 read tools by default; the 18 that mutate appear once
 `SCG_MCP_MUTATIONS_ENABLED=true` is set. The complete registry is in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 

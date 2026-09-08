@@ -69,7 +69,7 @@ All adapters produce the same normalized output (`AdapterExtractionResult`), ens
 | **Temporal** | `temporal-engine.ts` | ~980 | Git history mining via `execFileAsync('git', ...)`. Co-change pair computation (Jaccard similarity). Risk scoring (frequency, bug-fix correlation, churn). |
 | **Symbol Lineage** | `symbol-lineage.ts` | ~1,110 | Deterministic identity seeds (SHA-256). 5-signal fuzzy matching (normalized AST, body hash, neighborhood, signature, Levenshtein name distance). Birth/death tracking. |
 | **Runtime Evidence** | `runtime-evidence.ts` | ~1,480 | Runtime trace ingestion with payload truncation. Observed edge persistence. Evidence retrieval per symbol. |
-| **Uncertainty Tracker** | `uncertainty.ts` | ~240 | 12-source uncertainty model. Per-symbol and per-snapshot confidence scoring. Evidence recommendations. |
+| **Uncertainty Tracker** | `uncertainty.ts` | ~240 | 12 defined uncertainty sources. Snapshot-level confidence scoring aggregated over per-symbol flags. Evidence recommendations. |
 
 ### 3.7 Homolog Inference Engine (`homolog-engine`)
 - **7-dimension weighted scoring** (sum=1.0): semantic intent (0.20), normalized logic (0.20), signature/type (0.15), behavioral overlap (0.15), contract overlap (0.15), test overlap (0.10), history co-change (0.05).
@@ -88,8 +88,8 @@ All adapters produce the same normalized output (`AdapterExtractionResult`), ens
 - Stale transaction cleanup and transaction recovery.
 
 ### 3.9 API Layer
-- **REST API (`mcp-interface`)** — Express 5 HTTP server with **60 routes** (7 GET + 53 POST). Fail-closed API key auth, distinct production admin keys for mutation/command/admin routes, bounded per-route rate limiting, tiered body limits, input validation, Prometheus metrics, correlation IDs, HSTS enforcement, and a sanitized JSON error boundary.
-- **MCP Stdio Bridge (`mcp-bridge`)** — Native Model Context Protocol server over a trusted local stdio child-process channel. **61 tools** with Zod schema validation; the 17 mutation tools are registered only when operator-level `SCG_MCP_MUTATIONS_ENABLED=true` is set, so a default session lists 44 and is told at connect where the rest are. Optional per-call secrets are defense in depth, not remote transport authentication. All logging goes to stderr.
+- **REST API (`mcp-interface`)** — Express 5 HTTP server with **62 routes** (9 GET + 53 POST). Fail-closed API key auth, distinct production admin keys for mutation/command/admin routes, bounded per-route rate limiting, tiered body limits, input validation, Prometheus metrics, correlation IDs, HSTS enforcement, and a sanitized JSON error boundary.
+- **MCP Stdio Bridge (`mcp-bridge`)** — Native Model Context Protocol server over a trusted local stdio child-process channel. **61 tools** with Zod schema validation; the 18 mutation tools are registered only when operator-level `SCG_MCP_MUTATIONS_ENABLED=true` is set, so a default session lists 43 and is told at connect where the rest are. Optional per-call secrets are defense in depth, not remote transport authentication. All logging goes to stderr.
 - **Native Workspace Tools** — 3 DB-free tools (`scg_native_codebase_overview`, `scg_native_symbol_search`, `scg_native_search_code`) for direct filesystem analysis via `workspace-native.ts`. Available only through MCP bridge (no HTTP routes).
 
 ### 3.10 Caching Layer (`cache`)
