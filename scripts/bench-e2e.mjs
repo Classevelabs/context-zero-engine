@@ -323,7 +323,8 @@ console.log(`source       ${src.files} files, ${src.lines.toLocaleString()} line
 console.log(`iterations   ${QUERY_ITERATIONS} per query\n`)
 
 console.log("── ingest ──────────────────────────────────────────────────────")
-const cold = await withPeakRss(() => ingestor.ingestRepo(REPO_PATH, REPO_NAME, await headCommit(REPO_PATH), "main"))
+const coldCommit = await headCommit(REPO_PATH)
+const cold = await withPeakRss(() => ingestor.ingestRepo(REPO_PATH, REPO_NAME, coldCommit, "main"))
 if (cold.value.error) {
   console.error(`cold ingest refused: ${cold.value.error}`)
   process.exit(1)
