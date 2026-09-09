@@ -1944,7 +1944,7 @@ export class Ingestor {
     repoId: string,
     snapshotId: string,
     changedPaths: string[],
-    options: { refine?: "full" | "deferred" } = {},
+    options: { refine?: "full" | "deferred"; commitSha?: string } = {},
   ): Promise<{
     symbolsUpdated: number
     relationsUpdated: number
@@ -2619,6 +2619,25 @@ export class Ingestor {
         })
       }
 
+      // Advance the snapshot's recorded commit. Without this the graph moved
+      // forward while its provenance stayed at the last full ingest, so anyone
+      // comparing commit_sha against git HEAD to decide "is my index stale"
+      // was told the wrong thing in both directions. Only on a clean pass: a
+      // snapshot that failed files has not reached the commit the caller named.
+      if (options.commitSha && failedPaths.length === 0 && indexStatusAfter === "complete") {
+        try {
+          await db.query(`UPDATE snapshots SET commit_sha = $1 WHERE snapshot_id = $2`, [
+            options.commitSha,
+            snapshotId,
+          ])
+        } catch (err) {
+          log.warn("Incremental: could not record commit_sha (non-fatal)", {
+            snapshotId,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        }
+      }
+
       const result = {
         symbolsUpdated,
         relationsUpdated,
@@ -2720,9 +2739,22 @@ export class Ingestor {
       }
       const portableInput = rawPath.replace(/\\/g, "/")
       const directorySegments = portableInput.split("/").slice(0, -1)
-      if (directorySegments.some((segment) => !segment || segment === "." || segment === ".." ||
-          segment.startsWith(".") || SKIP_DIRS.has(segment))) {
-        throw new Error("changedPaths contains a skipped or unsafe directory")
+      // Malformed input, and the only case here that is actually unsafe.
+      if (directorySegments.some((segment) => !segment || segment === "." || segment === "..")) {
+        throw new Error("changedPaths contains an unsafe directory")
+      }
+      // A path the ingestor never indexes is not an error. The natural input is
+      // a git diff or an editor event, which routinely names files under
+      // `.github/` or `node_modules/`; refusing the whole call for one of them
+      // threw away the real source changes sitting beside it. Drop what is not
+      // indexed and index the rest, on the same rule the repository walk and
+      // the watcher already use, so all three agree on what is indexable.
+      const fileName = portableInput.slice(portableInput.lastIndexOf("/") + 1)
+      if (
+        directorySegments.some((segment) => segment.startsWith(".") || SKIP_DIRS.has(segment)) ||
+        fileName.startsWith(".")
+      ) {
+        continue
       }
       const safePath = resolvePathWithinBase(basePath, portableInput, { allowMissing: true })
       const candidate = safePath.existed ? safePath.realPath : safePath.resolvedPath

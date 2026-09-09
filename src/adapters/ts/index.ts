@@ -1225,6 +1225,35 @@ function extractRelationsFromBody(
   }
 
   /**
+   * True when the checker resolved this expression to a declaration outside the
+   * indexed corpus. This is NOT the same as failing to resolve: there the bare
+   * name is the only signal we have and matching on it is the intended
+   * fallback, but here the compiler has already told us no repository symbol is
+   * being called, so a name match can only invent an edge to an unrelated
+   * same-named symbol — `path.resolve` landing on a test's local `resolve`,
+   * `handle.read` on a script's `read`.
+   */
+  function resolvesOutsideCorpus(expr: ts.Expression): boolean {
+    try {
+      let symbol = checker.getSymbolAtLocation(expr)
+      if (!symbol) return false
+      if (symbol.flags & ts.SymbolFlags.Alias) {
+        try {
+          symbol = checker.getAliasedSymbol(symbol)
+        } catch {
+          /* not an alias after all */
+        }
+      }
+      const declaration = symbol.declarations?.[0]
+      if (!declaration || ts.isSourceFile(declaration)) return false
+      const declFile = declaration.getSourceFile()
+      return declFile.isDeclarationFile || declFile.fileName.includes("node_modules")
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * A declaration key, but only for symbols declared at module scope.
    *
    * Locals and parameters resolve perfectly well and are worthless as graph
@@ -1349,9 +1378,14 @@ function extractRelationsFromBody(
       let fullChain: string | undefined
       let targetKey: string | undefined
 
+      // A call the checker resolved into node_modules or a .d.ts has no
+      // repository target, so the bare-name fallback below is suppressed for it.
+      let external = false
+
       if (ts.isIdentifier(child.expression)) {
         targetName = child.expression.getText(sourceFile)
         targetKey = resolveDeclarationKey(child.expression)
+        external = !targetKey && resolvesOutsideCorpus(child.expression)
       } else if (ts.isPropertyAccessExpression(child.expression)) {
         // Extract FULL chain (e.g. this.service.repo.find)
         fullChain = extractFullChain(child.expression)
@@ -1360,10 +1394,18 @@ function extractRelationsFromBody(
         // Resolve against the property itself, not the receiver: `a.b.find`
         // must reach the declaration of `find`, not of `a`.
         targetKey = resolveDeclarationKey(child.expression.name)
+        external = !targetKey && resolvesOutsideCorpus(child.expression.name)
       }
 
-      // Emit full chain relation (primary — enables dispatch resolution)
-      if (fullChain) {
+      // Emit full chain relation (primary — enables dispatch resolution).
+      // Nothing is emitted for a callee the checker placed outside the corpus:
+      // downstream resolution falls back to a repository-wide match on the last
+      // segment, so `path.resolve` and `handle.read` were landing on whatever
+      // single symbol happened to carry that name — a test's local `resolve`, a
+      // script's `read`. No target is the correct answer, not a guessed one.
+      if (external) {
+        // No repository symbol is being called.
+      } else if (fullChain) {
         relations.push({
           source_key: sourceKey,
           target_name: fullChain,

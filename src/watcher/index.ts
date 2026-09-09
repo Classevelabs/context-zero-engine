@@ -32,6 +32,7 @@
 import * as fs from "fs"
 import * as path from "path"
 import crypto from "crypto"
+import { execFileSync } from "child_process"
 
 import { db } from "../db-driver"
 import { Logger } from "../logger"
@@ -41,6 +42,17 @@ import { watcher as watcherConfig } from "../config"
 import type { AdvisoryLock } from "../db-driver"
 
 const log = new Logger("watcher")
+
+/** Runs git in a repository, returning trimmed stdout, or null if it failed. */
+function gitOutput(repoPath: string, args: string[]): string | null {
+  try {
+    return String(
+      execFileSync("git", ["-C", repoPath, ...args], { stdio: ["ignore", "pipe", "ignore"], maxBuffer: 32 * 1024 * 1024 }),
+    ).trim()
+  } catch {
+    return null
+  }
+}
 
 /** Distinguishes watcher locks from the ingestion locks in the same namespace. */
 const WATCH_LOCK_SALT = "contextzero:watch:"
@@ -295,7 +307,76 @@ export class Watcher {
       started.push(repo)
     }
 
+    // Watching begins at the first edit AFTER this process starts, so every
+    // commit made while nothing was running was invisible — the graph silently
+    // drifted behind the tree it claims to describe. Close that window once,
+    // here, before returning.
+    await this.reconcile(started)
+
     return started
+  }
+
+  /**
+   * Index whatever changed while nobody was watching.
+   *
+   * Deferred refinement on purpose: startup should cost one extraction pass per
+   * drifted repository, not a full re-analysis of each. The idle timer settles
+   * that debt once the tree goes quiet.
+   */
+  private async reconcile(repos: WatchedRepository[]): Promise<void> {
+    for (const repo of repos) {
+      try {
+        const head = gitOutput(repo.base_path, ["rev-parse", "HEAD"])
+        if (!head) continue
+
+        const snapshotId = await resolveLatestIndexedSnapshot(repo.repo_id)
+        if (!snapshotId) continue
+        const row = await db.query(`SELECT commit_sha FROM snapshots WHERE snapshot_id = $1`, [snapshotId])
+        const recorded = (row.rows[0] as { commit_sha?: string } | undefined)?.commit_sha ?? ""
+        if (recorded === head) continue
+
+        // A snapshot whose commit is not a commit cannot be diffed against, and
+        // guessing would index the wrong set. Say so and leave it alone.
+        if (!/^[0-9a-f]{7,40}$/i.test(recorded)) {
+          log.warn("Repository cannot be reconciled — snapshot records no usable commit; re-ingest to fix", {
+            repo: repo.name,
+            recorded,
+          })
+          continue
+        }
+
+        const diff = gitOutput(repo.base_path, ["diff", "--name-only", recorded, head])
+        if (diff === null) {
+          log.warn("Repository cannot be reconciled — recorded commit is unknown to this checkout", {
+            repo: repo.name,
+            recorded,
+          })
+          continue
+        }
+        const changed = diff.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+        if (changed.length === 0) continue
+
+        log.info("Reconciling repository against HEAD", { repo: repo.name, files: changed.length })
+        const result = await ingestor.ingestIncremental(repo.repo_id, snapshotId, changed, {
+          refine: "deferred",
+          commitSha: head,
+        })
+        this.options.onBatch?.({
+          repo: repo.name,
+          files: changed.length,
+          symbols_updated: result.symbolsUpdated,
+          relations_updated: result.relationsUpdated,
+          files_failed: result.files_failed,
+          failed_paths: result.failed_paths,
+        })
+      } catch (err) {
+        // A repository that cannot be reconciled is still worth watching.
+        log.warn("Reconciliation failed (non-fatal)", {
+          repo: repo.name,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
   }
 
   public async stop(): Promise<void> {

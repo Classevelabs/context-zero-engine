@@ -70,6 +70,9 @@ import { symbolCache, profileCache, capsuleCache, homologCache as adminHomologCa
 // Both the bridge safeTool wrapper and handlers import this list to ensure consistency.
 
 export const SAFE_ERROR_PREFIXES = [
+  // The caller's own input, described back to them. Sanitizing these into
+  // "Internal server error" made a plain bad-path argument undiagnosable.
+  "changedPaths",
   "Transaction not found",
   "Invalid",
   "Repository not found",
@@ -197,6 +200,7 @@ function optionalArray<T>(args: Record<string, unknown>, key: string): T[] | und
 // ────────── UUID validation ──────────
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/i
 
 function isUUID(v: unknown): v is string {
   return typeof v === "string" && UUID_RE.test(v)
@@ -2309,6 +2313,7 @@ export async function handleIncrementalIndex(args: Record<string, unknown>, log:
   const repo_path = optionalString(args, "repo_path")
   const snapshot_id = optionalString(args, "snapshot_id")
   const refine = optionalString(args, "refine")
+  const commit_sha = optionalString(args, "commit_sha")
   const changed_paths = requireArray<string>(args, "changed_paths")
 
   if (repo_id && repo_path) return errorResult("Provide either repo_id or repo_path, not both")
@@ -2317,6 +2322,12 @@ export async function handleIncrementalIndex(args: Record<string, unknown>, log:
   if (snapshot_id && !isUUID(snapshot_id)) return errorResult("snapshot_id must be a valid UUID")
   if (refine && refine !== "full" && refine !== "deferred") {
     return errorResult('refine must be "full" or "deferred"')
+  }
+  // A snapshot's commit is provenance other tools reason about, so refuse a
+  // label rather than storing one: a benchmark harness passing "bench-cold"
+  // left a repository permanently unable to answer "am I current?".
+  if (commit_sha !== undefined && !COMMIT_SHA_RE.test(commit_sha)) {
+    return errorResult("commit_sha must be a hexadecimal git commit id (7-40 characters)")
   }
   if (!Array.isArray(changed_paths) || changed_paths.length === 0) {
     return errorResult("changed_paths is required (non-empty array of strings)")
@@ -2383,6 +2394,7 @@ export async function handleIncrementalIndex(args: Record<string, unknown>, log:
 
   const result = await ingestor.ingestIncremental(resolvedRepoId, resolvedSnapshotId, relativePaths, {
     refine: refine === "deferred" ? "deferred" : "full",
+    ...(commit_sha ? { commitSha: commit_sha } : {}),
   })
   return textResult({ repo_id: resolvedRepoId, snapshot_id: resolvedSnapshotId, result })
 }

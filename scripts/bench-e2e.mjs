@@ -302,6 +302,19 @@ async function benchQueries(snapshotId, repoId, iterations) {
   return results
 }
 
+// The snapshot's commit is provenance the rest of the engine reasons about, so
+// record the real one. Passing a fixed label left a benchmarked repository
+// permanently unable to answer "is this index current?".
+async function headCommit(repoPath) {
+  try {
+    const { execFileSync } = await import("child_process")
+    const sha = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], { stdio: ["ignore", "pipe", "ignore"] })
+    return String(sha).trim() || "bench-cold"
+  } catch {
+    return "bench-cold"
+  }
+}
+
 // ── run ─────────────────────────────────────────────────────────────────────
 
 const src = await sourceStats(REPO_PATH)
@@ -310,7 +323,7 @@ console.log(`source       ${src.files} files, ${src.lines.toLocaleString()} line
 console.log(`iterations   ${QUERY_ITERATIONS} per query\n`)
 
 console.log("── ingest ──────────────────────────────────────────────────────")
-const cold = await withPeakRss(() => ingestor.ingestRepo(REPO_PATH, REPO_NAME, "bench-cold", "main"))
+const cold = await withPeakRss(() => ingestor.ingestRepo(REPO_PATH, REPO_NAME, await headCommit(REPO_PATH), "main"))
 if (cold.value.error) {
   console.error(`cold ingest refused: ${cold.value.error}`)
   process.exit(1)

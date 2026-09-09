@@ -140,11 +140,24 @@ function report(label, s, sourceSize) {
   }
 }
 
+// The snapshot's commit is provenance the rest of the engine reasons about, so
+// record the real one. Passing a fixed label left a benchmarked repository
+// permanently unable to answer "is this index current?".
+async function headCommit(repoPath) {
+  try {
+    const { execFileSync } = await import("child_process")
+    const sha = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], { stdio: ["ignore", "pipe", "ignore"] })
+    return String(sha).trim() || "bench-cold"
+  } catch {
+    return "bench-cold"
+  }
+}
+
 const sourceSize = await sourceBytes(REPO_PATH)
 console.log(`indexing ${REPO_PATH} as "${REPO_NAME}" (${mb(sourceSize)} of source)`)
 
 const coldStart = Date.now()
-const cold = await ingestor.ingestRepo(REPO_PATH, REPO_NAME, "bench-cold", "main")
+const cold = await ingestor.ingestRepo(REPO_PATH, REPO_NAME, await headCommit(REPO_PATH), "main")
 const coldMs = Date.now() - coldStart
 if (cold.error) {
   console.error(`cold ingest refused: ${cold.error}`)

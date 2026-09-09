@@ -1291,7 +1291,16 @@ registerTool(
         .array(z.string().min(1))
         .min(1)
         .max(5000)
-        .describe("Changed file paths — absolute or relative to repo root"),
+        .describe(
+          "Changed file paths — absolute or relative to repo root. Paths the ingestor does not index (dotfiles, .github/, node_modules/) are skipped rather than rejected, so a raw git diff is valid input.",
+        ),
+      commit_sha: z
+        .string()
+        .regex(/^[0-9a-f]{7,40}$/i)
+        .optional()
+        .describe(
+          "The commit these changes bring the snapshot to. Recorded only when the pass completes with no failed files, so commit_sha stays a truthful answer to 'is this index current?'",
+        ),
       refine: z
         .enum(["full", "deferred"])
         .optional()
