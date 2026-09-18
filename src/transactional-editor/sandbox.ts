@@ -347,12 +347,19 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
     let spawnArgs = args
 
     if (process.platform === "linux") {
+      // Each ceiling is applied best-effort. A host whose hard cap sits below one
+      // of these — or that refuses to set it at all — must still run the target,
+      // not abort the whole `sh -c` before `exec` and report the shell's error as
+      // the command's exit code. (A GitHub runner image update did exactly that:
+      // one `ulimit` began failing, so every repository command exited 2 without
+      // running.) The ceilings that CAN be set still are.
+      const bestEffort = (limit: string) => `${limit} 2>/dev/null || true`
       const ulimitPrefix = [
-        `ulimit -v ${Math.floor(limits.maxMemoryMb * 1024)}`, // virtual memory in KB
-        `ulimit -t ${Math.floor(limits.maxCpuSeconds)}`, // CPU time in seconds
-        `ulimit -u ${Math.floor(limits.maxProcesses)}`, // max user processes
-        `ulimit -f ${Math.floor(limits.maxFileSizeMb * 1024)}`, // file size in KB
-        `ulimit -n ${Math.floor(limits.maxOpenFiles)}`, // open file descriptors
+        bestEffort(`ulimit -v ${Math.floor(limits.maxMemoryMb * 1024)}`), // virtual memory in KB
+        bestEffort(`ulimit -t ${Math.floor(limits.maxCpuSeconds)}`), // CPU time in seconds
+        bestEffort(`ulimit -u ${Math.floor(limits.maxProcesses)}`), // max user processes
+        bestEffort(`ulimit -f ${Math.floor(limits.maxFileSizeMb * 1024)}`), // file size in KB
+        bestEffort(`ulimit -n ${Math.floor(limits.maxOpenFiles)}`), // open file descriptors
       ].join(" && ")
 
       // Wrap: sh -c "ulimit ... && exec <original command>"
