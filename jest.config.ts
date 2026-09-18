@@ -25,6 +25,10 @@ const config: Config = {
   },
   setupFiles: [],
   testTimeout: 10000,
+  // Runs the tree-sitter-memory-sensitive files (workspace symbol search) on a
+  // fresh worker before a heavy parser can share the process — see
+  // jest.sequencer.js.
+  testSequencer: "<rootDir>/jest.sequencer.js",
 }
 
 export default config
