@@ -11,6 +11,8 @@ const config: Config = {
   // uuid v13+ ships ESM — mock it for CJS compatibility in tests
   moduleNameMapper: {
     "^uuid$": "<rootDir>/src/__tests__/__mocks__/uuid.ts",
+    // tree-sitter's wrapper runs once per worker, as it runs once per process — see the shim.
+    "^tree-sitter$": "<rootDir>/src/__tests__/__mocks__/tree-sitter.ts",
   },
   collectCoverageFrom: ["src/**/*.ts", "!src/**/__tests__/**", "!src/mcp-interface/index.ts"],
   coverageDirectory: "coverage",
