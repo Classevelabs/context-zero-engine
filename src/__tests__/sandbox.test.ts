@@ -8,6 +8,7 @@ import * as path from "path"
 import { buildSanitizedEnv, isRepositoryExecutionAllowed, sandboxExec } from "../transactional-editor/sandbox"
 
 const ORIGINAL_ENV = process.env
+const testOnLinux = process.platform === "linux" ? test : test.skip
 
 describe("Sandbox environment", () => {
   beforeEach(() => {
@@ -93,6 +94,30 @@ describe("Repository execution gate", () => {
       expect(result.exitCode).toBe(3)
       const runs = fs.readFileSync(marker, "utf-8").trim().split("\n").filter(Boolean)
       expect(runs).toHaveLength(1)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  testOnLinux("the target runs under every ceiling it was given, in the units it was given", async () => {
+    // Regression: /bin/sh is dash on Debian and Ubuntu, which has no `ulimit -u`, so the chain
+    // exited 2 before the target ran; and -f was set in KB where sh counts 512-byte blocks.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "contextzero-limits-"))
+    try {
+      const result = await sandboxExec(
+        process.execPath,
+        ["-e", "process.stdout.write(require('fs').readFileSync('/proc/self/limits', 'utf-8'))"],
+        {
+          cwd,
+          timeoutMs: 10_000,
+          maxOutputBytes: 16_384,
+          resourceLimits: { maxCpuSeconds: 42, maxFileSizeMb: 7, maxOpenFiles: 200 },
+        },
+      )
+      expect(result.exitCode).toBe(0)
+      expect(result.stdout).toMatch(/^Max cpu time\s+42\s+42\s/m)
+      expect(result.stdout).toMatch(/^Max file size\s+7340032\s+7340032\s/m)
+      expect(result.stdout).toMatch(/^Max open files\s+200\s+200\s/m)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }

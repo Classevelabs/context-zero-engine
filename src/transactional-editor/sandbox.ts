@@ -107,8 +107,8 @@ function isUnshareAvailable(): boolean {
   } catch {
     _unshareAvailable = false
     log.warn(
-      "unshare(1) not found — sandbox processes will NOT run in a PID namespace. " +
-        "/proc of the parent process may be readable by sandboxed commands. " +
+      "unshare(1) not found — sandbox processes will NOT run in a PID namespace or under the " +
+        "process-count ceiling. /proc of the parent process may be readable by sandboxed commands. " +
         "Install util-linux to enable PID namespace isolation.",
     )
   }
@@ -138,7 +138,8 @@ function isUnshareUsable(): boolean {
     _unshareUsable = false
     log.warn(
       "unshare(1) is present but cannot create a PID namespace here — sandbox processes " +
-        "will run WITHOUT namespace isolation. Enable unprivileged user namespaces to restore it.",
+        "will run WITHOUT namespace isolation or the process-count ceiling. Enable unprivileged " +
+        "user namespaces to restore both.",
     )
   }
   return _unshareUsable
@@ -347,12 +348,19 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
     let spawnArgs = args
 
     if (process.platform === "linux") {
+      const isProduction = (process.env["NODE_ENV"] || "").toLowerCase() === "production"
+      const useUnshare = isProduction ? isUnshareAvailable() : isUnshareUsable()
+
+      // /bin/sh is dash on Debian and Ubuntu: every POSIX sh counts -f in 512-byte blocks, and the
+      // process ceiling is -u in bash and busybox but -p in dash, so the chain tries both spellings.
+      const maxProcesses = Math.floor(limits.maxProcesses)
       const ulimitPrefix = [
         `ulimit -v ${Math.floor(limits.maxMemoryMb * 1024)}`, // virtual memory in KB
         `ulimit -t ${Math.floor(limits.maxCpuSeconds)}`, // CPU time in seconds
-        `ulimit -u ${Math.floor(limits.maxProcesses)}`, // max user processes
-        `ulimit -f ${Math.floor(limits.maxFileSizeMb * 1024)}`, // file size in KB
+        `ulimit -f ${Math.floor(limits.maxFileSizeMb * 2048)}`, // file size in 512-byte blocks
         `ulimit -n ${Math.floor(limits.maxOpenFiles)}`, // open file descriptors
+        // RLIMIT_NPROC counts every task the user owns; only a new user namespace starts it at zero.
+        ...(useUnshare ? [`{ ulimit -u ${maxProcesses} 2>/dev/null || ulimit -p ${maxProcesses}; }`] : []),
       ].join(" && ")
 
       // Wrap: sh -c "ulimit ... && exec <original command>"
@@ -378,8 +386,6 @@ export async function sandboxExec(command: string, args: string[], config: Sandb
       // whether unshare actually works and otherwise runs bare. Both paths
       // invoke the target exactly once.
       const innerCmd = `${ulimitPrefix} && exec ${escapedCommand} ${escapedArgs}`
-      const isProduction = (process.env["NODE_ENV"] || "").toLowerCase() === "production"
-      const useUnshare = isProduction ? isUnshareAvailable() : isUnshareUsable()
       spawnCommand = "/bin/sh"
       spawnArgs = useUnshare
         ? ["-c", `unshare -r --pid --fork --mount-proc /bin/sh -c ${escapeShell(innerCmd)}`]
