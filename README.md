@@ -123,52 +123,44 @@ algorithms, engine internals).
 
 ## Install
 
-### Prerequisites
-
-- **Node.js** 20+ (22 recommended)
-- **PostgreSQL** 14 or newer (17 recommended) with the `pg_trgm` extension
-- **Python 3** with `libcst` (optional — only for Python source analysis)
-
-### Bootstrap (recommended)
+Node.js 20 or newer, and nothing else. If the machine has no PostgreSQL, ContextZero creates one for
+itself — in your user data directory, on a port nobody else uses, with a password it generates and
+nobody has to type.
 
 ```bash
-git clone https://github.com/Classevelabs/context-zero-engine.git context-zero-engine
+git clone https://github.com/Classevelabs/context-zero-engine.git
 cd context-zero-engine
+npm run setup -- --install-mcp=claude
 ```
 
-Windows:
+That installs dependencies, provisions the database, applies the schema, builds, writes the MCP
+config for your client (`claude`, `codex`, `cursor`, or `all`), and checks the result. Restart the
+client and the tools are there.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 -Client claude
-```
+Python source analysis also wants Python 3 with `libcst`; everything else works without it.
 
-macOS / Linux:
+### Using a PostgreSQL you already run
+
+Set `DB_HOST`, `DB_USER` and `DB_PASSWORD` before running setup and ContextZero uses that database
+and never provisions one. It needs PostgreSQL 14 or newer, the `pg_trgm` extension, and a UTF-8
+database — source code is UTF-8, and a database created with a machine's code page rejects it:
 
 ```bash
-scripts/bootstrap.sh --client claude
-```
-
-The bootstrap installs dependencies, creates `.env`, builds, runs database
-migrations, runs diagnostics (`npm run doctor`), and optionally writes the
-MCP config for your client (`claude`, `codex`, `cursor`, or `all`).
-
-### Manual install
-
-```bash
-npm ci
-
-createdb scg_v2
+createdb -E UTF8 -T template0 scg_v2
 psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
-
-cp .env.example .env    # set DB_USER / DB_PASSWORD / SCG_ALLOWED_BASE_PATHS
-
-npm run build
-npm run db:migrate
-npm run doctor          # verifies node, database, python, env
 ```
 
-Full options, client config paths, and troubleshooting:
-[docs/INSTALL.md](docs/INSTALL.md) and [docs/OPERATIONS.md](docs/OPERATIONS.md).
+### The database ContextZero provisions
+
+```bash
+npm run db:status    # where it is, and whether it is running
+npm run db:stop      # stop it
+npm run db:up        # start it (the MCP client does this for you)
+```
+
+Its data, binaries and log live under `%LOCALAPPDATA%\ContextZero` on Windows,
+`~/Library/Application Support/ContextZero` on macOS, and `~/.local/share/contextzero` on Linux.
+Set `CONTEXTZERO_HOME` to put them somewhere else.
 
 ---
 
@@ -190,12 +182,13 @@ Claude Code CLI:
 ```bash
 claude mcp add contextzero -s user \
   -e CONTEXTZERO_ENV_FILE=/absolute/path/to/context-zero-engine/.env \
-  -- node /absolute/path/to/context-zero-engine/dist/mcp-bridge/index.js
+  -- node /absolute/path/to/context-zero-engine/scripts/mcp-start.mjs
 ```
 
 Any MCP client that speaks stdio works: the server is
-`node dist/mcp-bridge/index.js` with the `DB_*`/`SCG_*` environment (or a
-single `CONTEXTZERO_ENV_FILE` pointing at your `.env`).
+`node scripts/mcp-start.mjs` with the `DB_*`/`SCG_*` environment (or a single
+`CONTEXTZERO_ENV_FILE` pointing at your `.env`). It starts the database when that
+database is the one ContextZero provisioned, then becomes the bridge.
 
 MCP uses a trusted local stdio child-process boundary; it is not a remote
 network authentication layer. The 43 read tools are listed by default. The 18

@@ -40,7 +40,7 @@ python -m pip install libcst
 Create the database:
 
 ```powershell
-createdb scg_v2
+createdb -E UTF8 -T template0 scg_v2
 psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
 ```
 

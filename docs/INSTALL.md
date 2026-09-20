@@ -5,6 +5,9 @@ ContextZero has two supported install paths:
 - **Native local MCP**: best for Claude Desktop, Codex, Cursor, and local developer workflows.
 - **Docker server**: best when you want a repeatable HTTP server with bundled PostgreSQL.
 
+Both need Node.js 20 or newer. Neither needs you to install PostgreSQL: when the machine has none,
+ContextZero provisions its own and generates the password itself.
+
 For operating guidance after installation, see `docs/OPERATIONS.md`.
 
 ## Fastest Native Install
@@ -32,11 +35,34 @@ The bootstrap script:
 
 - installs npm dependencies;
 - installs Python `libcst` when Python is available;
-- creates `.env` when missing;
+- provisions a private PostgreSQL when no database is configured;
+- creates `.env` when missing, with every secret generated;
 - builds ContextZero;
 - runs migrations unless disabled;
 - runs `npm run doctor`;
 - optionally installs MCP config with a backup of the existing client config.
+
+## The Database
+
+With no `DB_HOST`/`DB_USER`/`DB_PASSWORD` in the environment, setup provisions a PostgreSQL that
+belongs to ContextZero: binaries fetched once into your user data directory, a port nobody else is
+using, and a generated password written only into `.env`. The MCP launcher starts it when a client
+opens, so nothing has to be running first.
+
+```bash
+npm run db:status    # where it is, and whether it is running
+npm run db:stop
+npm run db:up
+```
+
+`CONTEXTZERO_HOME` moves that directory. To use a database you already run, set `DB_HOST`, `DB_USER`
+and `DB_PASSWORD` before setup: PostgreSQL 14 or newer, with `pg_trgm`, and **UTF-8** — source code
+is UTF-8, and `initdb` on a Windows locale produces a code page that cannot store it.
+
+```bash
+createdb -E UTF8 -T template0 scg_v2
+psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+```
 
 ## Docker Install
 
@@ -132,12 +158,14 @@ npm run doctor -- --fix
 
 ## PostgreSQL Notes
 
-Native install requires PostgreSQL to be running locally or remotely.
+These apply to a database you run yourself; the one ContextZero provisions is already set up this
+way.
 
-Minimum database setup:
+Minimum database setup — UTF-8 from `template0`, because a database on the machine's code page
+cannot store source code:
 
 ```bash
-createdb scg_v2
+createdb -E UTF8 -T template0 scg_v2
 psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
 ```
 

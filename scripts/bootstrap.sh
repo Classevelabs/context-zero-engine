@@ -208,7 +208,8 @@ ensure_postgres_best_effort() {
 
   step "Preparing PostgreSQL database when local tools allow it"
   if command -v createdb >/dev/null 2>&1; then
-    createdb scg_v2 2>/dev/null || echo "createdb scg_v2 skipped or already exists."
+    # UTF-8 from template0: initdb on a Windows locale gives a code page that cannot store source.
+    createdb -E UTF8 -T template0 scg_v2 2>/dev/null || echo "createdb scg_v2 skipped or already exists."
   fi
 
   psql -d scg_v2 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || \

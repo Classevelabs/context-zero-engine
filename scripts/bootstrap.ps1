@@ -132,7 +132,8 @@ function Ensure-PostgresBestEffort {
 
     Write-Step "Preparing PostgreSQL database when local tools allow it"
     if (Get-Command createdb -ErrorAction SilentlyContinue) {
-        & createdb scg_v2 2>$null
+        # UTF-8 from template0: initdb on a Windows locale gives a code page that cannot store source.
+        & createdb -E UTF8 -T template0 scg_v2 2>$null
         if ($LASTEXITCODE -ne 0) {
             Write-Host "createdb scg_v2 skipped or already exists."
         }

@@ -51,6 +51,17 @@ async function main(): Promise<void> {
   try {
     await acquireMigrationLock(lockClient, lockTimeoutMs)
 
+    // Said here rather than in the middle of a migration: a database on the machine's code page
+    // fails on the first schema text outside it, with an error that names a byte sequence.
+    const encoding = await pool.query<{ server_encoding: string }>("SHOW server_encoding")
+    const serverEncoding = encoding.rows[0]?.server_encoding
+    if (serverEncoding !== "UTF8") {
+      throw new Error(
+        `This database is ${serverEncoding ?? "of an unknown encoding"}; ContextZero needs UTF8, because source code is UTF-8. ` +
+          `Recreate it with: CREATE DATABASE <name> ENCODING 'UTF8' TEMPLATE template0;`,
+      )
+    }
+
     // Ensure migrations tracking table exists
     await pool.query(`
             CREATE TABLE IF NOT EXISTS _migrations (
