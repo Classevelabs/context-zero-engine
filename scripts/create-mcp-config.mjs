@@ -7,6 +7,9 @@ const repoRoot = path.resolve(scriptDir, "..")
 const outDir = path.join(repoRoot, ".contextzero", "mcp")
 const envPath = path.join(repoRoot, ".env")
 const bridgePath = path.join(repoRoot, "dist", "mcp-bridge", "index.js")
+// The client starts this, not the bridge directly: it makes sure the database is running first,
+// then becomes the bridge, so nothing has to be started by hand before the client opens.
+const launcherPath = path.join(repoRoot, "scripts", "mcp-start.mjs")
 
 function parseEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return {}
@@ -110,7 +113,7 @@ const fileEnv = parseEnvFile(envPath)
 const effectiveEnv = { ...fileEnv, ...process.env }
 const server = {
   command: process.execPath,
-  args: [bridgePath],
+  args: [launcherPath],
   env: pickEnv(effectiveEnv),
 }
 
