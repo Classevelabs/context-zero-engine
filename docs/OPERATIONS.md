@@ -302,15 +302,9 @@ macOS/Linux:
 scripts/bootstrap.sh --mode docker
 ```
 
-## Historical Benchmarks
+## Benchmarks
 
-See [`BENCHMARKS.md`](../BENCHMARKS.md) for the consolidated methodology and numbers.
-
-Author-reported historical headline (raw original run artifacts are not
-committed; reproduce on your target corpus before relying on these values):
-
-- Multi-language benchmark (7 repositories): 92.2% exact-token savings, 12.86x exact token reduction, and 99.26% savings versus whole-source loading.
-- VS Code benchmark: 91.96% exact-token savings, 12.44x exact token reduction, and 1,618x reduction versus full-source loading.
+See [`BENCHMARKS.md`](../BENCHMARKS.md) for the current 2026-09-08 run, methodology and reproduction.
 
 Plain description: ContextZero indexes a repo once, then serves structured context through MCP so an agent can ask targeted questions instead of repeatedly reading thousands of raw source lines.
 
