@@ -92,7 +92,7 @@ export function toRepoRelativePaths(basePath: string, changedPaths: string[]): s
     }
     const relative = path.relative(basePath, changedPath)
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`changed path is outside the repository (${basePath}): ${changedPath}`)
+      throw new Error(`changed path is outside the repository: ${changedPath}`)
     }
     return toPortableRelativePath(relative)
   })
