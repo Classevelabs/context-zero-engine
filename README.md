@@ -297,20 +297,6 @@ how to report a vulnerability.
 
 ---
 
-## Historical Benchmarks
-
-| Benchmark | Scale | Token reduction (exact-symbol baseline) |
-|---|---|---:|
-| Engine self-ingest | 105 files / 7,753 symbols | 2.71x (63.1% savings) |
-| VS Code | 10,386 files / 125,777 symbol versions | 12.44x (91.96% savings) |
-| 7 multi-language repos | Django, Prometheus, Tokio, Commons Lang, Serilog, OkHttp, Alamofire | 12.86x (92.2% savings) |
-
-These are author-reported historical results; raw machine-readable run outputs
-are not committed. Methodology, reproduction scripts, and cases where the gain
-is small: [BENCHMARKS.md](BENCHMARKS.md).
-
----
-
 ## Testing
 
 ```bash
