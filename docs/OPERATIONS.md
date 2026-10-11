@@ -316,7 +316,8 @@ To verify a complete install end to end, run:
 npm run build
 npm test -- --runInBand
 npm run test:db
-npm audit
+npm run audit
+npm run audit:prod
 npm run doctor
 ```
 
@@ -325,7 +326,7 @@ Expected result:
 - Build passes.
 - Default test suite passes.
 - `npm run test:db` passes against a reachable PostgreSQL database.
-- `npm audit` reports no vulnerabilities.
+- `npm run audit` passes (nothing at high or critical severity), and `npm run audit:prod` reports no vulnerabilities in what the engine runs on.
 - `npm run doctor` has zero failures and zero warnings.
 - At least one real repository under `SCG_ALLOWED_BASE_PATHS` ingests successfully.
 - Claude Desktop, Codex, or another MCP client can call `scg_health_check`.

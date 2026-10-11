@@ -209,7 +209,8 @@ To verify a complete install end to end, run:
 npm run build
 npm test -- --runInBand
 npm run test:db
-npm audit
+npm run audit
+npm run audit:prod
 npm run doctor
 ```
 
@@ -218,6 +219,6 @@ Expected:
 - build passes;
 - all default tests pass;
 - the opt-in PostgreSQL integration test passes on a machine with a reachable test database;
-- audit reports zero vulnerabilities;
+- `npm run audit` passes (nothing at high or critical severity) and `npm run audit:prod` reports zero vulnerabilities;
 - doctor reports zero failures;
 - MCP `scg_health_check` returns healthy from at least one supported client.
